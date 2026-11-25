@@ -22,10 +22,10 @@ it('preserves FIFO, reserves capacity, and cancels queued work without charging 
   })
   const aborter = new AbortController()
   const pending = new AbortController().signal
-  const ordinary = Promise.withResolvers<void>()
-  const firstStarted = Promise.withResolvers<void>()
+  const ordinary = Promise.withResolvers<undefined>()
+  const firstStarted = Promise.withResolvers<undefined>()
   const first = scheduler.query('ordinary', pending, () => {
-    firstStarted.resolve()
+    firstStarted.resolve(undefined)
     return ordinary.promise
   })
   const cancelled = vi.fn(async () => {})
@@ -46,10 +46,50 @@ it('preserves FIFO, reserves capacity, and cancels queued work without charging 
     expect(order).toEqual(['priority'])
     expect(cancelled).not.toHaveBeenCalled()
   } finally {
-    ordinary.resolve()
+    ordinary.resolve(undefined)
     await Promise.all([first, second, third, priority])
   }
   expect(order).toEqual(['priority', 'ordinary 2', 'ordinary 3'])
+})
+
+it.each([
+  { startsPerTurn: 1, maxBatches: 2 },
+  { startsPerTurn: 4, maxBatches: 1 },
+])('dispatches an eligible priority query within $maxBatches batches with startsPerTurn=$startsPerTurn', async ({
+  startsPerTurn, maxBatches,
+}) => {
+  const scheduler = new LinuxScopeQueryScheduler({
+    ordinaryConcurrency: 8, priorityConcurrency: 2, ordinaryStartsPerSecond: 20,
+    priorityStartsPerSecond: 10, startsPerTurn,
+  })
+  const signal = new AbortController().signal
+  // A priority-only dispatch gives ordinary work the next turn when both lanes are ready.
+  await scheduler.query('priority', signal, () => Promise.resolve())
+  const batches: string[][] = []
+  let currentBatch: string[] | undefined
+  const record = (name: string): void => {
+    if (currentBatch === undefined) {
+      currentBatch = []
+      batches.push(currentBatch)
+      queueMicrotask(() => { currentBatch = undefined })
+    }
+    currentBatch.push(name)
+  }
+  const ordinary = Array.from({ length: 8 }, (_, index) => scheduler.query('ordinary', signal, () => {
+    record(`ordinary ${index}`)
+    return Promise.resolve()
+  }))
+  const enqueuedAt = performance.now()
+  const priority = scheduler.query('priority', signal, () => {
+    record('confirmation')
+    return Promise.resolve(performance.now() - enqueuedAt)
+  })
+  const [waitMs] = await Promise.all([priority, ...ordinary])
+  const batch = batches.findIndex(entries => entries.includes('confirmation')) + 1
+  expect(batch).toBeGreaterThanOrEqual(1)
+  expect(batch).toBeLessThanOrEqual(maxBatches)
+  expect(batches.flat().indexOf('confirmation')).toBe(1)
+  expect(waitMs).toBeLessThanOrEqual(100)
 })
 
 it('does not release a start budget before the actual process start ages out', async () => {
@@ -98,7 +138,7 @@ it('charges immediate failures and starts both lanes in bounded batches at the r
   const enqueue = (lane: 'ordinary' | 'priority', name: string) => scheduler.query(lane, signal, () => {
     starts.push(name)
     throw failure
-  }).catch(error => error)
+  }).catch((error: unknown) => error)
   try {
     const pending = [
       enqueue('priority', 'P1'), enqueue('priority', 'P2'), enqueue('priority', 'P3'),
