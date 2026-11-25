@@ -77,6 +77,7 @@ async function scopeFixture(config: Config = {}) {
   const pending = new Map<string, Reply>()
   const queries: string[] = []
   let finishing = false
+  let onLaunch: ((kind: 'ordinary' | 'terminal') => void) | undefined
   let respond = (unit: string, reply: Reply): void => { pending.set(unit, reply) }
   const signal = vi.spyOn(process, 'kill').mockImplementation(() => true)
   childProcess.spawn.mockImplementation((file: string, args: string[], options: SpawnOptions) => {
@@ -89,6 +90,7 @@ async function scopeFixture(config: Config = {}) {
     children.set(`${unit}.scope`, child)
     launchPaths.push(requestPath)
     consumeLinuxLaunchRequest(requestPath)
+    onLaunch?.('ordinary')
     return child
   })
   spawnPty.mockImplementation((file: string, args: string[], options: IPtyForkOptions) => {
@@ -99,6 +101,7 @@ async function scopeFixture(config: Config = {}) {
     terminals.set(`${unit}.scope`, pty)
     launchPaths.push(requestPath)
     consumeLinuxLaunchRequest(requestPath)
+    onLaunch?.('terminal')
     return pty
   })
   childProcess.spawnSync.mockImplementation((file: string, args: string[]) => {
@@ -140,7 +143,8 @@ async function scopeFixture(config: Config = {}) {
     await fiber.dispose()
   }
   return {
-    children, ctx, kills, pending, queries, signal, terminals, dispose,
+    children, ctx, fiber, kills, pending, queries, signal, terminals, dispose,
+    onLaunch: (callback: typeof onLaunch) => { onLaunch = callback },
     ordinary: (graceMs = 100): SubprocessHandle => ctx.subprocess.spawn({
       argv: ['fixture-target'], cwd: process.cwd(), env: {},
       stdio: { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' }, graceMs,
@@ -162,6 +166,22 @@ async function scopeFixture(config: Config = {}) {
       }
     },
   }
+}
+
+const EXPECTED_SHUTDOWN_ERROR = 'subprocess-local: provider is shutting down'
+
+function terminalSpec() {
+  return {
+    argv: ['fixture-shell'], cwd: process.cwd(), rows: 24, cols: 80,
+    terminalType: 'dumb', graceMs: 1_000, env: {},
+  } as const
+}
+
+function ordinarySpec() {
+  return {
+    argv: ['fixture-target'], cwd: process.cwd(), env: {},
+    stdio: { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' }, graceMs: 1_000,
+  } as const
 }
 
 function replyState(reply: Reply, state: 'active' | 'inactive'): void {
@@ -197,6 +217,95 @@ it.skipIf(process.platform !== 'linux')('bounds status-query starts for a burst 
     await fixture.cleanup()
   }
 })
+
+it.skipIf(process.platform !== 'linux').each(['ordinary', 'terminal'] as const)(
+  'rejects an old service reference after dispose reenters during %s allocation', async (kind) => {
+    const fixture = await scopeFixture()
+    const service = fixture.ctx.subprocess
+    let disposal: Promise<void> | undefined
+    fixture.onLaunch(() => { disposal ??= fixture.fiber.dispose() })
+    try {
+      const launch = kind === 'ordinary' ? service.spawn(ordinarySpec()) : await service.spawnTerminal(terminalSpec())
+      expect(disposal).toBeDefined()
+      await vi.waitFor(() => expect(fixture.kills).toHaveLength(1))
+      const unit = fixture.kills[0]?.at(-1)
+      if (unit === undefined) throw new Error('Expected teardown to include the reentrant launch')
+      await vi.waitFor(() => expect(fixture.pending.has(unit)).toBe(true))
+      fixture.onLaunch(() => { throw new Error('Launch adapter reached after disposal began') })
+      const launchCalls = () => childProcess.spawn.mock.calls.length + spawnPty.mock.calls.length
+      const before = launchCalls()
+      const ordinary = (): void => { service.spawn(ordinarySpec()) }
+      const rejection = () => service.spawnTerminal(terminalSpec()).then(() => undefined, (error: unknown) => error)
+      const duringDispose = await rejection()
+      fixture.children.get(unit)?.exit()
+      fixture.terminals.get(unit)?.exit()
+      fixture.complete(unit, 'inactive')
+      await expect(launch.done).resolves.toEqual({ exitCode: 0, signal: null })
+      await disposal
+      expect(await rejection()).toEqual(new Error(EXPECTED_SHUTDOWN_ERROR))
+      expect(ordinary).toThrow(new Error(EXPECTED_SHUTDOWN_ERROR))
+      expect(duringDispose).toEqual(new Error(EXPECTED_SHUTDOWN_ERROR))
+      expect(launchCalls()).toBe(before)
+    } finally {
+      await fixture.cleanup()
+    }
+  },
+)
+
+it.skipIf(process.platform !== 'linux').each(['ordinary', 'terminal'] as const)(
+  'keeps %s allocation owned if the provider disposer starts synchronously inside the adapter', async (kind) => {
+    const fixture = await scopeFixture()
+    const runtime = fixture.ctx.subprocess as LocalSubprocessRuntime
+    let disposal: Promise<void> | undefined
+    let disposed = false
+    fixture.onLaunch(() => {
+      // Cordis normally defers effect disposal; invoke the same provider operation here to force the overlap.
+      disposal = runtime['disposeManagedProcesses']().then(() => { disposed = true })
+    })
+    try {
+      const launch = kind === 'ordinary' ? runtime.spawn(ordinarySpec()) : await runtime.spawnTerminal(terminalSpec())
+      expect(disposal).toBeDefined()
+      await vi.waitFor(() => expect(fixture.kills.length + Number(disposed)).toBeGreaterThan(0))
+      expect(disposed).toBe(false)
+      const unit = fixture.kills[0]?.at(-1)
+      if (unit === undefined) throw new Error('Expected the pending allocation to be included in disposal')
+      await vi.waitFor(() => expect(fixture.pending.has(unit)).toBe(true))
+      fixture.children.get(unit)?.exit()
+      fixture.terminals.get(unit)?.exit()
+      fixture.complete(unit, 'inactive')
+      await launch.done
+      await disposal
+      expect(disposed).toBe(true)
+    } finally {
+      await fixture.cleanup()
+    }
+  },
+)
+
+it.skipIf(process.platform !== 'linux').each(['ordinary', 'terminal'] as const)(
+  'releases a failed %s allocation when dispose reenters the launcher', async (kind) => {
+    const fixture = await scopeFixture()
+    const service = fixture.ctx.subprocess
+    const failure = new Error('fixture launch failed')
+    let disposal: Promise<void> | undefined
+    fixture.onLaunch(() => {
+      disposal ??= fixture.fiber.dispose()
+      throw failure
+    })
+    try {
+      if (kind === 'ordinary') expect(() => service.spawn(ordinarySpec())).toThrow(failure)
+      else await expect(service.spawnTerminal(terminalSpec())).rejects.toBe(failure)
+      expect(disposal).toBeDefined()
+      await disposal
+      expect(fixture.queries).toEqual([])
+      expect(fixture.kills).toEqual([])
+      if (kind === 'ordinary') expect(() => service.spawn(ordinarySpec())).toThrow(new Error(EXPECTED_SHUTDOWN_ERROR))
+      else await expect(service.spawnTerminal(terminalSpec())).rejects.toEqual(new Error(EXPECTED_SHUTDOWN_ERROR))
+    } finally {
+      await fixture.cleanup()
+    }
+  },
+)
 
 it.skipIf(process.platform !== 'linux')('reports a current query error and retries while the launcher remains owned', async () => {
   const fixture = await scopeFixture()
