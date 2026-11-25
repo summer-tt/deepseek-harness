@@ -102,6 +102,10 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
 
   /** Shared by ordinary and terminal owners until managed-range observation finishes. */
   private readonly linuxScopeQueries: LinuxScopeQueryScheduler
+  private acceptingLaunches = true
+  private launchesInProgress = 0
+  private finishLaunches: (() => void) | undefined
+  private disposal: Promise<void> | undefined
   /** Live handles retained for normal disposal and synchronous host-exit finalization. */
   private live = new Set<LocalSubprocessHandle>()
   /** Live terminals retained through normal quiescence or host-exit finalization. */
@@ -167,7 +171,22 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     }
   }
 
-  private async disposeManagedProcesses(): Promise<void> {
+  private disposeManagedProcesses(): Promise<void> {
+    if (this.disposal !== undefined) return this.disposal
+    this.acceptingLaunches = false
+    const { promise, resolve, reject } = Promise.withResolvers<void>()
+    this.disposal = promise
+    void this.terminateManagedProcesses().then(resolve, reject)
+    return promise
+  }
+
+  private async terminateManagedProcesses(): Promise<void> {
+    if (this.launchesInProgress > 0) {
+      const { promise, resolve } = Promise.withResolvers<void>()
+      this.finishLaunches = resolve
+      await promise
+    }
+    this.linuxScopeQueries.beginDisposal()
     // Request termination, then await MANAGED-RANGE exit — not just the
     // direct command's settlement — so even a surviving descendant cannot
     // outlive the fiber. Keep both sets authoritative while these waits are
@@ -242,7 +261,26 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
       extensions.map(extension => resolve(process.cwd(), directory, command + extension)))
   }
 
+  private withLaunch<T>(launch: () => T): T {
+    if (!this.acceptingLaunches) throw new Error('subprocess-local: provider is shutting down')
+    this.launchesInProgress += 1
+    try {
+      return launch()
+    } finally {
+      this.launchesInProgress -= 1
+      if (this.launchesInProgress === 0 && this.finishLaunches !== undefined) {
+        const finish = this.finishLaunches
+        this.finishLaunches = undefined
+        finish()
+      }
+    }
+  }
+
   spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    return this.withLaunch(() => this.spawnOwned(spec))
+  }
+
+  private spawnOwned(spec: SubprocessSpawnSpec): SubprocessHandle {
     validateSubprocessSpec(spec)
     const env = targetEnvironment(spec)
     const containmentMode = this.selectContainmentMode('ordinary')
@@ -336,6 +374,10 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   // Local PTY allocation is synchronous, but the provider contract permits remote asynchronous allocation.
   // oxlint-disable-next-line typescript/require-await -- Preserve promise rejection semantics at the async provider contract.
   async spawnTerminal(spec: SubprocessTerminalSpawnSpec): Promise<SubprocessTerminalHandle> {
+    return this.withLaunch(() => this.spawnTerminalOwned(spec))
+  }
+
+  private spawnTerminalOwned(spec: SubprocessTerminalSpawnSpec): SubprocessTerminalHandle {
     const file = spec.argv[0]
     if (file === undefined || file.length === 0) {
       throw new SubprocessError('subprocess-local: terminal argv must contain a program', 'SUBPROCESS_INVALID_ARGV')

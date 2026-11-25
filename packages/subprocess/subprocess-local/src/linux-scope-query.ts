@@ -30,6 +30,7 @@ function lane(capacity: number, startsPerSecond: number): Lane {
 /** Schedule ordinary FIFO queries and reserve independent capacity for termination confirmations. */
 export class LinuxScopeQueryScheduler {
   private readonly lanes: Record<LaneName, Lane>
+  private disposing = false
   private nextLane: LaneName = 'priority'
   private immediate: ReturnType<typeof setImmediate> | undefined
   private timer: { handle: ReturnType<typeof setTimeout>; at: number } | undefined
@@ -39,6 +40,16 @@ export class LinuxScopeQueryScheduler {
       ordinary: lane(budget.ordinaryConcurrency, budget.ordinaryStartsPerSecond),
       priority: lane(budget.priorityConcurrency, budget.priorityStartsPerSecond),
     }
+  }
+
+  /** Drain owned queries using the combined concurrency limit without waiting for rolling start credits. */
+  beginDisposal(): void {
+    if (this.disposing) return
+    this.disposing = true
+    this.lanes.ordinary.starts.length = 0
+    this.lanes.priority.starts.length = 0
+    this.clearRateTimer()
+    this.scheduleDispatch()
   }
 
   /**
@@ -67,7 +78,7 @@ export class LinuxScopeQueryScheduler {
         return run()
       } finally {
         // Charge after the synchronous attempt so its budget cannot expire before the start ages out.
-        current.starts.push(performance.now())
+        if (!this.disposing) current.starts.push(performance.now())
       }
     }
     const execute = async (): Promise<void> => {
@@ -87,7 +98,12 @@ export class LinuxScopeQueryScheduler {
   }
 
   private nextStart(current: Lane, now: number): number | undefined {
-    if (current.pending.size === 0 || current.active >= current.capacity) return undefined
+    if (current.pending.size === 0) return undefined
+    if (this.disposing) {
+      const { ordinary, priority } = this.lanes
+      return ordinary.active + priority.active < ordinary.capacity + priority.capacity ? now : undefined
+    }
+    if (current.active >= current.capacity) return undefined
     let expired = 0
     for (const start of current.starts) {
       if (now - start < SECOND_MS) break
@@ -106,10 +122,7 @@ export class LinuxScopeQueryScheduler {
       this.nextStart(this.lanes.ordinary, now) ?? Infinity,
     )
     if (at === this.timer?.at) return
-    if (this.timer !== undefined) {
-      clearTimeout(this.timer.handle)
-      this.timer = undefined
-    }
+    this.clearRateTimer()
     if (at <= now) {
       this.immediate = setImmediate(() => {
         try {
@@ -125,6 +138,12 @@ export class LinuxScopeQueryScheduler {
         this.scheduleDispatch()
       }, Math.ceil(at - now)) }
     }
+  }
+
+  private clearRateTimer(): void {
+    if (this.timer === undefined) return
+    clearTimeout(this.timer.handle)
+    this.timer = undefined
   }
 
   private dispatch(): void {
