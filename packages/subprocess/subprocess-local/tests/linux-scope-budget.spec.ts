@@ -3,12 +3,23 @@ import type { SpawnOptions } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 import { Context } from '@deepseek-ai/cordis'
 import type { SubprocessHandle } from '@deepseek-ai/dsh-subprocess'
+import type { IPtyForkOptions } from 'node-pty'
+import type { Config } from '../src/index.ts'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import { expect, it, vi } from 'vitest'
 import { SUBPROCESS_RUNNER_ENV } from '../src/runner-launch.ts'
 import { cleanupLinuxLaunchFiles, consumeLinuxLaunchRequest, linuxLaunchFilesFromLocator } from '../src/runner-protocol.ts'
 
 const childProcess = vi.hoisted(() => ({ execFile: vi.fn(), spawn: vi.fn(), spawnSync: vi.fn() }))
+const spawnPty = vi.hoisted(() => vi.fn())
+vi.mock('@deepseek-ai/dsh-lazy-require', async importOriginal => {
+  const actual = await importOriginal<typeof import('@deepseek-ai/dsh-lazy-require')>()
+  return {
+    ...actual,
+    createLazyRequire: (name: string, from: string) => name === 'node-pty'
+      ? () => ({ spawn: spawnPty }) : actual.createLazyRequire(name, from),
+  }
+})
 vi.mock('node:child_process', async importOriginal => ({
   ...await importOriginal<typeof import('node:child_process')>(),
   ...childProcess,
@@ -34,6 +45,20 @@ class FakeChild extends EventEmitter {
 
 type Reply = (error: Error | null, stdout: string, stderr: string) => void
 
+class FakePty {
+  private exitListener: ((event: { exitCode: number }) => void) | undefined
+
+  constructor(readonly pid: number) {}
+
+  onData(): { dispose(): void } { return { dispose() {} } }
+  onExit(listener: (event: { exitCode: number }) => void): { dispose(): void } {
+    this.exitListener = listener
+    return { dispose: () => { this.exitListener = undefined } }
+  }
+
+  exit(): void { this.exitListener?.({ exitCode: 0 }) }
+}
+
 function peakStartsInSecond(starts: readonly number[]): number {
   let first = 0
   let peak = 0
@@ -44,13 +69,15 @@ function peakStartsInSecond(starts: readonly number[]): number {
   return peak
 }
 
-it.skipIf(process.platform !== 'linux')('bounds status-query starts for a burst of naturally exited Linux scopes', { timeout: 10_000 }, async () => {
-  const scopeCount = 32
-  const starts: number[] = []
+async function scopeFixture(config: Config = {}) {
   const children = new Map<string, FakeChild>()
-  const observedActive = new Set<string>()
-  const handles: SubprocessHandle[] = []
+  const terminals = new Map<string, FakePty>()
+  const launchPaths: string[] = []
+  const kills: string[][] = []
+  const pending = new Map<string, Reply>()
+  const queries: string[] = []
   let finishing = false
+  let respond = (unit: string, reply: Reply): void => { pending.set(unit, reply) }
   const signal = vi.spyOn(process, 'kill').mockImplementation(() => true)
   childProcess.spawn.mockImplementation((file: string, args: string[], options: SpawnOptions) => {
     const unit = args.find(arg => arg.startsWith('--unit=dsh-subprocess-'))?.slice('--unit='.length)
@@ -60,42 +87,101 @@ it.skipIf(process.platform !== 'linux')('bounds status-query starts for a burst 
     }
     const child = new FakeChild(10_000 + children.size, requestPath)
     children.set(`${unit}.scope`, child)
+    launchPaths.push(requestPath)
     consumeLinuxLaunchRequest(requestPath)
     return child
+  })
+  spawnPty.mockImplementation((file: string, args: string[], options: IPtyForkOptions) => {
+    const unit = args.find(arg => arg.startsWith('--unit=dsh-terminal-'))?.slice('--unit='.length)
+    const requestPath = options.env?.[SUBPROCESS_RUNNER_ENV]
+    if (file !== 'systemd-run' || unit === undefined || requestPath === undefined) throw new Error('Expected a terminal scope')
+    const pty = new FakePty(20_000 + terminals.size)
+    terminals.set(`${unit}.scope`, pty)
+    launchPaths.push(requestPath)
+    consumeLinuxLaunchRequest(requestPath)
+    return pty
   })
   childProcess.spawnSync.mockImplementation((file: string, args: string[]) => {
     const [user, operation] = args
     if (user === '--user' && (
       (file === 'systemd-run' && operation === '--scope')
       || (file === 'systemctl' && operation === 'show' && args.includes('--property=Version'))
-      || (finishing && file === 'systemctl' && operation === 'kill' && children.has(args.at(-1) ?? ''))
     )) return { status: 0, stdout: '', stderr: '' }
+    const unit = args.at(-1) ?? ''
+    if (user === '--user' && file === 'systemctl' && operation === 'kill' && (children.has(unit) || terminals.has(unit))) {
+      kills.push(args)
+      return { status: 0, stdout: '', stderr: '' }
+    }
     throw new Error(`Unexpected synchronous process request: ${file} ${args.join(' ')}`)
   })
   childProcess.execFile.mockImplementation((file: string, args: string[], _options: object, reply: Reply) => {
     const [user, operation, unit] = args
-    if (file !== 'systemctl' || user !== '--user' || operation !== 'show' || unit === undefined || !children.has(unit)) {
+    if (file !== 'systemctl' || user !== '--user' || operation !== 'show' || unit === undefined
+      || (!children.has(unit) && !terminals.has(unit))) {
       throw new Error(`Unexpected async process request: ${file} ${args.join(' ')}`)
     }
-    starts.push(performance.now())
-    const state = !finishing && !observedActive.has(unit) ? 'active' : 'inactive'
-    if (state === 'active') observedActive.add(unit)
-    queueMicrotask(() => { reply(null, `LoadState=loaded\nActiveState=${state}\nTasksCurrent=[not set]\n`, '') })
+    if (pending.has(unit)) throw new Error(`Two in-flight queries for ${unit}`)
+    queries.push(unit)
+    if (finishing) queueMicrotask(() => replyState(reply, 'inactive'))
+    else respond(unit, reply)
     return new EventEmitter()
   })
 
   const ctx = new Context()
-  const fiber = await ctx.plugin(LocalSubprocessRuntime)
-  try {
-    for (let i = 0; i < scopeCount; i += 1) {
-      handles.push(ctx.subprocess.spawn({
-        argv: ['fixture-target'],
-        cwd: process.cwd(),
-        env: {},
-        stdio: { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' },
-        graceMs: 100,
-      }))
+  const fiber = await ctx.plugin(LocalSubprocessRuntime, config)
+  const dispose = async (): Promise<void> => {
+    finishing = true
+    for (const [unit, reply] of pending) {
+      pending.delete(unit)
+      replyState(reply, 'inactive')
     }
+    for (const child of children.values()) if (child.exitCode === null) child.exit()
+    for (const terminal of terminals.values()) terminal.exit()
+    await fiber.dispose()
+  }
+  return {
+    children, ctx, kills, pending, queries, signal, terminals, dispose,
+    ordinary: (graceMs = 100): SubprocessHandle => ctx.subprocess.spawn({
+      argv: ['fixture-target'], cwd: process.cwd(), env: {},
+      stdio: { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' }, graceMs,
+    }),
+    onQuery: (next: typeof respond) => { respond = next },
+    complete(unit: string, state: 'active' | 'inactive' | Error): void {
+      const reply = pending.get(unit)
+      if (reply === undefined) throw new Error(`No in-flight query for ${unit}`)
+      pending.delete(unit)
+      if (state instanceof Error) reply(state, '', '')
+      else replyState(reply, state)
+    },
+    async cleanup(): Promise<void> {
+      try {
+        await dispose()
+      } finally {
+        signal.mockRestore()
+        for (const requestPath of launchPaths) cleanupLinuxLaunchFiles(linuxLaunchFilesFromLocator(requestPath))
+      }
+    },
+  }
+}
+
+function replyState(reply: Reply, state: 'active' | 'inactive'): void {
+  reply(null, `LoadState=loaded\nActiveState=${state}\nTasksCurrent=[not set]\n`, '')
+}
+
+it.skipIf(process.platform !== 'linux')('bounds status-query starts for a burst of naturally exited Linux scopes', { timeout: 10_000 }, async () => {
+  const fixture = await scopeFixture()
+  const { children, signal } = fixture
+  const scopeCount = 32
+  const starts: number[] = []
+  const observedActive = new Set<string>()
+  fixture.onQuery((unit, reply) => {
+    starts.push(performance.now())
+    const state = observedActive.has(unit) ? 'inactive' : 'active'
+    observedActive.add(unit)
+    queueMicrotask(() => replyState(reply, state))
+  })
+  try {
+    const handles = Array.from({ length: scopeCount }, () => fixture.ordinary())
     expect(children.size).toBe(scopeCount)
     for (const child of children.values()) child.exit()
     expect(await Promise.all(handles.map(handle => handle.done))).toEqual(
@@ -104,18 +190,70 @@ it.skipIf(process.platform !== 'linux')('bounds status-query starts for a burst 
     expect(await Promise.all(handles.map(handle => handle.waitForExit()))).toEqual(Array.from({ length: scopeCount }, () => true))
     expect(observedActive.size).toBe(scopeCount)
     expect(starts).toHaveLength(scopeCount * 2)
+    expect(fixture.kills).toEqual([])
     expect(signal).not.toHaveBeenCalled()
     expect(peakStartsInSecond(starts), 'ordinary systemctl show starts in a rolling second').toBeLessThanOrEqual(20)
   } finally {
-    finishing = true
-    for (const child of children.values()) {
-      if (child.exitCode === null) child.exit()
-    }
-    try {
-      await fiber.dispose()
-    } finally {
-      signal.mockRestore()
-      for (const child of children.values()) cleanupLinuxLaunchFiles(linuxLaunchFilesFromLocator(child.requestPath))
-    }
+    await fixture.cleanup()
+  }
+})
+
+it.skipIf(process.platform !== 'linux')('shares ordinary capacity with PTY owners and drains both during dispose', async () => {
+  const fixture = await scopeFixture({ ordinaryConcurrency: 1, startsPerTurn: 2 })
+  try {
+    const ordinary = fixture.ordinary()
+    const terminal = await fixture.ctx.subprocess.spawnTerminal({
+      argv: ['fixture-shell'], cwd: process.cwd(), rows: 24, cols: 80,
+      terminalType: 'dumb', graceMs: 100, env: {}, shellActivity: true,
+    })
+    const ordinaryUnit = [...fixture.children.keys()][0]!
+    const terminalUnit = [...fixture.terminals.keys()][0]!
+    const ordinaryExit = ordinary.waitForExit()
+    await vi.waitFor(() => expect(fixture.queries).toEqual([ordinaryUnit]))
+    fixture.terminals.get(terminalUnit)!.exit()
+    await terminal.done
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(fixture.queries).toEqual([ordinaryUnit])
+    fixture.complete(ordinaryUnit, 'active')
+    await vi.waitFor(() => expect(fixture.pending.has(terminalUnit)).toBe(true))
+    await fixture.dispose()
+    await expect(ordinaryExit).resolves.toBe(true)
+    expect(fixture.pending.size).toBe(0)
+  } finally {
+    await fixture.cleanup()
+  }
+})
+
+it.skipIf(process.platform !== 'linux')('promotes a queued owner, discards stale failures, and confirms TERM then KILL serially', async () => {
+  const fixture = await scopeFixture({ ordinaryConcurrency: 1, priorityConcurrency: 1, startsPerTurn: 2 })
+  try {
+    const survivor = fixture.ordinary()
+    const terminating = fixture.ordinary(400)
+    const [survivorUnit, terminatingUnit] = [...fixture.children.keys()]
+    if (survivorUnit === undefined || terminatingUnit === undefined) throw new Error('Expected two scopes')
+    for (const child of fixture.children.values()) child.exit()
+    await Promise.all([survivor.done, terminating.done])
+    const caller = new AbortController()
+    const abandonedWait = survivor.waitForExit(caller.signal)
+    const scopeExit = terminating.waitForExit()
+    await vi.waitFor(() => expect(fixture.queries).toEqual([survivorUnit]))
+    caller.abort()
+    await expect(abandonedWait).resolves.toBe(false)
+    expect(fixture.pending.has(survivorUnit)).toBe(true)
+
+    terminating.terminate()
+    await vi.waitFor(() => expect(fixture.pending.has(terminatingUnit)).toBe(true))
+    expect(fixture.queries).toEqual([survivorUnit, terminatingUnit])
+    await vi.waitFor(() => expect(fixture.kills.map(args => args[3])).toEqual(['--signal=SIGTERM', '--signal=SIGKILL']), { timeout: 2_000 })
+    expect(fixture.queries).toEqual([survivorUnit, terminatingUnit])
+    fixture.complete(terminatingUnit, Object.assign(new Error('stale manager error'), { code: 'EIO' }))
+    await vi.waitFor(() => expect(fixture.queries).toEqual([survivorUnit, terminatingUnit, terminatingUnit]))
+    fixture.complete(terminatingUnit, 'inactive')
+    await expect(scopeExit).resolves.toBe(true)
+    expect(fixture.pending.has(survivorUnit)).toBe(true)
+    fixture.complete(survivorUnit, 'inactive')
+    await expect(survivor.waitForExit()).resolves.toBe(true)
+  } finally {
+    await fixture.cleanup()
   }
 })
