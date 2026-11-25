@@ -12,6 +12,7 @@ import type {
   SubprocessTerminalSpawnSpec,
 } from '@deepseek-ai/dsh-subprocess'
 import { loadLinuxExecve } from './linux-execve.ts'
+import type { LinuxScopeQueryScheduler } from './linux-scope-query.ts'
 import type { BoundProcessOwner, ManagedProcessLaunch } from './managed-owner.ts'
 import {
   cleanupLinuxLaunchFiles,
@@ -29,8 +30,9 @@ import {
 import type { RunnerInvocation } from './runner-launch.ts'
 import { childEnv } from './spawn.ts'
 
-/** Test seams for systemd command execution. */
+/** Provider-owned scheduling and test seams for systemd command execution. */
 export interface LinuxScopeInternals {
+  queryScheduler?: LinuxScopeQueryScheduler
   spawn?: typeof spawn
   spawnSync?: typeof spawnSync
   systemctlQuery?: (command: string, args: readonly string[]) => Promise<SystemctlResult>
@@ -289,6 +291,8 @@ class SystemdScopeOwner implements BoundProcessOwner {
   private killFailure: Error | undefined
   private directKillSettlement: Promise<void> | undefined
   private wakeGeneration = 0
+  private queriedGeneration = 0
+  private querySuperseded: AbortController | undefined
   private wakeWaiter: { generation: number; resolve: () => void } | undefined
 
   constructor(
@@ -299,6 +303,7 @@ class SystemdScopeOwner implements BoundProcessOwner {
     private readonly runSync: typeof spawnSync,
     private readonly query: (command: string, args: readonly string[]) => Promise<SystemctlResult>,
     private readonly sleep: (delayMs: number, signal?: AbortSignal) => Promise<void>,
+    private readonly queryScheduler: LinuxScopeQueryScheduler | undefined,
   ) {}
 
   inspectTaskCount(): number | undefined {
@@ -441,20 +446,39 @@ class SystemdScopeOwner implements BoundProcessOwner {
     }
   }
 
-  private async rangeActive(): Promise<boolean> {
+  private async rangeActive(recheckGeneration?: number): Promise<boolean> {
     this.observeRequestConsumption()
     const generation = this.wakeGeneration
-    const directRunning = this.direct.running()
-    const result = await this.query(this.systemctl, [
-      '--user',
-      'show',
-      this.unit,
-      '--property=LoadState',
-      '--property=ActiveState',
-      '--property=TasksCurrent',
-    ])
-    // A signal invalidates state queried before its delivery and direct fallback.
-    if (generation !== this.wakeGeneration) return true
+    const priority = generation !== this.queriedGeneration || generation === recheckGeneration
+    let directRunning = false
+    const query = (): Promise<SystemctlResult> => {
+      this.queriedGeneration = generation
+      directRunning = this.direct.running()
+      return this.query(this.systemctl, [
+        '--user',
+        'show',
+        this.unit,
+        '--property=LoadState',
+        '--property=ActiveState',
+        '--property=TasksCurrent',
+      ])
+    }
+    const scheduler = this.queryScheduler
+    const superseded = new AbortController()
+    this.querySuperseded = superseded
+    let result: SystemctlResult | undefined
+    try {
+      result = scheduler === undefined
+        ? await query()
+        : await scheduler.query(priority ? 'priority' : 'ordinary', superseded.signal, query)
+    } catch (error) {
+      if (generation !== this.wakeGeneration) return true
+      throw error
+    } finally {
+      this.querySuperseded = undefined
+    }
+    // A signal invalidates both queued work and results from commands that already started.
+    if (result === undefined || generation !== this.wakeGeneration) return true
     const output = `${result.stdout}\n${result.stderr}`
     if (result.status === 0) {
       const { loadState, activeState, tasksCurrent } = this.parseUnitState(result.stdout)
@@ -479,7 +503,7 @@ class SystemdScopeOwner implements BoundProcessOwner {
           this.directKillSettlement = undefined
           await settlement
           // A query preceding direct exit cannot prove that its signalled processes survived.
-          return this.rangeActive()
+          return this.rangeActive(generation)
         }
         throw this.killFailure
       }
@@ -494,6 +518,7 @@ class SystemdScopeOwner implements BoundProcessOwner {
 
   private wakeObservation(): void {
     this.wakeGeneration += 1
+    this.querySuperseded?.abort()
     this.wakeWaiter?.resolve()
     this.wakeWaiter = undefined
   }
@@ -655,6 +680,7 @@ export function prepareLinuxTerminalScope(
       internals.spawnSync ?? spawnSync,
       internals.systemctlQuery ?? querySystemctl,
       internals.sleep ?? sleepWithAbort,
+      internals.queryScheduler,
     ),
     resolveOutcome: outcome => startup.resolveOutcome(outcome),
     cleanup: () => { cleanupLinuxLaunchFiles(files) },
@@ -714,6 +740,7 @@ export function launchLinuxScope(
     internals.spawnSync ?? spawnSync,
     internals.systemctlQuery ?? querySystemctl,
     internals.sleep ?? sleepWithAbort,
+    internals.queryScheduler,
   )
   return {
     stdin: child.stdin,

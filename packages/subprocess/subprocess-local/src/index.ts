@@ -2,9 +2,9 @@
  * Local Service Provider for the subprocess capability seam. Each spawn owns a
  * platform-selected managed range with the spec's per-stream stdio dispositions.
  * Normal disposal terminates and joins live ranges; Node's synchronous exit
- * phase force-stops any ranges the service still owns. It has no config: every
- * disposition and limit arrives on the spec, so deployment-varying choices
- * stay with the caller's config (the bash executor's, the LSP host's, …).
+ * phase force-stops any ranges the service still owns. Per-request choices
+ * arrive on the spawn spec; the provider config controls the shared Linux
+ * scope query budget.
  * @module @deepseek-ai/dsh-subprocess-local
  */
 
@@ -14,6 +14,7 @@ import { userInfo } from 'node:os'
 import { delimiter, extname, isAbsolute, resolve } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
 import type * as NodePty from 'node-pty'
 import type { IPtyForkOptions, IWindowsPtyForkOptions } from 'node-pty'
 import { createLazyRequire } from '@deepseek-ai/dsh-lazy-require'
@@ -43,6 +44,8 @@ import {
   signalLinuxDirectProcess,
   systemdRunIdentity,
 } from './linux-scope.ts'
+import { LinuxScopeQueryScheduler } from './linux-scope-query.ts'
+import type { ScopeQueryBudget } from './linux-scope-query.ts'
 import { LinuxScopeSelector } from './linux-scope-selector.ts'
 import type { LinuxScopeDecision } from './linux-scope-selector.ts'
 import { launchWindowsJob, probeWindowsJob } from './windows-job.ts'
@@ -51,6 +54,20 @@ import { createProcessInspector } from './process-inspector.ts'
 import type { ProcessInspector } from './process-inspector.ts'
 import { LocalTerminalHandle } from './terminal.ts'
 import { prepareShellActivity } from './shell-activity.ts'
+
+/** Shared budgets for asynchronous ordinary and PTY scope queries on Linux. */
+export interface Config {
+  /** Maximum in-flight ordinary queries per provider. */
+  ordinaryConcurrency?: number
+  /** Maximum in-flight termination confirmations per provider. */
+  priorityConcurrency?: number
+  /** Maximum ordinary query starts in any rolling second. */
+  ordinaryStartsPerSecond?: number
+  /** Maximum termination confirmation starts in any rolling second. */
+  priorityStartsPerSecond?: number
+  /** Maximum total query starts before yielding to the event loop. */
+  startsPerTurn?: number
+}
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
 
@@ -75,6 +92,16 @@ function loadNodePty(): typeof NodePty {
  * JavaScript-observable host exit also performs synchronous final termination.
  */
 export class LocalSubprocessRuntime extends SubprocessRuntime {
+  static Config: z<Config, ScopeQueryBudget> = z.object({
+    ordinaryConcurrency: z.natural().min(1).max(8).default(8),
+    priorityConcurrency: z.natural().min(1).max(2).default(2),
+    ordinaryStartsPerSecond: z.natural().min(1).max(20).default(20),
+    priorityStartsPerSecond: z.natural().min(1).max(10).default(10),
+    startsPerTurn: z.natural().min(1).max(4).default(4),
+  })
+
+  /** Shared by ordinary and terminal owners until managed-range observation finishes. */
+  private readonly linuxScopeQueries: LinuxScopeQueryScheduler
   /** Live handles retained for normal disposal and synchronous host-exit finalization. */
   private live = new Set<LocalSubprocessHandle>()
   /** Live terminals retained through normal quiescence or host-exit finalization. */
@@ -100,8 +127,16 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
   terminalInspector: ProcessInspector | undefined
 
-  constructor(ctx: Context) {
+  constructor(ctx: Context, config: Config = {}) {
+    const budget = LocalSubprocessRuntime.Config(config)
+    if (budget.startsPerTurn > Math.min(
+      budget.ordinaryConcurrency + budget.priorityConcurrency,
+      budget.ordinaryStartsPerSecond + budget.priorityStartsPerSecond,
+    )) {
+      throw new Error('subprocess-local: startsPerTurn must not exceed the combined concurrency or starts-per-second limit')
+    }
     super(ctx)
+    this.linuxScopeQueries = new LinuxScopeQueryScheduler(budget)
     ctx.effect(() => {
       const onHostExit = (): void => { this.terminateForHostExit() }
       process.prependListener('exit', onHostExit)
@@ -220,7 +255,7 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
       const linuxScope = containmentMode === 'linux-scope' ? this.linuxScopeDecision : undefined
       const launch = linuxScope === undefined
         ? launchWindowsJob(spec, env)
-        : launchLinuxScope(spec, env, linuxScope.literalArgv)
+        : launchLinuxScope(spec, env, linuxScope.literalArgv, { queryScheduler: this.linuxScopeQueries })
       handle = bindManagedProcess(spec, launch, binding)
       if (linuxScope !== undefined) this.watchLinuxScopeStart(handle.done, linuxScope.generation)
     }
@@ -330,7 +365,12 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     try {
       scope = linuxScope === undefined
         ? undefined
-        : prepareLinuxTerminalScope(launch, { ...activity?.env ?? env, PWD: spec.cwd, TERM: spec.terminalType }, linuxScope.literalArgv)
+        : prepareLinuxTerminalScope(
+          launch,
+          { ...activity?.env ?? env, PWD: spec.cwd, TERM: spec.terminalType },
+          linuxScope.literalArgv,
+          { queryScheduler: this.linuxScopeQueries },
+        )
       if (scope !== undefined) { options.cwd = scope.cwd; options.env = scope.env }
       terminal = loadNodePty().spawn(
         scope?.command ?? file,

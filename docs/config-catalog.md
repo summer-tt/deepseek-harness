@@ -3946,6 +3946,30 @@ export interface Config {
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-subagent-spawn-in-process -->
 
+<!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-subprocess-local -->
+<a id="deepseek-aidsh-subprocess-local"></a>
+
+## `@deepseek-ai/dsh-subprocess-local`
+
+- `source`: [`packages/subprocess/subprocess-local/src/index.ts:59`](../packages/subprocess/subprocess-local/src/index.ts)
+
+```ts config-catalog
+/** Shared budgets for asynchronous ordinary and PTY scope queries on Linux. */
+export interface Config {
+  /** Maximum in-flight ordinary queries per provider. */
+  ordinaryConcurrency?: number
+  /** Maximum in-flight termination confirmations per provider. */
+  priorityConcurrency?: number
+  /** Maximum ordinary query starts in any rolling second. */
+  ordinaryStartsPerSecond?: number
+  /** Maximum termination confirmation starts in any rolling second. */
+  priorityStartsPerSecond?: number
+  /** Maximum total query starts before yielding to the event loop. */
+  startsPerTurn?: number
+}
+```
+<!-- END GENERATED config-catalog:@deepseek-ai/dsh-subprocess-local -->
+
 <!-- BEGIN GENERATED config-catalog:@deepseek-ai/dsh-system-prompt -->
 <a id="deepseek-aidsh-system-prompt"></a>
 
@@ -5184,7 +5208,6 @@ These load from a `cordis.yml` entry with no `config:` block; they declare no co
 | `@deepseek-ai/dsh-settings` | `configEditor` · `profileContext` | [`packages/settings/settings/src/index.ts`](../packages/settings/settings/src/index.ts) |
 | `@deepseek-ai/dsh-skill-badge` | `skills` | [`packages/experimental/skill-badge/src/index.ts`](../packages/experimental/skill-badge/src/index.ts) |
 | `@deepseek-ai/dsh-storage` | — | [`packages/storage/storage/src/index.ts`](../packages/storage/storage/src/index.ts) |
-| `@deepseek-ai/dsh-subprocess-local` | — | [`packages/subprocess/subprocess-local/src/index.ts`](../packages/subprocess/subprocess-local/src/index.ts) |
 | `@deepseek-ai/dsh-subprocess-ssh` | `ssh` | [`packages/ssh/subprocess-ssh/src/index.ts`](../packages/ssh/subprocess-ssh/src/index.ts) |
 | `@deepseek-ai/dsh-terminal` | — | [`packages/terminal/terminal/src/index.ts`](../packages/terminal/terminal/src/index.ts) |
 | `@deepseek-ai/dsh-tool-call-timeout-policy` | `tools` | [`packages/guard/timeout-policy/src/index.ts`](../packages/guard/timeout-policy/src/index.ts) |

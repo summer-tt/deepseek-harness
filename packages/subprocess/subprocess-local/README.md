@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Mount `dsh-subprocess-local` in any composition that runs child processes on the host. It resolves local executables, gives ordinary Linux and Windows commands plus supported Linux terminal sessions an OS-owned managed range, and provides real terminal sessions through `node-pty`; unsupported hosts use an explicit weaker fallback. It has no configuration, so every disposition, limit, terminal size, and grace arrives on the spawn request from the calling capability seam. Output collection keeps a bounded in-memory tail with optional spill files for full-stream recovery, children start from a scrubbed environment, and disposal terminates and joins every selected range or session.
+Mount `dsh-subprocess-local` in any composition that runs child processes on the host. It resolves local executables, gives ordinary Linux and Windows commands plus supported Linux terminal sessions an OS-owned managed range, and provides real terminal sessions through `node-pty`; unsupported hosts use an explicit weaker fallback. The spawn request supplies per-process options; provider configuration controls the shared Linux scope query budgets. Output collection keeps a bounded in-memory tail with optional spill files for full-stream recovery, children start from a scrubbed environment, and disposal terminates and joins every selected range or session.
 
 ## Table of Contents
 
@@ -29,12 +29,26 @@ Mount the provider beside its consumers and start processes exactly as the subpr
 
 ### Mounting the provider
 
-Load the provider in the same composition as its consumers. It has no config fields: every choice arrives on the spawn request, so deployment-varying decisions stay with the caller's configuration. `terminalEnvironment()` reads a nonempty `SHELL` on POSIX, falling back to the account login shell, or a nonempty `ComSpec` on Windows. Empty values are omitted so the consumer can choose its platform fallback.
+Load the provider in the same composition as its consumers. `terminalEnvironment()` reads a nonempty `SHELL` on POSIX, falling back to the account login shell, or a nonempty `ComSpec` on Windows. Empty values are omitted so the consumer can choose its platform fallback.
 
 ```yaml
 - name: '@deepseek-ai/dsh-subprocess-local'
 - name: '@deepseek-ai/dsh-bash-local'
 ```
+
+### Linux scope query budgets
+
+Each provider instance shares the budgets for asynchronous `systemctl show` exit observations across ordinary and PTY scopes. Each lane is FIFO; neither can use the other's reserved concurrency or launch allowance. Per-process `done` does not wait for this queue, but a managed-range `waitForExit()` can. Synchronous signals, cleanup, capability probes, and PTY task counts do not use these budgets.
+
+| Config field | Default | Limit |
+|---|---:|---|
+| `ordinaryConcurrency` | 8 | Ordinary queries in flight |
+| `priorityConcurrency` | 2 | Termination confirmations in flight |
+| `ordinaryStartsPerSecond` | 20 | Ordinary query launches per rolling second |
+| `priorityStartsPerSecond` | 10 | Termination confirmation launches per rolling second |
+| `startsPerTurn` | 4 | Total query launches before yielding to the event loop |
+
+Each field takes a positive integer no higher than its default. `startsPerTurn` cannot exceed the combined concurrency or combined starts-per-second limit. A signal invalidates queued and in-flight observations for that scope. A superseded queued query does not start; an in-flight query must finish before the owner can run its priority confirmation. Regular polls resume in the ordinary lane after confirmation. These limits do not change the scope exit criteria or reclaim legacy units that remain active after natural exit.
 
 ### Resolving executables
 

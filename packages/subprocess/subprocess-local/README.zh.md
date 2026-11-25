@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-在任何于宿主机上运行子进程的组合中挂载 `dsh-subprocess-local`。它解析本地可执行文件，为普通 Linux 与 Windows 命令以及受支持的 Linux 终端会话提供由 OS 所有的受管范围，并通过 `node-pty` 提供真实终端会话；不受支持的宿主使用明确披露的较弱 fallback。它没有任何配置，因此每项处置方式、限制、终端尺寸与宽限期都随 spawn 请求来自调用方能力 seam。输出收集在内存中保留一段有界尾部，并可选地用 spill 文件恢复完整流；子进程从清理后的环境起步；dispose（资源释放）会终止并等待每个选定范围或会话完全停稳。
+在任何于宿主机上运行子进程的组合中挂载 `dsh-subprocess-local`。它解析本地可执行文件，为普通 Linux 与 Windows 命令以及受支持的 Linux 终端会话提供由 OS 所有的受管范围，并通过 `node-pty` 提供真实终端会话；不受支持的宿主使用明确披露的较弱 fallback。每个进程的选项由 spawn 请求提供；提供方的配置控制 Linux scope 共享查询额度。输出收集在内存中保留一段有界尾部，并可选地用 spill 文件恢复完整流；子进程从清理后的环境起步；dispose（资源释放）会终止并等待每个选定范围或会话完全停稳。
 
 ## 目录
 
@@ -29,12 +29,26 @@ kind: "package-reference"
 
 ### 挂载提供方
 
-在与消费方相同的组合中加载本提供方。它没有任何配置字段：每项选择都随 spawn 请求到达，因此随部署变化的决策留在调用方的配置里。 `terminalEnvironment()` 在 POSIX 读取非空的 `SHELL`，缺失时使用账户登录 shell；在 Windows 读取非空的 `ComSpec`。空值会被省略，由消费者选择平台回退。
+在与消费方相同的组合中加载本提供方。`terminalEnvironment()` 在 POSIX 读取非空的 `SHELL`，缺失时使用账户登录 shell；在 Windows 读取非空的 `ComSpec`。空值会被省略，由消费者选择平台回退。
 
 ```yaml
 - name: '@deepseek-ai/dsh-subprocess-local'
 - name: '@deepseek-ai/dsh-bash-local'
 ```
+
+### Linux scope 查询额度
+
+每个提供方实例在普通 scope 与 PTY scope 之间共享异步 `systemctl show` 退出观察的额度。普通查询和终止确认各自按 FIFO 调度，不能占用对方预留的并发数或启动额度。`done` 不等这个队列；受管范围的 `waitForExit()` 可能需要等待。同步信号、清理、能力探测和 PTY 任务计数不受这些额度约束。
+
+| 配置字段 | 默认值 | 限制 |
+|---|---:|---|
+| `ordinaryConcurrency` | 8 | 普通查询的最大并发数 |
+| `priorityConcurrency` | 2 | 终止确认的最大并发数 |
+| `ordinaryStartsPerSecond` | 20 | 任意滚动一秒内启动的普通查询数 |
+| `priorityStartsPerSecond` | 10 | 任意滚动一秒内启动的终止确认数 |
+| `startsPerTurn` | 4 | 让出事件循环前可启动的查询总数 |
+
+各字段均接受不超过默认值的正整数。`startsPerTurn` 不得超过两类查询的合计并发上限或合计每秒启动上限。信号会使该 scope 排队和在途的旧查询失效。失效的排队查询不会启动；owner 必须等在途查询结束，才能发起优先确认。确认后，常规轮询回到普通队列。这些额度不改变 scope 的退出判据，也不回收自然退出后仍为 active 的 legacy unit。
 
 ### 解析可执行文件
 
