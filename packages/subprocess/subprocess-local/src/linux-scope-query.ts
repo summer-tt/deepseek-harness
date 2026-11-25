@@ -45,7 +45,7 @@ export class LinuxScopeQueryScheduler {
    * Queue one command without starting it inline. Aborting a queued query is not an observation failure.
    * @param name - independent budget to charge for a start.
    * @param superseded - cancels only the queued request; it cannot interrupt a started query.
-   * @param run - start the query and settle when that command completes.
+   * @param run - attempt the launch synchronously before returning a promise for command completion.
    * @returns the query result, or undefined if superseded before dispatch.
    */
   query<T>(name: LaneName, superseded: AbortSignal, run: () => Promise<T>): Promise<T | undefined> {
@@ -55,7 +55,6 @@ export class LinuxScopeQueryScheduler {
     const start = (): void => {
       superseded.removeEventListener('abort', cancel)
       current.active += 1
-      current.starts.push(performance.now())
       void execute()
     }
     const cancel = (): void => {
@@ -63,9 +62,17 @@ export class LinuxScopeQueryScheduler {
       resolve(undefined)
       this.scheduleDispatch()
     }
+    const launch = (): Promise<T> => {
+      try {
+        return run()
+      } finally {
+        // Charge after the synchronous attempt so its budget cannot expire before the start ages out.
+        current.starts.push(performance.now())
+      }
+    }
     const execute = async (): Promise<void> => {
       try {
-        resolve(await run())
+        resolve(await launch())
       } catch (error) {
         reject(error)
       } finally {
