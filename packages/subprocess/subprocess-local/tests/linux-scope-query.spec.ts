@@ -161,3 +161,81 @@ it('charges immediate failures and starts both lanes in bounded batches at the r
     vi.useRealTimers()
   }
 })
+
+const disposalBudget = {
+  ordinaryConcurrency: 1,
+  priorityConcurrency: 1,
+  ordinaryStartsPerSecond: 1,
+  priorityStartsPerSecond: 1,
+  startsPerTurn: 1,
+}
+
+it('cancels its rate-delay timer when draining, leaving another scheduler rate-limited', async () => {
+  vi.useFakeTimers({ now: 0, toFake: ['Date', 'setImmediate', 'setTimeout', 'clearTimeout'] })
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => Date.now())
+  try {
+    const first = new LinuxScopeQueryScheduler(disposalBudget)
+    const second = new LinuxScopeQueryScheduler(disposalBudget)
+    const signal = new AbortController().signal
+    const run = () => Promise.resolve()
+    const warmup = [first.query('ordinary', signal, run), second.query('ordinary', signal, run)]
+    await vi.advanceTimersByTimeAsync(0)
+    await Promise.all(warmup)
+    const firstStart = vi.fn(run)
+    const secondStart = vi.fn(run)
+    const pending = [first.query('ordinary', signal, firstStart), second.query('ordinary', signal, secondStart)]
+    await vi.advanceTimersByTimeAsync(990)
+    expect(vi.getTimerCount()).toBe(2)
+    expect(firstStart).not.toHaveBeenCalled()
+    expect(secondStart).not.toHaveBeenCalled()
+    first.beginDisposal()
+    first.beginDisposal()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(firstStart).toHaveBeenCalledOnce()
+    expect(secondStart).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(20)
+    await Promise.all(pending)
+    expect(firstStart).toHaveBeenCalledOnce()
+    expect(secondStart).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  } finally {
+    clock.mockRestore()
+    vi.useRealTimers()
+  }
+})
+
+it('keeps an already scheduled batch and counts the existing query in the combined drain capacity', async () => {
+  vi.useFakeTimers({ now: 0, toFake: ['Date', 'setImmediate', 'setTimeout', 'clearTimeout'] })
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => Date.now())
+  try {
+    const scheduler = new LinuxScopeQueryScheduler(disposalBudget)
+    const signal = new AbortController().signal
+    const releaseFirst = Promise.withResolvers<undefined>()
+    const releaseSecond = Promise.withResolvers<undefined>()
+    const firstStart = vi.fn(() => releaseFirst.promise)
+    const secondStart = vi.fn(() => releaseSecond.promise)
+    const thirdStart = vi.fn(() => Promise.resolve())
+    const first = scheduler.query('ordinary', signal, firstStart)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(firstStart).toHaveBeenCalledOnce()
+    const second = scheduler.query('priority', signal, secondStart)
+    const third = scheduler.query('ordinary', signal, thirdStart)
+    expect(vi.getTimerCount()).toBe(1)
+    scheduler.beginDisposal()
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(secondStart).toHaveBeenCalledOnce()
+    expect(thirdStart).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+    releaseSecond.resolve(undefined)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(thirdStart).toHaveBeenCalledOnce()
+    releaseFirst.resolve(undefined)
+    await Promise.all([first, second, third])
+    expect(vi.getTimerCount()).toBe(0)
+  } finally {
+    clock.mockRestore()
+    vi.useRealTimers()
+  }
+})
