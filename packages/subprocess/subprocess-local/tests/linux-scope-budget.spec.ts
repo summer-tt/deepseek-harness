@@ -198,6 +198,28 @@ it.skipIf(process.platform !== 'linux')('bounds status-query starts for a burst 
   }
 })
 
+it.skipIf(process.platform !== 'linux')('reports a current query error and retries while the launcher remains owned', async () => {
+  const fixture = await scopeFixture()
+  try {
+    const handle = fixture.ordinary()
+    const unit = fixture.children.keys().next().value
+    if (unit === undefined) throw new Error('Expected a scope')
+    const firstWait = handle.waitForExit()
+    const checked = expect(firstWait).rejects.toThrow('current manager failure')
+    await vi.waitFor(() => expect(fixture.pending.has(unit)).toBe(true))
+    fixture.complete(unit, new Error('current manager failure'))
+    await checked
+    const secondWait = handle.waitForExit()
+    await vi.waitFor(() => expect(fixture.queries).toEqual([unit, unit]))
+    fixture.children.get(unit)?.exit()
+    fixture.complete(unit, 'inactive')
+    await expect(secondWait).resolves.toBe(true)
+    await expect(handle.done).resolves.toEqual({ exitCode: 0, signal: null })
+  } finally {
+    await fixture.cleanup()
+  }
+})
+
 it.skipIf(process.platform !== 'linux')('shares ordinary capacity with PTY owners and drains both during dispose', async () => {
   const fixture = await scopeFixture({ ordinaryConcurrency: 1, startsPerTurn: 2 })
   try {
