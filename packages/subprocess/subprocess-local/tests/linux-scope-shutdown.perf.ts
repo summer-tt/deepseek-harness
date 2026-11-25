@@ -82,7 +82,7 @@ async function compare(checkout: string, count: number, mode: Mode): Promise<boo
     sigkill: number
   } | undefined
   let holdFirst = holdOld
-  let simulateHostExit: (() => void) | undefined
+  let providerExit: ((code: number) => void) | undefined
   const reject = (): never => { throw new Error('Unexpected real process operation in shutdown fixture') }
   try {
     Object.assign(process.env, { TMPDIR: dir, PATH: dir, XDG_RUNTIME_DIR: dir, DBUS_SESSION_BUS_ADDRESS: `unix:path=${dir}/absent` })
@@ -167,9 +167,8 @@ async function compare(checkout: string, count: number, mode: Mode): Promise<boo
     const ctx = new Context()
     const listenersBefore = new Set(process.listeners('exit'))
     const fiber = await ctx.plugin(Runtime)
-    const providerExit = process.listeners('exit').find(listener => !listenersBefore.has(listener))
+    providerExit = process.listeners('exit').find(listener => !listenersBefore.has(listener))
     assert(providerExit !== undefined)
-    simulateHostExit = () => { providerExit(0) }
     for (let index = 0; index < count; index += 1) ctx.subprocess.spawn({
       argv: ['fixture-target'], cwd: dir, env: {}, graceMs: mode === 'grace-kill' ? 50 : 200_000,
       stdio: { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' },
@@ -187,7 +186,7 @@ async function compare(checkout: string, count: number, mode: Mode): Promise<boo
     }, (code) => {
       exit = { code, ms: time - began, disposed: disposedAt !== undefined,
         active: active.size, pending: count - confirmed.size, descendantAlive, shows: showStarts.length, term, sigkill }
-      simulateHostExit?.()
+      providerExit?.(code)
     })
     shutdown.interrupt(0)
     for (const child of launchers) child.exit()
@@ -232,6 +231,7 @@ async function compare(checkout: string, count: number, mode: Mode): Promise<boo
     }
     return exit.disposed
   } finally {
+    if (providerExit !== undefined) process.off('exit', providerExit)
     Object.assign(globalThis, timers)
     if (now === undefined) Reflect.deleteProperty(performance, 'now')
     else Object.defineProperty(performance, 'now', now)
