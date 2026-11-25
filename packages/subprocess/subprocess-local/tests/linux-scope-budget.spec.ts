@@ -12,7 +12,7 @@ import { cleanupLinuxLaunchFiles, consumeLinuxLaunchRequest, linuxLaunchFilesFro
 
 const childProcess = vi.hoisted(() => ({ execFile: vi.fn(), spawn: vi.fn(), spawnSync: vi.fn() }))
 const spawnPty = vi.hoisted(() => vi.fn())
-vi.mock('@deepseek-ai/dsh-lazy-require', async importOriginal => {
+vi.mock('@deepseek-ai/dsh-lazy-require', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@deepseek-ai/dsh-lazy-require')>()
   return {
     ...actual,
@@ -125,7 +125,7 @@ async function scopeFixture(config: Config = {}) {
     }
     if (pending.has(unit)) throw new Error(`Two in-flight queries for ${unit}`)
     queries.push(unit)
-    if (finishing) queueMicrotask(() => replyState(reply, 'inactive'))
+    if (finishing) queueMicrotask(() =>{  replyState(reply, 'inactive'); })
     else respond(unit, reply)
     return new EventEmitter()
   })
@@ -198,7 +198,7 @@ it.skipIf(process.platform !== 'linux')('bounds status-query starts for a burst 
     starts.push(performance.now())
     const state = observedActive.has(unit) ? 'inactive' : 'active'
     observedActive.add(unit)
-    queueMicrotask(() => replyState(reply, state))
+    queueMicrotask(() =>{  replyState(reply, state); })
   })
   try {
     const handles = Array.from({ length: scopeCount }, () => fixture.ordinary())
@@ -227,10 +227,10 @@ it.skipIf(process.platform !== 'linux').each(['ordinary', 'terminal'] as const)(
     try {
       const launch = kind === 'ordinary' ? service.spawn(ordinarySpec()) : await service.spawnTerminal(terminalSpec())
       expect(disposal).toBeDefined()
-      await vi.waitFor(() => expect(fixture.kills).toHaveLength(1))
+      await vi.waitFor(() =>{  expect(fixture.kills).toHaveLength(1); })
       const unit = fixture.kills[0]?.at(-1)
       if (unit === undefined) throw new Error('Expected teardown to include the reentrant launch')
-      await vi.waitFor(() => expect(fixture.pending.has(unit)).toBe(true))
+      await vi.waitFor(() =>{  expect(fixture.pending.has(unit)).toBe(true); })
       fixture.onLaunch(() => { throw new Error('Launch adapter reached after disposal began') })
       const launchCalls = () => childProcess.spawn.mock.calls.length + spawnPty.mock.calls.length
       const before = launchCalls()
@@ -265,11 +265,11 @@ it.skipIf(process.platform !== 'linux').each(['ordinary', 'terminal'] as const)(
     try {
       const launch = kind === 'ordinary' ? runtime.spawn(ordinarySpec()) : await runtime.spawnTerminal(terminalSpec())
       expect(disposal).toBeDefined()
-      await vi.waitFor(() => expect(fixture.kills.length + Number(disposed)).toBeGreaterThan(0))
+      await vi.waitFor(() =>{  expect(fixture.kills.length + Number(disposed)).toBeGreaterThan(0); })
       expect(disposed).toBe(false)
       const unit = fixture.kills[0]?.at(-1)
       if (unit === undefined) throw new Error('Expected the pending allocation to be included in disposal')
-      await vi.waitFor(() => expect(fixture.pending.has(unit)).toBe(true))
+      await vi.waitFor(() =>{  expect(fixture.pending.has(unit)).toBe(true); })
       fixture.children.get(unit)?.exit()
       fixture.terminals.get(unit)?.exit()
       fixture.complete(unit, 'inactive')
@@ -315,11 +315,11 @@ it.skipIf(process.platform !== 'linux')('reports a current query error and retri
     if (unit === undefined) throw new Error('Expected a scope')
     const firstWait = handle.waitForExit()
     const checked = expect(firstWait).rejects.toThrow('current manager failure')
-    await vi.waitFor(() => expect(fixture.pending.has(unit)).toBe(true))
+    await vi.waitFor(() =>{  expect(fixture.pending.has(unit)).toBe(true); })
     fixture.complete(unit, new Error('current manager failure'))
     await checked
     const secondWait = handle.waitForExit()
-    await vi.waitFor(() => expect(fixture.queries).toEqual([unit, unit]))
+    await vi.waitFor(() =>{  expect(fixture.queries).toEqual([unit, unit]); })
     fixture.children.get(unit)?.exit()
     fixture.complete(unit, 'inactive')
     await expect(secondWait).resolves.toBe(true)
@@ -340,13 +340,13 @@ it.skipIf(process.platform !== 'linux')('shares ordinary capacity with PTY owner
     const ordinaryUnit = [...fixture.children.keys()][0]!
     const terminalUnit = [...fixture.terminals.keys()][0]!
     const ordinaryExit = ordinary.waitForExit()
-    await vi.waitFor(() => expect(fixture.queries).toEqual([ordinaryUnit]))
+    await vi.waitFor(() =>{  expect(fixture.queries).toEqual([ordinaryUnit]); })
     fixture.terminals.get(terminalUnit)!.exit()
     await terminal.done
     await new Promise<void>(resolve => setImmediate(resolve))
     expect(fixture.queries).toEqual([ordinaryUnit])
     fixture.complete(ordinaryUnit, 'active')
-    await vi.waitFor(() => expect(fixture.pending.has(terminalUnit)).toBe(true))
+    await vi.waitFor(() =>{  expect(fixture.pending.has(terminalUnit)).toBe(true); })
     await fixture.dispose()
     await expect(ordinaryExit).resolves.toBe(true)
     expect(fixture.pending.size).toBe(0)
@@ -367,18 +367,18 @@ it.skipIf(process.platform !== 'linux')('promotes a queued owner, discards stale
     const caller = new AbortController()
     const abandonedWait = survivor.waitForExit(caller.signal)
     const scopeExit = terminating.waitForExit()
-    await vi.waitFor(() => expect(fixture.queries).toEqual([survivorUnit]))
+    await vi.waitFor(() =>{  expect(fixture.queries).toEqual([survivorUnit]); })
     caller.abort()
     await expect(abandonedWait).resolves.toBe(false)
     expect(fixture.pending.has(survivorUnit)).toBe(true)
 
     terminating.terminate()
-    await vi.waitFor(() => expect(fixture.pending.has(terminatingUnit)).toBe(true))
+    await vi.waitFor(() =>{  expect(fixture.pending.has(terminatingUnit)).toBe(true); })
     expect(fixture.queries).toEqual([survivorUnit, terminatingUnit])
-    await vi.waitFor(() => expect(fixture.kills.map(args => args[3])).toEqual(['--signal=SIGTERM', '--signal=SIGKILL']), { timeout: 2_000 })
+    await vi.waitFor(() =>{  expect(fixture.kills.map(args => args[3])).toEqual(['--signal=SIGTERM', '--signal=SIGKILL']); }, { timeout: 2_000 })
     expect(fixture.queries).toEqual([survivorUnit, terminatingUnit])
     fixture.complete(terminatingUnit, Object.assign(new Error('stale manager error'), { code: 'EIO' }))
-    await vi.waitFor(() => expect(fixture.queries).toEqual([survivorUnit, terminatingUnit, terminatingUnit]))
+    await vi.waitFor(() =>{  expect(fixture.queries).toEqual([survivorUnit, terminatingUnit, terminatingUnit]); })
     fixture.complete(terminatingUnit, 'inactive')
     await expect(scopeExit).resolves.toBe(true)
     expect(fixture.pending.has(survivorUnit)).toBe(true)
