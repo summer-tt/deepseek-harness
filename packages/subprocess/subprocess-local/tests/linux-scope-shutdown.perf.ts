@@ -81,7 +81,8 @@ async function compare(checkout: string, count: number, mode: Mode): Promise<boo
     term: number
     sigkill: number
   } | undefined
-  let holdFirst = holdOld
+  let holdFirst = false
+  let settledUnit: string | undefined
   let providerExit: ((code: number) => void) | undefined
   const reject = (): never => { throw new Error('Unexpected real process operation in shutdown fixture') }
   try {
@@ -112,6 +113,7 @@ async function compare(checkout: string, count: number, mode: Mode): Promise<boo
           else {
             const unit = args.at(-1)
             assert(unit !== undefined && children.has(unit))
+            assert.notEqual(unit, settledUnit, 'Previously settled owner must not be signalled again')
             if (operation === 'stop') {
               assert.equal(mode, 'active-empty')
               stops += 1
@@ -169,12 +171,25 @@ async function compare(checkout: string, count: number, mode: Mode): Promise<boo
     const fiber = await ctx.plugin(Runtime)
     providerExit = process.listeners('exit').find(listener => !listenersBefore.has(listener))
     assert(providerExit !== undefined)
-    for (let index = 0; index < count; index += 1) ctx.subprocess.spawn({
+    const launch = () => ctx.subprocess.spawn({
       argv: ['fixture-target'], cwd: dir, env: {}, graceMs: mode === 'grace-kill' ? 50 : 200_000,
       stdio: { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' },
     })
-    const launchers = [...children.values()]
+    const settled = launch()
+    const previous = children.entries().next().value
+    assert(previous !== undefined)
+    const [previousUnit, previousLauncher] = previous
+    active.delete(previousUnit)
+    previousLauncher.exit()
+    await advance(5)
+    assert.equal(await settled.waitForExit(), true)
+    assert(confirmed.delete(previousUnit))
+    settledUnit = previousUnit
+    showStarts.length = 0
+    for (let index = 0; index < count; index += 1) launch()
+    const launchers = [...children.values()].slice(1)
     if (holdOld) {
+      holdFirst = true
       launchers[0]?.exit()
       await advance(10)
       assert(held !== undefined)
@@ -204,13 +219,16 @@ async function compare(checkout: string, count: number, mode: Mode): Promise<boo
       assert.equal(descendantAlive, false)
       held?.()
     }
+    await advance(began + 20_000)
+    const at20Seconds = { disposed: disposedAt !== undefined, pending: count - confirmed.size,
+      active: active.size, descendantAlive, shows: showStarts.length }
     await advance(began + 110_000)
     assert(exit !== undefined)
     assert(disposedAt !== undefined)
     assert.equal(active.size, 0)
     assert.equal(queue.size, 0)
     const lastShow = showStarts.at(-1)
-    console.log(JSON.stringify({ checkout, mode, owners: count, exit, disposedMs: disposedAt - began,
+    console.log(JSON.stringify({ checkout, mode, owners: count, preSettled: 1, exit, at20Seconds, disposedMs: disposedAt - began,
       lastShowMs: lastShow === undefined ? null : lastShow - began,
       finalTerm: term, finalKill: sigkill, stops, active: active.size }))
     assert.equal(exit.code, 0)
