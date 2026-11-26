@@ -107,14 +107,15 @@ export function AgentPresetSeat({
     if (draftPreset === undefined) void load()
   }, [load, draftPreset === undefined])
 
+  const showCodingTools = developerTools || draftPreset?.remote === true
   const options = useMemo(
     () => state.options.flatMap((option) => {
-      if (!developerTools && requiresCodingTools(option)) return []
+      if (!showCodingTools && requiresCodingTools(option)) return []
       const text = presetDisplayText(option, t)
       const name = presetDisplay === undefined ? text.name : presetDisplay(option.id, text.name)
       return name === undefined ? [] : [{ id: option.id, text: { ...text, name } }]
     }),
-    [state.options, developerTools, presetDisplay, t],
+    [state.options, showCodingTools, presetDisplay, t],
   )
 
   useEffect(() => {

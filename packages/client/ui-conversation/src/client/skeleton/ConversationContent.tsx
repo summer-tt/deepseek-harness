@@ -177,7 +177,7 @@ export function ConversationContent(props: ConversationContentProps) {
         <div className={css.heroWorkspaceRow}>
           {renderSlot('conversation.hero.draftTarget', {
             draftAvailable: heroDraft, targetSessionId: sessionId, renderWorkspace,
-            renderDraftPreset: draftPreset => renderSlot('conversation.hero.agentPreset', { draftPreset }),
+            renderDraftPreset: (draftPreset, fallback) => renderSlot('conversation.hero.agentPreset', { draftPreset }, { fallback }),
             renderNativeTarget: presetDisplay => <>{renderWorkspace()}{renderSlot('conversation.hero.agentPreset', { presetDisplay })}</>,
           }, {
             children: <>{renderWorkspace()}{renderSlot('conversation.hero.agentPreset', {})}</>,

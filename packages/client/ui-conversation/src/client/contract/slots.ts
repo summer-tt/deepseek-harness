@@ -420,6 +420,8 @@ export interface HeroDraftPresetControl {
   readonly options: readonly { id: string; name?: string; description?: string }[]
   readonly selectedId?: string | undefined
   readonly disabled?: boolean | undefined
+  /** Remote options are filtered by the selected Host. */
+  readonly remote?: boolean | undefined
   readonly onSelect: (id: string) => void
 }
 
@@ -766,7 +768,7 @@ export type ComposerAttachmentsProps =
 export interface HeroDraftTargetOwnerProps {
   readonly draftAvailable: boolean
   readonly targetSessionId?: SessionId | undefined
-  readonly renderDraftPreset?: ((control: HeroDraftPresetControl) => ReactNode) | undefined
+  readonly renderDraftPreset?: ((control: HeroDraftPresetControl, fallback: ReactNode) => ReactNode) | undefined
   readonly renderNativeTarget?: ((display: NonNullable<HeroAgentPresetOwnerProps['presetDisplay']>) => ReactNode) | undefined
   readonly renderWorkspace: (options: {
     label?: string | undefined
