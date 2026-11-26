@@ -16,7 +16,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { RemoteError, TestRemote, TestSessions } from '@deepseek-ai/dsh-client-test-runtime'
 import type { SessionFixture } from '@deepseek-ai/dsh-client-test-runtime'
 import { IconGoalOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { ClientSessionContext, ConsumeTokenRequest, InputTriggerPick, InputTriggerSource, SubmitAttachment } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
+import type { ClientSessionContext, ComposerOccurrenceId, ConsumeTokenRequest, InputTriggerPick, InputTriggerSource, SubmitAttachment } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { CommandContribution, CommandDecoration, PopupSelectSpec, SelectOption } from '../src/client/contract.ts'
 import type { CommandDescriptor } from '../src/client/directory.ts'
 import { CommandUiRuntime } from '../src/client/service.ts'
@@ -574,6 +574,83 @@ describe('decorations (bare-invocation UI on host commands)', () => {
     expect(() => { command.decorate(goalDecoration()) }).toThrow('duplicate decoration for /goal')
     dispose()
     expect(() => { command.decorate(goalDecoration())() }).not.toThrow()
+  })
+})
+
+describe('composer-owned popup opening', () => {
+  it('routes menu picks and bare Enter, consuming their tokens without executing', async () => {
+    const { command, source, mint, executeCalls } = await bench()
+    const scope = mint('s1')
+    const session = proj('s1')
+    const first = 'first' as ComposerOccurrenceId
+    const second = 'second' as ComposerOccurrenceId
+    const span = { start: 2, end: 6, draftRev: 3 }
+    const consumes: ConsumeTokenRequest[] = []
+    scope.ctx.on('slash/input-consume-token', (req) => {
+      consumes.push(req)
+      return true
+    })
+    const open = vi.fn(() => true)
+    const options = vi.fn(async () => [{ id: 'option', label: 'Option' }])
+    command.register(themeContribution({ name: 'model', ui: themeUi({ openInComposer: open, options }) }))
+    const popup = command.popupFor(scope.ctx)
+    expect(source.onPick({
+      candidate: { name: 'model' }, session, position: 'inline', via: 'menu', action: 'pick', composerId: first, span,
+    })).toBe('handled')
+    const signal = new AbortController().signal
+    await expect(source.matchEnter!(session, '/model', signal, { attachments: 0, composerId: second })).resolves.toBe('handled')
+    await expect(source.matchEnter!(session, '/model args', signal, { attachments: 0, composerId: second })).resolves.toBeUndefined()
+    expect(open.mock.calls).toEqual([[session, first], [session, second]])
+    expect(consumes).toEqual([
+      { guard: { kind: 'span', span } },
+      { guard: { kind: 'bare-token', token: '/model' } },
+    ])
+    expect(popup.state.getSnapshot().open).toBe(false)
+    expect(options).not.toHaveBeenCalled()
+    expect(executeCalls).toEqual([])
+  })
+
+  it('drops a fallback if the initiating composer unmounts while Enter waits for the catalog', async () => {
+    const pending = Promise.withResolvers<{ commands: CommandDescriptor[] }>()
+    const { command, source, mint } = await bench({ commands: () => pending.promise })
+    const session = proj('s1')
+    const scope = mint('s1')
+    const composerId = 'first' as ComposerOccurrenceId
+    const popup = command.popupFor(scope.ctx)
+    const unbind = popup.bindComposer(composerId, vi.fn())
+    const options = vi.fn(async () => [])
+    command.decorate({ name: 'plan', ui: themeUi({ options }), available: () => true })
+    const submission = source.matchEnter!(session, '/plan', new AbortController().signal, { attachments: 0, composerId })
+    unbind()
+    pending.resolve({ commands: S1_CMDS })
+    await expect(submission).resolves.toBe('handled')
+    expect(popup.state.getSnapshot().open).toBe(false)
+    expect(options).not.toHaveBeenCalled()
+  })
+
+  it('opens the native popup for a declining opener or a view-independent invocation', async () => {
+    const { command, source, mint } = await bench()
+    const scope = mint('s1')
+    const session = proj('s1')
+    const composerId = 'first' as ComposerOccurrenceId
+    const open = vi.fn(() => false)
+    const onSelect = vi.fn()
+    command.register(themeContribution({ name: 'model', ui: themeUi({ openInComposer: open, onSelect }) }))
+    const popup = command.popupFor(scope.ctx)
+    const unbind = popup.bindComposer(composerId, vi.fn())
+    const signal = new AbortController().signal
+    await source.matchEnter!(session, '/model', signal, { attachments: 0, composerId })
+    expect(popup.state.getSnapshot()).toMatchObject({ open: true, command: 'model', composerId })
+    await popup.select(0)
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith({ id: 'dark', label: 'Dark' }, session)
+    expect(menuPick(source, 'model', session)).toBe('handled')
+    expect(popup.state.getSnapshot()).toMatchObject({ open: true, command: 'model' })
+    expect(popup.state.getSnapshot()).not.toHaveProperty('composerId')
+    expect(open).toHaveBeenCalledExactlyOnceWith(session, composerId)
+    unbind()
+    popup.dismiss()
+    await expect(source.matchEnter!(session, '/model', signal, { attachments: 0, composerId })).resolves.toBe('handled')
+    expect(popup.state.getSnapshot().open).toBe(false)
   })
 })
 

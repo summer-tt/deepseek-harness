@@ -16,13 +16,13 @@ import { MenuSurface } from '@deepseek-ai/dsh-client-ui-primitives'
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import clsx from 'clsx'
 import { IconChevronRightOutlineRegular, ReferenceIconRegular, useAnchoredMaxHeight } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
+import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import css from './MenuView.module.css'
 import type { MenuViewInjected } from './slots.ts'
 import type { MenuKey } from './locales.ts'
 
 /** Full menu props: injected face + the locale seat. */
-export type MenuViewProps = MenuViewInjected & PropsLocale<'slash.menu'>
+export type MenuViewProps = MenuViewInjected & PropsLocale<'slash.menu'> & Pick<PropsRuntime<'conversation.input.overlay'>, 'composerId'>
 
 /** Height cap that fits the two headings and eight built-in command rows. */
 const MAX_HEIGHT = 400
@@ -44,11 +44,12 @@ function optionId(source: string, index: number): string {
  * @param props - injected face (the menu store and the pick route); `t` rides the standard locale seat.
  * @returns the dropdown while open; null while closed.
  */
-export function MenuView({ menu, headers, onPick, onCrumb, onHover, onDismiss, t }: MenuViewProps) {
+export function MenuView({ menu, headers, onPick, onCrumb, onHover, onDismiss, t, composerId }: MenuViewProps) {
   const state = useSyncExternalStore(
     fn => menu.subscribe(fn),
     () => menu.getSnapshot(),
   )
+  const open = state.open && (state.composerId === undefined || state.composerId === composerId)
   const crumbs = useSyncExternalStore(
     fn => headers.subscribe(fn),
     () => headers.getSnapshot(),
@@ -68,18 +69,18 @@ export function MenuView({ menu, headers, onPick, onCrumb, onHover, onDismiss, t
   useLayoutEffect(() => {
     updateOverflowHint()
   }, [state, maxHeight, updateOverflowHint])
-  const highlight = state.open ? state.highlight : null
+  const highlight = open ? state.highlight : null
   // Focus stays in the textarea (combobox pattern), so the browser never
   // scrolls the active option into view on keyboard moves — do it here.
   useEffect(() => {
     if (highlight === null) return
-    document.getElementById(optionId(highlight.source, highlight.index))
+    listRef.current?.querySelector('[role="option"][aria-selected="true"]')
       ?.scrollIntoView({ block: 'nearest' })
   }, [highlight])
   // Dismiss on pointer outside the menu AND outside the composer card
   // (clicking the textarea or bottom bar must not close the menu).
   useEffect(() => {
-    if (!state.open) return
+    if (!open) return
     const onPointerDown = (ev: PointerEvent): void => {
       if (!(ev.target instanceof Node)) return
       if (listRef.current?.contains(ev.target)) return
@@ -89,8 +90,8 @@ export function MenuView({ menu, headers, onPick, onCrumb, onHover, onDismiss, t
     }
     document.addEventListener('pointerdown', onPointerDown, true)
     return () => { document.removeEventListener('pointerdown', onPointerDown, true) }
-  }, [state.open, onDismiss])
-  if (!state.open) return null
+  }, [open, onDismiss])
+  if (!open) return null
   return (
     // The listbox role sits on the scrolling viewport, not this shell: a
     // breadcrumb header is not an option, and a listbox may not carry one.
@@ -116,7 +117,7 @@ export function MenuView({ menu, headers, onPick, onCrumb, onHover, onDismiss, t
                   // mousedown, not click: the composer keeps focus, same as a row.
                   onMouseDown={(ev) => {
                     ev.preventDefault()
-                    onCrumb(group.source, index)
+                    onCrumb(group.source, index, composerId)
                   }}
                 >
                   {crumb.label}
@@ -169,7 +170,7 @@ export function MenuView({ menu, headers, onPick, onCrumb, onHover, onDismiss, t
                         // pick runs before any blur-driven teardown.
                         onMouseDown={(ev) => {
                           ev.preventDefault()
-                          onPick(group.source, index)
+                          onPick(group.source, index, 'pick', composerId)
                         }}
                         // mousemove, not mouseenter: real pointer motion moves the
                         // shared highlight; keyboard scrolling rows under a resting
@@ -203,7 +204,7 @@ export function MenuView({ menu, headers, onPick, onCrumb, onHover, onDismiss, t
                               onMouseDown={(ev) => {
                                 ev.preventDefault()
                                 ev.stopPropagation()
-                                onPick(group.source, index, 'drill')
+                                onPick(group.source, index, 'drill', composerId)
                               }}
                             >
                               <IconChevronRightOutlineRegular size={12} />

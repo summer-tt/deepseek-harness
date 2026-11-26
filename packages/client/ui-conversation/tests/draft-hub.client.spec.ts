@@ -90,7 +90,7 @@ function catalog(initial: readonly string[]) {
 function controller(lexicon: () => InputTriggerController['lexicon']): InputTriggerController {
   return {
     get lexicon() { return lexicon() },
-    launcher: createSnapshotStore<string | null>(null),
+    launcher: createSnapshotStore<ReturnType<InputTriggerController['launcher']['getSnapshot']>>(null),
     track: () => {},
     arbitrate: () => 'pass',
     onSpace: () => false,

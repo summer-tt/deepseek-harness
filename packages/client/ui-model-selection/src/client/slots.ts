@@ -2,6 +2,7 @@
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ModelCatalogModel, ModelProviderGroup } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { ComposerOccurrenceId } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { ModelDirectoryState } from './directory.ts'
 
@@ -60,6 +61,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 export interface ModelSelectInjected {
   /** Whether this session supports Agent-bound model inspection and selection. */
   available: boolean
+  /** Open this composer’s registered picker. False keeps the native menu. */
+  openPicker?: (composerId: ComposerOccurrenceId) => boolean
   /** The session's shared directory store (same instance the /model popup reads). */
   directory: SnapshotStore<ModelDirectoryState>
   /** Ensure the shared advisory catalog is loaded (errors land on the store). */

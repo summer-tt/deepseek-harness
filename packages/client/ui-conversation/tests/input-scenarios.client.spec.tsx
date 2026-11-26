@@ -20,8 +20,10 @@ import {
 import type { SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { InputTriggerService } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
+import { MenuView } from '../../ui-input-trigger/src/client/MenuView.tsx'
+import { zh as menuZh } from '../../ui-input-trigger/src/client/locales.ts'
 import type {
-  ClientSessionContext, SubmitEnvelope,
+  ClientSessionContext, ComposerOccurrenceId, InputTriggerSource, SubmitEnvelope,
 } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type {
   CommandClaim, PickOutcome, SubmitAttachment, SubmitOutcome,
@@ -189,7 +191,7 @@ async function scopedBench(register?: (inputTriggers: InputTriggerService) => vo
       previewUrl: `blob:${id}`,
     })),
     useBusyEnter: bindSnapshotSelector(createSnapshotStore<'queue' | 'steer'>('queue')),
-    toggleCommandMenu: (selection) => {
+    toggleCommandMenu: (selection, composerId) => {
       const snapshot = shell.snapshot
       controller.toggleSource('command', {
         trigger: '/',
@@ -197,7 +199,7 @@ async function scopedBench(register?: (inputTriggers: InputTriggerService) => vo
         quoted: false,
         position: snapshot.draft.slice(0, selection.start).trim() === '' ? 'leading' : 'inline',
         span: { ...selection, draftRev: snapshot.draftRev },
-      })
+      }, composerId)
     },
     useNotices: bindSnapshotSelector(shell.notices),
     useLexicon: bindSnapshotSelector(shell.lexicon),
@@ -238,7 +240,7 @@ async function scopedBench(register?: (inputTriggers: InputTriggerService) => vo
     })
   }
   return {
-    runtime, inputTriggers, controller, shell, wiring, view, textarea,
+    runtime, inputTriggers, controller, shell, wiring, view, textarea, barProps,
     type, space, append, erase, deleteCharacter, sink, serialize, release,
   }
 }
@@ -251,6 +253,87 @@ async function bench(executeImpl?: (line: string) => Promise<SubmitOutcome>) {
   return { ...base, execute, executed, envelopes }
 }
 
+it('routes bare Enter, menu Enter, and a pointer menu pick to their composer in the same Session', async () => {
+  const entered = vi.fn<NonNullable<InputTriggerSource['matchEnter']>>()
+    .mockResolvedValue('handled')
+  const picked = vi.fn<InputTriggerSource['onPick']>()
+    .mockReturnValue('handled')
+  const b = await scopedBench(triggers => triggers.registerSource({
+    trigger: '/', name: 'command',
+    candidates: () => Promise.resolve([{ name: 'model' }]),
+    onPick: picked,
+    matchEnter: entered,
+  }))
+  const composers = new Map<string, ComposerOccurrenceId>()
+  const previousScrollIntoView = Element.prototype.scrollIntoView
+  Element.prototype.scrollIntoView = vi.fn()
+  onTestFinished(() => { Element.prototype.scrollIntoView = previousScrollIntoView })
+  const capture = (name: string): InputBarProps['renderSlot'] => (key, owner) => {
+    if (key === 'conversation.input.overlay' && 'composerId' in owner && typeof owner.composerId === 'string') {
+      return <MenuView composerId={owner.composerId as ComposerOccurrenceId}
+        menu={b.controller.menu} headers={b.controller.headers} t={makeTranslate(menuZh, commonZh)}
+        onPick={(source, index, action, composerId) => { b.controller.pick(source, index, action, composerId) }}
+        onCrumb={vi.fn()} onHover={vi.fn()} onDismiss={() => { b.controller.dismiss() }} />
+    }
+    if (key === 'conversation.input.model' && 'composerId' in owner && typeof owner.composerId === 'string') {
+      composers.set(name, owner.composerId as ComposerOccurrenceId)
+    }
+    return null
+  }
+  b.view.rerender(<InputBar {...b.barProps} renderSlot={capture('first')} />)
+  const second = render(<InputBar {...b.barProps} occurrence="embedded" renderSlot={capture('second')} />)
+  expect(composers.get('first')).toEqual(expect.any(String))
+  expect(composers.get('second')).toEqual(expect.any(String))
+  expect(composers.get('second')).not.toBe(composers.get('first'))
+  const secondEditor = second.container.querySelector<HTMLDivElement>('[data-composer-input]')!
+  expect(b.shell.editor.getRootElement()).toBe(b.textarea)
+  await act(async () => { secondEditor.focus() })
+  expect(b.shell.editor.getRootElement()).toBe(secondEditor)
+  b.type('/model')
+  act(() => { b.controller.dismiss() })
+  await act(async () => { fireEvent.keyDown(secondEditor, { key: 'Enter', keyCode: 13 }) })
+  expect(entered).toHaveBeenCalledExactlyOnceWith(
+    { sessionId: b.barProps.sessionId }, '/model', expect.any(AbortSignal),
+    { attachments: 0, composerId: composers.get('second') },
+  )
+  await act(async () => {
+    b.type('/mod')
+    await Promise.resolve()
+  })
+  expect(b.controller.menu.getSnapshot().open).toBe(true)
+  await act(async () => { fireEvent.keyDown(secondEditor, { key: 'Enter', keyCode: 13 }) })
+  expect(picked).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    candidate: { name: 'model' }, session: { sessionId: b.barProps.sessionId }, composerId: composers.get('second'),
+  }))
+  await act(async () => { b.textarea.focus() })
+  expect(b.shell.editor.getRootElement()).toBe(b.textarea)
+  b.type('/model')
+  act(() => { b.controller.dismiss() })
+  await act(async () => { fireEvent.keyDown(b.textarea, { key: 'Enter', keyCode: 13 }) })
+  expect(entered).toHaveBeenNthCalledWith(
+    2, { sessionId: b.barProps.sessionId }, '/model', expect.any(AbortSignal),
+    { attachments: 0, composerId: composers.get('first') },
+  )
+  b.type('')
+  const firstLauncher = b.view.container.querySelector<HTMLButtonElement>('button[aria-haspopup="listbox"]')!
+  await act(async () => { fireEvent.click(firstLauncher) })
+  expect(firstLauncher.getAttribute('aria-expanded')).toBe('true')
+  expect(second.container.querySelector('button[aria-haspopup="listbox"]')?.getAttribute('aria-expanded')).toBe('false')
+  expect(second.container.querySelector('[role="listbox"]')).toBeNull()
+  const option = b.view.container.querySelector<HTMLElement>('[role="option"]')!
+  expect(option).not.toBeNull()
+  fireEvent.pointerDown(option)
+  expect(b.controller.menu.getSnapshot().open).toBe(true)
+  fireEvent.mouseDown(option)
+  expect(picked).toHaveBeenNthCalledWith(2, expect.objectContaining({
+    candidate: { name: 'model' }, session: { sessionId: b.barProps.sessionId }, composerId: composers.get('first'),
+  }))
+  expect(b.controller.menu.getSnapshot().open).toBe(false)
+  second.unmount()
+  expect(b.shell.editor.getRootElement()).toBe(b.textarea)
+  expect(b.sink).not.toHaveBeenCalled()
+})
+
 describe('scenario A: menu-pick /goal, type args, enter submits', () => {
   it('runs the whole claim chain through the real pipeline', async () => {
     const b = await bench()
@@ -262,7 +345,7 @@ describe('scenario A: menu-pick /goal, type args, enter submits', () => {
       expect(menu.groups[0]?.items.map((i: { name: string }) => i.name)).toContain('goal')
     })
     // Pointer pick (menu path executes through the bound target inside the pipeline).
-    act(() => { b.controller.pick('command', 0) })
+    act(() => { b.controller.pick('command', 0, 'pick', b.controller.menu.getSnapshot().composerId) })
     expect(b.shell.snapshot.phase).toBe('claimed')
     expect(b.shell.snapshot.draft).toBe('/goal ')
     expect(b.view.container.querySelector('[data-composer-command]')?.textContent).toBe('/goal')
@@ -300,7 +383,7 @@ describe('scenario D: execute-kind /compact', () => {
     const b = await bench()
     b.type('/comp')
     await vi.waitFor(() => { expect(b.controller.menu.getSnapshot().open).toBe(true) })
-    act(() => { b.controller.pick('command', 0) })
+    act(() => { b.controller.pick('command', 0, 'pick', b.controller.menu.getSnapshot().composerId) })
     // 'handled': no claim, machine still plain; the source ran the detached execute.
     expect(b.shell.snapshot.phase).toBe('plain')
     expect(b.executed).toContain('/compact')
@@ -331,7 +414,7 @@ describe('scenario: images ride an accepting command through the real pipeline',
     fireEvent.keyDown(b.textarea, { key: 'Enter' })
     await vi.waitFor(() => { expect(b.execute).toHaveBeenCalledWith('/vision 这张图是什么', [PNG]) })
     // The envelope the controller forwarded to matchEnter carried the count.
-    expect(b.envelopes).toEqual([{ attachments: 1 }])
+    expect(b.envelopes.map(envelope => envelope.attachments)).toEqual([1])
     expect(b.serialize).toHaveBeenCalledWith(['img-1'])
     await vi.waitFor(() => { expect(b.shell.snapshot.draft).toBe('') })
     expect(b.release).toHaveBeenCalledWith(['img-1'])
@@ -344,7 +427,7 @@ describe('scenario: images ride an accepting command through the real pipeline',
     act(() => { b.shell.setDraft('/goal 发布') })
     fireEvent.keyDown(b.textarea, { key: 'Enter' })
     await vi.waitFor(() => { expect(b.execute).toHaveBeenCalledWith('/goal 发布', []) })
-    expect(b.envelopes).toEqual([{ attachments: 0 }])
+    expect(b.envelopes.map(envelope => envelope.attachments)).toEqual([0])
     expect(b.serialize).not.toHaveBeenCalled()
     expect(b.release).not.toHaveBeenCalled()
   })

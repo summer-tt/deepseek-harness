@@ -227,7 +227,7 @@ export class InputHub implements SessionInputResolver {
       || (inbox?.['next-turn'].length ?? 0) > 0
       || inbox?.['next-step'].some(message => message.source.kind === 'user')
       || this.conversation().blocks.storeFor(id).getSnapshot() !== undefined) return
-    shell.submit('queue', 'click', true)
+    shell.submit('queue', 'click', undefined, true)
   }
 
   /**

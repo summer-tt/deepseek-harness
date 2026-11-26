@@ -1,8 +1,12 @@
 /** Editor-facing ranges, reference projections, and the composer keyboard interface. */
 import type { LexicalEditor } from 'lexical'
+import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { QuoteSummary } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InputState } from './input.ts'
 import type { InputSubmitMode } from './composer-submission.ts'
+
+/** Browser-local identity of one mounted composer, independent of its Session. */
+export type ComposerOccurrenceId = Branded<'ComposerOccurrenceId'>
 
 /** Pick-time draft span guarded by the input revision. */
 export interface TokenSpan {
@@ -78,8 +82,10 @@ export interface ComposerKeyboard {
   readonly snapshot: InputState
   /** The shell-owned Lexical editor the composer binds its contenteditable to. */
   readonly editor: LexicalEditor
+  /** Set the occurrence that currently owns the shared editor root, or clear it when detached. */
+  setEditorComposer?(composerId: ComposerOccurrenceId | undefined): void
   /** Submit with an explicit delivery mode resolved by the submission policy (Enter gestures and the primary Send button). */
-  submit(mode: InputSubmitMode, source?: 'click' | 'enter'): void
+  submit(mode: InputSubmitMode, source?: 'click' | 'enter', composerId?: ComposerOccurrenceId): void
   /**
    * Steer every still-pending queued message into the running turn (the
    * empty-draft accelerated-Enter gesture; the queue dock's per-row steer
@@ -95,7 +101,7 @@ export interface ComposerKeyboard {
    */
   caretSpan(): EditSelection
   /** Keyboard arbitration while the menu is open ('pass' when no pipeline). */
-  arbitrate(key: ArbitrateKey, composing: boolean): ArbitrateOutcome
+  arbitrate(key: ArbitrateKey, composing: boolean, composerId?: ComposerOccurrenceId): ArbitrateOutcome
   /** Space adjudication; true = the input applied a claim — caller preventDefaults. */
   space(): boolean
   /** Dismiss the popupSelect shell (any interaction outside the box). */

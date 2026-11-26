@@ -4,7 +4,7 @@
  * live in sibling modules annotated with these
  * aliases; the service shell wires them to ctx.
  */
-import type { TokenSpan } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { ComposerOccurrenceId, TokenSpan } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { InputTriggerCandidate, TriggerChar, TriggerGuard, TriggerPosition } from '../types.ts'
 
 /** A detected trigger token under the caret. */
@@ -32,6 +32,8 @@ export type DetectTrigger = (draft: string, caret: number, guard: TriggerGuard) 
 /** Menu state: one group per source; empty ready groups auto-close the menu. */
 export interface MenuState {
   readonly open: boolean
+  /** Mounted composer that owns this menu opening, if supplied by the input. */
+  readonly composerId?: ComposerOccurrenceId
   readonly hit: TriggerHit | null
   /** Monotonic per-hit generation; stale source settlements are dropped. */
   readonly generation: number
@@ -47,7 +49,7 @@ export interface MenuState {
 
 /** Menu reduction events. Source failure = silent group removal (log only; no error UI tier). */
 export type MenuEvent =
-  | { readonly type: 'hit'; readonly hit: TriggerHit | null }
+  | { readonly type: 'hit'; readonly hit: TriggerHit | null; readonly composerId?: ComposerOccurrenceId }
   | { readonly type: 'source-settled'; readonly generation: number; readonly source: string; readonly items?: readonly InputTriggerCandidate[] }
   | { readonly type: 'source-failed'; readonly generation: number; readonly source: string }
   | { readonly type: 'move'; readonly dir: 1 | -1 }

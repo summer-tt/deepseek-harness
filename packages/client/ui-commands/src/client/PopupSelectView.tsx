@@ -16,7 +16,7 @@ import { Fragment, useEffect, useMemo, useRef } from 'react'
 import { useSyncExternalStore } from 'react'
 import clsx from 'clsx'
 import { IconCheckOutlineRegular, isMobileDevice, RiskConfirmation, useAnchoredMaxHeight } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
+import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { filterOptions } from './popup.ts'
 import type { SelectOption } from './contract.ts'
 import { groupOptions } from './option-groups.ts'
@@ -33,18 +33,23 @@ export interface PopupSelectInjected {
 }
 
 /** Full shell props: injected face + the locale seat. */
-export type PopupSelectViewProps = PopupSelectInjected & PropsLocale<'command'>
+export type PopupSelectViewProps = PopupSelectInjected & PropsLocale<'command'> & Pick<PropsRuntime<'conversation.input.overlay'>, 'composerId' | 'focusComposer'>
 
 /**
  * Render the popupSelect shell overlay entry.
  * @param props - injected face: the session's shell controller; `t` rides the standard locale seat.
  * @returns the select card while open; null while closed.
  */
-export function PopupSelectView({ popup, t }: PopupSelectViewProps) {
+export function PopupSelectView({ popup, t, composerId, focusComposer }: PopupSelectViewProps) {
   const state = useSyncExternalStore(
     fn => popup.state.subscribe(fn),
     () => popup.state.getSnapshot(),
   )
+  useEffect(() => {
+    if (composerId === undefined || focusComposer === undefined) return
+    return popup.bindComposer(composerId, focusComposer)
+  }, [popup, composerId, focusComposer])
+  const open = state.open && (state.composerId === undefined || state.composerId === composerId)
   const cardRef = useRef<HTMLDivElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
@@ -55,11 +60,11 @@ export function PopupSelectView({ popup, t }: PopupSelectViewProps) {
     const viewport = viewportRef.current
     if (viewport === null) return
     return observeStickyMenuGroups(viewport)
-  }, [state.open, state.status, state.confirming, groups])
+  }, [open, state.status, state.confirming, groups])
   // The card is bottom-anchored above the composer; clamp the design cap to
   // the space above it, re-measured on every store update.
   const maxHeight = useAnchoredMaxHeight(cardRef, MAX_HEIGHT, state)
-  const active = state.open ? state.active : null
+  const active = open ? state.active : null
 
   // The search input keeps focus while arrows move a virtual highlight, so
   // the browser never scrolls the active row into view — do it here.
@@ -73,23 +78,23 @@ export function PopupSelectView({ popup, t }: PopupSelectViewProps) {
   // closes the shell before its own handlers run; that click's target then
   // takes focus naturally, so no focusComposer here.
   useEffect(() => {
-    if (!state.open || state.confirming !== null) return
+    if (!open || state.confirming !== null) return
     const onPointerDown = (ev: PointerEvent): void => {
       if (cardRef.current !== null && ev.target instanceof Node && cardRef.current.contains(ev.target)) return
       popup.dismiss()
     }
     document.addEventListener('pointerdown', onPointerDown, true)
     return () => { document.removeEventListener('pointerdown', onPointerDown, true) }
-  }, [state.open, state.confirming, popup])
+  }, [open, state.confirming, popup])
 
   // Focus the search input after it mounts (separate effect so the ref is populated).
   useEffect(() => {
-    if (!state.open || state.confirming !== null) return
+    if (!open || state.confirming !== null) return
     if (isMobileDevice()) return
     searchRef.current?.focus()
-  }, [state.open, state.confirming])
+  }, [open, state.confirming])
 
-  if (!state.open) return null
+  if (!open) return null
 
   const confirmation = state.confirming?.confirmation
   const emptyLabel = state.searchLabels === null

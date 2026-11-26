@@ -61,8 +61,8 @@ interface EffortChoice {
  * @returns the trigger and, while open, the two-level menu.
  */
 export function ModelSelect(
-  { locked, available, directory, load, select, resolveText, t, renderSlot }:
-  ModelSelectInjected & Pick<PropsRuntime<'conversation.input.model'>, 'locked'> & PropsLocale<'model'>
+  { locked, composerId, available, directory, load, select, resolveText, openPicker, t, renderSlot }:
+  ModelSelectInjected & Pick<PropsRuntime<'conversation.input.model'>, 'locked' | 'composerId'> & PropsLocale<'model'>
     & Omit<PropsRenderSlots<'conversation.input.model.label' | 'conversation.input.model.options'>, 'SessionProvider'>,
 ) {
   const state = useSyncExternalStore(
@@ -458,7 +458,7 @@ export function ModelSelect(
         onClick={() => {
           if (open) {
             close(true)
-          } else {
+          } else if (composerId === undefined || openPicker?.(composerId) !== true) {
             show()
           }
         }}

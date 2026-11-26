@@ -90,7 +90,7 @@ const ABSENT_LEXICON = {
   subscribe: () => () => {},
 }
 const ABSENT_MENU_LAUNCHER = {
-  getSnapshot: (): string | null => null,
+  getSnapshot: (): null => null,
   subscribe: () => () => {},
 }
 const EMPTY_FILE_UPLOADS: DraftFileUploads = {}
@@ -556,7 +556,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
         },
         toggleCommandMenu: inputTriggers === undefined
           ? undefined
-          : (selection) => {
+          : (selection, composerId) => {
             shell.dismissPopup()
             const snapshot = shell.snapshot
             inputTriggers.toggleSource('command', {
@@ -565,7 +565,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
               quoted: false,
               position: snapshot.draft.slice(0, selection.start).trim() === '' ? 'leading' : 'inline',
               span: { ...selection, draftRev: snapshot.draftRev },
-            })
+            }, composerId)
           },
         stop: () => { stop(sessionId) },
         retry: (failureSeq) => { inputHub.retry(sessionId, failureSeq) },

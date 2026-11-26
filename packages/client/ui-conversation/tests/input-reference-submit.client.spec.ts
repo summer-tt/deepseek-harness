@@ -286,7 +286,7 @@ describe('submit transaction hardening', () => {
     expect(shell.snapshot.draft).toBe('@src/')
     // Every editor commit re-tracks at the settled caret (the continue flag
     // is a contract passenger now): a trailing '/' keeps the menu open.
-    expect(track).toHaveBeenCalledWith('@src/', 5, { tier: 'plain' }, shell.snapshot.draftRev)
+    expect(track).toHaveBeenCalledWith('@src/', 5, { tier: 'plain' }, shell.snapshot.draftRev, undefined)
   })
 })
 

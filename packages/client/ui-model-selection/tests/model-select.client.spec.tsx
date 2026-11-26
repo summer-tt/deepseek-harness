@@ -498,6 +498,21 @@ describe('ModelSelect reasoning effort', () => {
   })
 })
 
+it('opens the registered picker from the model button and falls back to the native menu', () => {
+  const composerId = 'composer' as NonNullable<ComponentProps<typeof ModelSelect>['composerId']>
+  const openPicker = vi.fn(() => false).mockReturnValueOnce(true)
+  render(<ModelSelect renderSlot={renderLabel} locked={false} available composerId={composerId} openPicker={openPicker}
+    directory={createSnapshotStore(state())} load={vi.fn()} resolveText={resolveText}
+    select={() => Promise.resolve(undefined)} t={t} />)
+  const trigger = screen.getByRole('button', { name: /选择模型/ })
+  fireEvent.click(trigger)
+  expect(openPicker).toHaveBeenCalledExactlyOnceWith(composerId)
+  expect(screen.queryByRole('menu')).toBeNull()
+  fireEvent.click(trigger)
+  expect(openPicker).toHaveBeenCalledTimes(2)
+  expect(screen.getByRole('menu')).toBeTruthy()
+})
+
 describe('ModelSelect keyboard walk', () => {
   function mountOpen() {
     const select = vi.fn().mockResolvedValue({ ok: true, value: undefined })

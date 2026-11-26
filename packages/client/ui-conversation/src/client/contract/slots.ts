@@ -17,8 +17,8 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { SessionId, SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type { ComposerBlock } from './composer-blocks.ts'
-import type { DraftAttachmentId, InputActions, InputNotice, InputState } from './input.ts'
-import type { ComposerKeyboard, DraftSnapshot, EditSelection } from './draft-editor.ts'
+import type { DraftAttachmentId, InputActions, InputNotice, InputTriggerLauncher, InputState } from './input.ts'
+import type { ComposerKeyboard, ComposerOccurrenceId, DraftSnapshot, EditSelection } from './draft-editor.ts'
 import type { createConversationStore } from '../stores.ts'
 import type { BusyEnterBehavior } from './composer-submission.ts'
 import type { ConversationSnapshot } from './snapshot.ts'
@@ -307,7 +307,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
      * Floating entries rendered inside the resident composer card; fixed overlays must portal to
      * the document body because the docked composer contains them.
      */
-    'conversation.input.overlay': { kind: 'list'; scope: 'session' }
+    'conversation.input.overlay': { kind: 'list'; scope: 'session'; owner: ComposerOverlayOwnerProps }
     /**
      * Ambient entries below the composer card; fixed overlays must portal to the document body
      * because the docked composer contains them.
@@ -322,7 +322,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
      * Compact controls before the composer submit action; fixed overlays must portal to the
      * document body because the docked composer contains them.
      */
-    'conversation.input.right': { kind: 'list'; scope: 'session' }
+    'conversation.input.right': { kind: 'list'; scope: 'session'; owner: ComposerOccurrenceOwnerProps }
     /**
      * Compact action after the model selector; it can expand across the toolbar while retaining the
      * editor and submit action, and fixed overlays must portal to the document body because the
@@ -359,7 +359,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
      * --dsh-composer-model-icon-display to block for an occupant's compact display.
      * Fixed overlays must portal to the document body because the docked composer contains them.
      */
-    'conversation.input.model': { kind: 'single'; scope: 'session'; owner: InputControlOwnerProps }
+    'conversation.input.model': { kind: 'single'; scope: 'session'; owner: InputControlOwnerProps & ComposerOccurrenceOwnerProps }
   }
 
   interface SlotFactoryMap {
@@ -600,7 +600,7 @@ export interface ComposerBarInjected {
   resolveDraftAttachments: ((ids: readonly DraftAttachmentId[]) => readonly ComposerAttachment[]) | undefined
   /** Restart one failed file upload; absent without a session. */
   retryFileUpload: ((id: DraftAttachmentId) => void) | undefined
-  toggleCommandMenu: ((selection: EditSelection) => void) | undefined
+  toggleCommandMenu: ((selection: EditSelection, composerId: ComposerOccurrenceId) => void) | undefined
   stop: (() => void) | undefined
   /**
    * Submit empty input to retry the displayed failed generation.
@@ -619,8 +619,20 @@ export interface ComposerBarInjected {
     fileUploads: ObservableSnapshot<DraftFileUploads>
     notices: ObservableSnapshot<InputNotice | null>
     lexicon: ObservableSnapshot<ReadonlyMap<'/' | '@', readonly string[]>>
-    menuLauncher: ObservableSnapshot<string | null>
+    menuLauncher: ObservableSnapshot<InputTriggerLauncher | null>
   }
+}
+
+/** Identity passed by the mounted composer to its child slots. */
+export interface ComposerOccurrenceOwnerProps {
+  /** Absent when an independent renderer mounts the slot outside the composer. */
+  readonly composerId?: ComposerOccurrenceId
+}
+
+/** Mounted composer identity and focus restoration for input overlays. */
+export interface ComposerOverlayOwnerProps extends ComposerOccurrenceOwnerProps {
+  /** Restore focus to this view’s editor. Absent for independently mounted overlays. */
+  readonly focusComposer?: () => void
 }
 
 /** Owner share of the named plan, permission, and model controls. */

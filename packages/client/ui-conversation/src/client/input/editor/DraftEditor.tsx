@@ -11,6 +11,10 @@ import { DecoratorPortals } from './DecoratorPortals.tsx'
 export interface DraftEditorProps {
   readonly classNames: Readonly<Record<string, string>>
   readonly editor: LexicalEditor | null
+  /** Composer-owned ref. A standalone editor uses its own ref. */
+  readonly editorRef?: RefObject<HTMLDivElement>
+  /** Report shared editor ownership to the composer. */
+  readonly onEditorBinding?: (bound: boolean) => void
   readonly scrollRef: RefObject<HTMLDivElement>
   readonly editable: boolean
   readonly editorDisabled: boolean
@@ -30,7 +34,7 @@ export interface DraftEditorProps {
  * @returns the existing text-area DOM without an additional wrapper.
  */
 export function DraftEditor({
-  classNames: css, editor, scrollRef, editable, editorDisabled, phase, placeholderText, ariaLabel,
+  classNames: css, editor, editorRef, onEditorBinding, scrollRef, editable, editorDisabled, phase, placeholderText, ariaLabel,
   workspaceTrigger, workspacePickerOpen, onWorkspaceKeyDown, hint, showPlaceholder,
 }: DraftEditorProps): ReactNode {
   return (
@@ -38,6 +42,8 @@ export function DraftEditor({
       <HoverCardGroup className={css.grow}>
         <ComposerContentEditable
           editor={workspaceTrigger ? null : editor}
+          {...editorRef === undefined ? {} : { editorRef }}
+          {...onEditorBinding === undefined ? {} : { onEditorBinding }}
           editable={editable}
           className={clsx(css.input, editorDisabled && css.inputDisabled)}
           data-phase={phase}

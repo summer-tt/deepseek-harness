@@ -21,7 +21,7 @@ import type {
   SessionInput, SubmitAttempt, SubmitAttachment, SubmitOutcome,
 } from '../contract/input.ts'
 import type {
-  ArbitrateKey, ArbitrateOutcome, ComposerKeyboard, DraftInput, DraftSnapshot, ReferenceInsert, TokenSpan,
+  ArbitrateKey, ArbitrateOutcome, ComposerKeyboard, ComposerOccurrenceId, DraftInput, DraftSnapshot, ReferenceInsert, TokenSpan,
 } from '../contract/draft-editor.ts'
 import type { InputSubmitMode, MessageSubmission, MessageSubmissionState } from '../contract/composer-submission.ts'
 import { serializeDraftPrompt } from './prompt.ts'
@@ -181,6 +181,7 @@ export class SessionInputShell implements SessionInput {
   private commandRestore: AbortController | undefined
   /** The mounted composer's file-picker opener (scoped pick-files event target). */
   private filePicker: Parameters<ComposerKeyboard['bindFilePicker']>[0] | undefined
+  private editorComposerId: ComposerOccurrenceId | undefined
   private readonly unsubscribeInbox: (() => void) | undefined
 
   constructor(private readonly deps: SessionInputDeps) {
@@ -213,9 +214,17 @@ export class SessionInputShell implements SessionInput {
     const caret = this.projection.caret
     if (caret !== null) {
       this.deps.inputTriggers?.()?.track(
-        this.projection.detectText, caret, { tier: guardOf(this.core.state.phase) }, this.rev,
+        this.projection.detectText, caret, { tier: guardOf(this.core.state.phase) }, this.rev, this.editorComposerId,
       )
     }
+  }
+
+  /**
+   * Route subsequent editor tracking to the view that owns the root.
+   * @param composerId - owner of the editor root, or undefined on detach.
+   */
+  setEditorComposer(composerId: ComposerOccurrenceId | undefined): void {
+    this.editorComposerId = composerId
   }
 
   // ---- SessionInput face ----
@@ -397,9 +406,12 @@ export class SessionInputShell implements SessionInput {
    * out from the machine; this method only feeds the event. Lock entry
    * (adjudicating/submitting/sending) force-closes the transient layers: the
    * popup dismisses and the menu tracks frozen.
+   * @param mode - delivery mode for an ordinary message.
+   * @param source - submission gesture, when started by a composer.
+   * @param composerId - mounted composer, when the gesture comes from a view.
    * @param allowEmpty - explicitly admit empty continuation input through the default sink.
    */
-  submit(mode: InputSubmitMode = 'queue', source?: 'click' | 'enter', allowEmpty = false): void {
+  submit(mode: InputSubmitMode = 'queue', source?: 'click' | 'enter', composerId?: ComposerOccurrenceId, allowEmpty = false): void {
     if (this.disposed) return
     const timestamp = Date.now()
     let state: MessageSubmissionState | undefined
@@ -418,7 +430,7 @@ export class SessionInputShell implements SessionInput {
       this.notify('error', this.deps.commandAttachments.unsupportedNotice(before.claim?.token ?? before.draft))
       return
     }
-    this.dispatchRun({
+    const effects = this.core.dispatch({
       type: 'enter',
       ...allowEmpty ? { allowEmpty: true } : {},
       mode,
@@ -428,20 +440,22 @@ export class SessionInputShell implements SessionInput {
       attachmentIds: [...this.attachmentIds],
       submission,
     })
-    if (frozen(this.snapshot.phase)) {
+    if (effects.length > 0 && frozen(this.core.state.phase)) {
       this.deps.popup?.()?.dismiss()
       this.deps.inputTriggers?.()?.track(this.projection.detectText, 0, { tier: 'frozen' }, this.rev)
     }
+    this.run(effects, composerId)
   }
 
   /**
    * Keyboard arbitration while the menu is open.
    * @param key - the intercepted key.
    * @param composing - IME composition guard state.
+   * @param composerId - mounted composer supplying the gesture, when available.
    * @returns the menu's verdict; 'pass' when no pipeline is mounted.
    */
-  arbitrate(key: ArbitrateKey, composing: boolean): ArbitrateOutcome {
-    return this.deps.inputTriggers?.()?.arbitrate(key, composing) ?? 'pass'
+  arbitrate(key: ArbitrateKey, composing: boolean, composerId?: ComposerOccurrenceId): ArbitrateOutcome {
+    return this.deps.inputTriggers?.()?.arbitrate(key, composing, composerId) ?? 'pass'
   }
 
   /**
@@ -670,12 +684,12 @@ export class SessionInputShell implements SessionInput {
     this.run(this.core.dispatch(ev))
   }
 
-  private run(effects: readonly InputEffect[]): void {
-    for (const fx of effects) this.execute(fx)
+  private run(effects: readonly InputEffect[], composerId?: ComposerOccurrenceId): void {
+    for (const fx of effects) this.execute(fx, composerId)
     this.publish()
   }
 
-  private execute(fx: InputEffect): void {
+  private execute(fx: InputEffect, composerId?: ComposerOccurrenceId): void {
     switch (fx.type) {
       case 'notice': {
         this.noticeSeq += 1
@@ -683,7 +697,7 @@ export class SessionInputShell implements SessionInput {
         return
       }
       case 'adjudicate': {
-        this.adjudicate(fx.attempt, fx.draft)
+        this.adjudicate(fx.attempt, fx.draft, composerId)
         return
       }
       case 'begin-submit': {
@@ -791,14 +805,17 @@ export class SessionInputShell implements SessionInput {
   }
 
   /** Enter adjudication: poll the session controller; failure = notice + draft retained (never a silent downgrade). */
-  private adjudicate(attempt: SubmitAttempt, draft: string): void {
+  private adjudicate(attempt: SubmitAttempt, draft: string, composerId?: ComposerOccurrenceId): void {
     const inputTriggers = this.deps.inputTriggers?.()
     if (inputTriggers === undefined) {
       // No pipeline mounted: the '/' line is an ordinary message.
       this.dispatchRun(({ type: 'adjudicated', attempt, outcome: undefined }))
       return
     }
-    inputTriggers.adjudicate(draft.trim(), attempt.signal, { attachments: this.attachmentIds.length }).then(
+    inputTriggers.adjudicate(draft.trim(), attempt.signal, {
+      attachments: attempt.attachmentIds.length,
+      ...composerId === undefined ? {} : { composerId },
+    }).then(
       (outcome: PickOutcome) => {
         if (this.dead(attempt)) return
         this.dispatchRun(({ type: 'adjudicated', attempt, outcome }))

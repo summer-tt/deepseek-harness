@@ -11,7 +11,7 @@
  */
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
-import type { TokenSpan } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
+import type { ComposerOccurrenceId, TokenSpan } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { PopupSearchLabels, PopupSearchMode, PopupSelectSpec, SelectOption } from './contract.ts'
 import { rankByName } from '@deepseek-ai/dsh-client-ui-primitives'
 import { groupOptions } from './option-groups.ts'
@@ -57,6 +57,8 @@ export interface PopupSelectDeps {
 /** Popup shell state (the shell component renders from here; closed = render null). */
 export interface PopupState {
   readonly open: boolean
+  /** Initiating composer; absent for an invocation without a mounted composer. */
+  readonly composerId?: ComposerOccurrenceId
   /** Command name the shell is open for (null while closed). */
   readonly command: string | null
   /** Options-load lifecycle; 'failed' keeps the shell open for retry(). */
@@ -153,11 +155,28 @@ export class PopupSelectController<TCtx = unknown> {
   /** Shell state store (the overlay component subscribes here). */
   readonly state: SnapshotStore<PopupState> = createSnapshotStore<PopupState>(CLOSED)
   private binding: OpenBinding<TCtx> | null = null
+  private readonly composerFocus = new Map<ComposerOccurrenceId, () => void>()
 
   /**
    * @param deps - session-wiring callbacks (token consumption + composer focus).
    */
   constructor(private readonly deps: PopupSelectDeps) {}
+
+  /**
+   * Bind the focus callback of the mounted overlay owning a composer. Unmounting
+   * that overlay dismisses its current opening and cancels pending option work.
+   * @param composerId - mounted occurrence rendering the overlay.
+   * @param focus - restore focus inside that occurrence.
+   * @returns cleanup for this binding.
+   */
+  bindComposer(composerId: ComposerOccurrenceId, focus: () => void): () => void {
+    this.composerFocus.set(composerId, focus)
+    return () => {
+      if (this.composerFocus.get(composerId) !== focus) return
+      this.composerFocus.delete(composerId)
+      if (this.state.getSnapshot().composerId === composerId) this.dismiss()
+    }
+  }
 
   /**
    * Open the shell for one command: publish pending state and fetch options
@@ -167,13 +186,19 @@ export class PopupSelectController<TCtx = unknown> {
    * @param spec - the registered popupSelect spec.
    * @param context - open-time context snapshot, handed verbatim to options/onSelect.
    * @param segment - open-time token segment snapshot for post-select consumption.
+   * @param composerId - mounted composer rendering this opening, if any. If its overlay
+   * left before the invocation reached this method, its opening is dropped.
    */
-  open(command: string, spec: PopupSpec<TCtx>, context: TCtx, segment: TokenSegment): void {
+  open(command: string, spec: PopupSpec<TCtx>, context: TCtx, segment: TokenSegment, composerId?: ComposerOccurrenceId): void {
+    if (composerId !== undefined && !this.composerFocus.has(composerId)) return
     const searchLabels = spec.searchLabels?.() ?? null
     this.binding?.abort.abort()
     const binding: OpenBinding<TCtx> = { command, spec, context, segment, abort: new AbortController() }
     this.binding = binding
-    this.state.set({ ...CLOSED, open: true, command, searchLabels, searchMode: spec.searchMode ?? 'substring' })
+    this.state.set({
+      ...CLOSED, open: true, command, searchLabels, searchMode: spec.searchMode ?? 'substring',
+      ...composerId === undefined ? {} : { composerId },
+    })
     this.load(binding)
   }
 
@@ -302,10 +327,11 @@ export class PopupSelectController<TCtx = unknown> {
       return
     }
     if (this.binding !== binding) return // late success: no state write, no consumption
+    const { composerId } = this.state.getSnapshot()
     this.deps.consume(binding.segment)
     this.binding = null
     this.state.set(CLOSED)
-    this.deps.focusComposer()
+    this.restoreFocus(composerId)
   }
 
   /**
@@ -316,15 +342,22 @@ export class PopupSelectController<TCtx = unknown> {
    */
   dismiss(opts?: { readonly focusComposer?: boolean }): void {
     if (this.binding === null) return
+    const { composerId } = this.state.getSnapshot()
     this.binding.abort.abort()
     this.binding = null
     this.state.set(CLOSED)
-    if (opts?.focusComposer === true) this.deps.focusComposer()
+    if (opts?.focusComposer === true) this.restoreFocus(composerId)
+  }
+
+  private restoreFocus(composerId: ComposerOccurrenceId | undefined): void {
+    if (composerId === undefined) this.deps.focusComposer()
+    else this.composerFocus.get(composerId)?.()
   }
 
   /** Scope-teardown disposer: abort in-flight work and clear state (no focus side effect). */
   dispose(): void {
     this.binding?.abort.abort()
+    this.composerFocus.clear()
     this.binding = null
     this.state.set(CLOSED)
   }

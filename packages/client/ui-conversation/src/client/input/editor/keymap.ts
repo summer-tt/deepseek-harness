@@ -28,6 +28,8 @@ import { $isQuoteNode } from './QuoteNode.tsx'
 
 /** The bar-supplied behavior behind each intercepted gesture. */
 export interface ComposerKeymapHandlers {
+  /** Whether the mounted view owns the shared editor’s root. Omitted for a dedicated editor. */
+  ownsEditorRoot?(): boolean
   /** Keyboard arbitration while the menu is open ('pass' when no pipeline). */
   arbitrate(key: ArbitrateKey, composing: boolean): ArbitrateOutcome
   /** Space adjudication; true = a claim was applied — the keystroke is consumed. */
@@ -180,7 +182,9 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
   let composing = false
   let composingUntil = 0
   let rootElement: HTMLElement | null = null
+  const ownsRoot = (): boolean => handlers.ownsEditorRoot?.() !== false
   const syncComposition = (): void => {
+    if (!ownsRoot()) return
     rootElement?.toggleAttribute('data-composer-composing', composing || editor.isComposing())
   }
   const onCompositionStart = (): void => {
@@ -197,6 +201,7 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
   const recentlyComposing = (): boolean => composing || Date.now() < composingUntil
 
   const arrow = (key: ArbitrateKey) => (event: KeyboardEvent | null): boolean => {
+    if (!ownsRoot()) return false
     const inComposition = event !== null && isComposingEvent(event, recentlyComposing)
     if (handlers.arbitrate(key, inComposition) !== 'pass') {
       event?.preventDefault()
@@ -209,21 +214,21 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
     editor.registerRootListener((root, prevRoot) => {
       prevRoot?.removeEventListener('compositionstart', onCompositionStart)
       prevRoot?.removeEventListener('compositionend', onCompositionEnd)
-      prevRoot?.removeAttribute('data-composer-composing')
+      rootElement?.removeAttribute('data-composer-composing')
       composing = false
       composingUntil = 0
-      rootElement = root
-      root?.addEventListener('compositionstart', onCompositionStart)
-      root?.addEventListener('compositionend', onCompositionEnd)
+      rootElement = ownsRoot() ? root : null
+      rootElement?.addEventListener('compositionstart', onCompositionStart)
+      rootElement?.addEventListener('compositionend', onCompositionEnd)
       syncComposition()
     }),
     editor.registerCommand(KEY_DOWN_COMMAND, (event) => {
-      if (!isApplePlatform() || !event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false
+      if (!ownsRoot() || !isApplePlatform() || !event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false
       const key = event.key.toLowerCase()
       if (key === 'a') return moveBeforeQuote(editor, event)
       return false
     }, COMMAND_PRIORITY_CRITICAL),
-    editor.registerCommand(MOVE_TO_END, event => movePastQuote(editor, event), COMMAND_PRIORITY_CRITICAL),
+    editor.registerCommand(MOVE_TO_END, event => ownsRoot() && movePastQuote(editor, event), COMMAND_PRIORITY_CRITICAL),
     editor.registerUpdateListener(syncComposition),
     editor.registerCommand(KEY_ARROW_UP_COMMAND, arrow('up'), COMMAND_PRIORITY_CRITICAL),
     editor.registerCommand(KEY_ARROW_DOWN_COMMAND, arrow('down'), COMMAND_PRIORITY_CRITICAL),
@@ -237,6 +242,7 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
       COMMAND_PRIORITY_CRITICAL,
     ),
     editor.registerCommand(KEY_ESCAPE_COMMAND, (event) => {
+      if (!ownsRoot()) return false
       // Escape layering: an open overlay closes; claimed without an overlay
       // does NOT release (deleting the command chip is the only exit gesture).
       handlers.dismissPopup()
@@ -247,7 +253,7 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
       return false
     }, COMMAND_PRIORITY_CRITICAL),
     editor.registerCommand(KEY_SPACE_COMMAND, (event) => {
-      if (isComposingEvent(event, recentlyComposing)) return false
+      if (!ownsRoot() || isComposingEvent(event, recentlyComposing)) return false
       const consumed = handlers.space()
       if (consumed) {
         event.preventDefault() // the command chip insertion already carries its separator
@@ -256,6 +262,7 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
       return false
     }, COMMAND_PRIORITY_CRITICAL),
     editor.registerCommand(KEY_ENTER_COMMAND, (event) => {
+      if (!ownsRoot()) return false
       // Returning true stops Lexical's fallback line break without consuming
       // the DOM event that application shortcuts need.
       if (event !== null && (event.altKey || event.getModifierState('AltGraph')
@@ -280,6 +287,7 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
       return true
     }, COMMAND_PRIORITY_CRITICAL),
     editor.registerCommand(PASTE_COMMAND, (event) => {
+      if (!ownsRoot()) return false
       // Duck-typed: the payload union includes InputEvent, and test engines
       // deliver clipboardData on plain events.
       const clipboardData = (event as ClipboardEvent).clipboardData ?? null

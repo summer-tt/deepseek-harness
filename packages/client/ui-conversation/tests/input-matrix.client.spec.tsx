@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import type { InputTriggerLauncher } from '../src/client/contract/input.ts'
 import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 /**
  * Impact-matrix projection tests (row by row): what each
@@ -92,7 +93,7 @@ function mountBar(shell: SessionInputShell, over?: { running?: boolean; disabled
     useStopShortcut: bindSnapshotSelector(createSnapshotStore<readonly string[]>([])),
     useNotices: bindSnapshotSelector(shell.notices),
     useLexicon: bindSnapshotSelector(shell.lexicon),
-    useMenuLauncher: bindSnapshotSelector(createSnapshotStore<string | null>(null)),
+    useMenuLauncher: bindSnapshotSelector(createSnapshotStore<InputTriggerLauncher | null>(null)),
     renderSlot: (() => null) as InputBarProps['renderSlot'],
     stop: vi.fn(),
     t: makeTranslate(zh, commonZh),

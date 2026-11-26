@@ -97,6 +97,7 @@ export const menuReduce: MenuReduce = (state, ev) => {
       if (ev.hit === null) return closed(state)
       return {
         open: true,
+        ...ev.composerId === undefined ? {} : { composerId: ev.composerId },
         hit: ev.hit,
         generation: state.generation + 1,
         // Items and highlight survive the refinement (stale-while-revalidate):

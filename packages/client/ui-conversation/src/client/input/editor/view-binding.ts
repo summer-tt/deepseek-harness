@@ -1,9 +1,9 @@
 /** DOM and keymap bindings installed by the InputBar's existing effects. */
-import type { MouseEvent, MutableRefObject, RefObject } from 'react'
+import type { MutableRefObject, RefObject } from 'react'
 import type { LexicalEditor } from 'lexical'
 import { $getRoot } from 'lexical'
 import { focusWithoutRing, isMobileDevice } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { ComposerKeyboard } from '../../contract/draft-editor.ts'
+import type { ComposerKeyboard, ComposerOccurrenceId } from '../../contract/draft-editor.ts'
 import type { BusyEnterBehavior } from '../../contract/composer-submission.ts'
 import { resolveSubmitMode } from '../submission-policy.ts'
 import { registerComposerKeymap } from './keymap.ts'
@@ -13,14 +13,19 @@ import { DRAFT_SUBMITTED_TAG } from './runtime.ts'
  * Transfer mobile editor focus after a submission empties the draft.
  * A control the user already focused retains focus.
  * @param editor - the Session-owned editor.
- * @param destination - stable, focusable non-text element that retains the composer's keyboard position.
+ * @param destination - stable, focusable non-text element that retains keyboard position.
+ * @param editorRef - the initiating view’s editor element. Omitted for a dedicated editor.
  * @returns the update-listener cleanup.
  */
-export function installDraftKeyboardDismissal(editor: LexicalEditor, destination: RefObject<HTMLElement>): () => void {
+export function installDraftKeyboardDismissal(
+  editor: LexicalEditor,
+  destination: RefObject<HTMLElement>,
+  editorRef?: RefObject<HTMLElement>,
+): () => void {
   return editor.registerUpdateListener(({ editorState, tags }) => {
     if (!tags.has(DRAFT_SUBMITTED_TAG) || !isMobileDevice()) return
     const input = editor.getRootElement()
-    if (input === null || input.ownerDocument.activeElement !== input) return
+    if (input === null || (editorRef !== undefined && editorRef.current !== input) || input.ownerDocument.activeElement !== input) return
     if (editorState.read(() => $getRoot().getTextContentSize() === 0) && destination.current !== null) {
       focusWithoutRing(destination.current, { preventScroll: true })
     }
@@ -122,15 +127,20 @@ export function installDraftFilePicker(
  * @param editor - the borrowed Session-owned editor.
  * @param keyboard - the existing composer keyboard operations.
  * @param gate - live view values read by the installed handlers.
+ * @param composerId - mounted composer supplying the gesture.
+ * @param editorRef - this composer’s editable element.
  * @returns the keymap disposer.
  */
 export function installDraftKeymap(
   editor: LexicalEditor,
   keyboard: ComposerKeyboard,
   gate: MutableRefObject<DraftViewGate>,
+  composerId: ComposerOccurrenceId,
+  editorRef: RefObject<HTMLDivElement>,
 ): () => void {
   return registerComposerKeymap(editor, {
-    arbitrate: (key, composing) => keyboard.arbitrate(key, composing),
+    ownsEditorRoot: () => editorRef.current !== null && editorRef.current === editor.getRootElement(),
+    arbitrate: (key, composing) => keyboard.arbitrate(key, composing, composerId),
     space: () => {
       if (gate.current.machineBusy || gate.current.locked) return false
       return keyboard.space()
@@ -155,7 +165,7 @@ export function installDraftKeymap(
         g.running,
         accelerated ? 'accelerated' : 'enter',
         g.steeringAvailable,
-      ), 'enter')
+      ), 'enter', composerId)
     },
     intakeFiles: (files, directories) => { gate.current.intakeFiles(files, directories) },
     pasteText: (text) => {
@@ -163,14 +173,4 @@ export function installDraftKeymap(
       keyboard.paste(text)
     },
   })
-}
-
-/**
- * Keep a toolbar press from moving focus away from the draft.
- * @param event - the toolbar button's mouse event.
- * @param editor - the borrowed editor, absent in the inert view.
- */
-export function keepDraftFocus(event: MouseEvent<HTMLButtonElement>, editor: LexicalEditor | null): void {
-  event.preventDefault()
-  editor?.getRootElement()?.focus({ preventScroll: true })
 }

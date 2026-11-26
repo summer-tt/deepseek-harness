@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import type { InputTriggerLauncher } from '../src/client/contract/input.ts'
 import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 // InputBar behavior over the editor + submit-machine wiring: Enter-send
 // semantics (IME guard, Shift newline, busy Enter policy, Ctrl/Meta steering,
@@ -167,7 +168,7 @@ function bench(over?: BenchOptions) {
   const stop = vi.fn()
   const retry = vi.fn()
   const removeAttachment = vi.fn((id: DraftAttachmentId) => { shell.removeAttachment(id) })
-  const menuLauncher = createSnapshotStore<string | null>(over?.commandMenuOpen === true ? 'command' : null)
+  const menuLauncher = createSnapshotStore<InputTriggerLauncher | null>(over?.commandMenuOpen === true ? { source: 'command' } : null)
   const busyEnter = createSnapshotStore<'queue' | 'steer'>(over?.busyEnter ?? 'queue')
   const stopShortcut = createSnapshotStore<readonly string[]>(['Esc', 'Esc'])
   const slotCalls: { key: string; owner: unknown }[] = []
@@ -2151,8 +2152,8 @@ describe('command launcher chrome and control seats', () => {
     const launcher = view.getByLabelText('添加文件或调用指令')
     expect(launcher.getAttribute('aria-expanded')).toBe('false')
     fireEvent.click(launcher)
-    expect(toggleCommandMenu).toHaveBeenCalledExactlyOnceWith({ start: 2, end: 7 })
-    act(() => { menuLauncher.set('command') })
+    expect(toggleCommandMenu).toHaveBeenCalledExactlyOnceWith({ start: 2, end: 7 }, expect.any(String))
+    act(() => { menuLauncher.set({ source: 'command' }) })
     expect(launcher.getAttribute('aria-expanded')).toBe('true')
   })
 

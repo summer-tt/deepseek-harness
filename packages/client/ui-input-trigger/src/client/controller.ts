@@ -7,6 +7,7 @@
  * only the source roster. One controller per session scope; the service
  * disposes it with the scope fiber.
  */
+import type { InputTriggerLauncher } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type {
@@ -17,7 +18,7 @@ import { detectTrigger } from '../core/detect.ts'
 import { MENU_CLOSED, menuReduce, seedGroups } from '../core/menu.ts'
 import type { MenuEvent, MenuState, TriggerHit } from '../core/contract.ts'
 import type {
-  ClientSessionContext, InputTriggerCandidate, InputTriggerCrumb, InputTriggerSource, PickAction,
+  ClientSessionContext, ComposerOccurrenceId, InputTriggerCandidate, InputTriggerCrumb, InputTriggerSource, PickAction,
   SubmitEnvelope, TriggerChar, TriggerGuard,
 } from '../types.ts'
 
@@ -65,7 +66,7 @@ export class InputTriggerController {
    * trigger-detected/closed menus. Composer chrome subscribes to this store
    * for the launcher's expanded state without owning a second menu model.
    */
-  readonly launcher: SnapshotStore<string | null> = createSnapshotStore<string | null>(null)
+  readonly launcher: SnapshotStore<InputTriggerLauncher | null> = createSnapshotStore<InputTriggerLauncher | null>(null)
   /**
    * Crumbs published by each header-bearing source for the open menu, keyed
    * by source name. A snapshot store like {@link InputTriggerController.launcher}:
@@ -122,10 +123,15 @@ export class InputTriggerController {
    * @param guard - availability tier derived from the input phase.
    * @param draftRev - the input machine's current draft revision, stamped
    * into the hit span for pick-time CAS.
+   * @param composerId - composer that owns the tracked editor root, when mounted.
    */
-  track(draft: string, caret: number, guard: TriggerGuard, draftRev: number): void {
+  track(draft: string, caret: number, guard: TriggerGuard, draftRev: number, composerId?: ComposerOccurrenceId): void {
     if (this.disposed) return
-    const launched = this.launcher.getSnapshot() !== null
+    const launcher = this.launcher.getSnapshot()
+    const launched = launcher !== null
+    // Focusing the launcher’s editor can publish a selection-only commit.
+    if (composerId !== undefined && launcher?.composerId === composerId && guard.tier !== 'frozen'
+      && this.hit?.span.draftRev === draftRev) return
     this.clearLauncher()
     const raw = detectTrigger(draft, caret, guard)
     if (raw === null) {
@@ -156,7 +162,7 @@ export class InputTriggerController {
       }
     }
     const prev = this.menu.getSnapshot()
-    const same = !launched && prev.open && prev.hit !== null
+    const same = !launched && prev.open && prev.composerId === composerId && prev.hit !== null
       && prev.hit.trigger === hit.trigger && prev.hit.query === hit.query
       && prev.hit.quoted === hit.quoted
       && prev.hit.span.start === hit.span.start && prev.hit.span.end === hit.span.end
@@ -171,7 +177,7 @@ export class InputTriggerController {
     if (launched || !prev.open || prev.hit === null || prev.hit.trigger !== hit.trigger) {
       this.menu.set(seedGroups(this.menu.getSnapshot(), roster))
     }
-    this.reduce({ type: 'hit', hit })
+    this.reduce({ type: 'hit', hit, ...composerId === undefined ? {} : { composerId } })
     this.refreshHeaders(hit, roster)
     this.fetchCandidates(hit, roster)
   }
@@ -183,10 +189,12 @@ export class InputTriggerController {
    * mutation pipeline.
    * @param source - registered source name under `hit.trigger`.
    * @param hit - synthetic hit carrying position and pick-time draft CAS.
+   * @param composerId - mounted composer that opened the launcher.
    */
-  toggleSource(source: string, hit: TriggerHit): void {
+  toggleSource(source: string, hit: TriggerHit, composerId?: ComposerOccurrenceId): void {
     if (this.disposed) return
-    if (this.launcher.getSnapshot() === source && this.menu.getSnapshot().open) {
+    const launcher = this.launcher.getSnapshot()
+    if (launcher?.source === source && launcher.composerId === composerId) {
       this.dismiss()
       return
     }
@@ -197,9 +205,9 @@ export class InputTriggerController {
     }
     this.stopFetch()
     this.hit = hit
-    this.launcher.set(source)
+    this.launcher.set({ source, ...composerId === undefined ? {} : { composerId } })
     this.menu.set(seedGroups(this.menu.getSnapshot(), [match]))
-    this.reduce({ type: 'hit', hit })
+    this.reduce({ type: 'hit', hit, ...composerId === undefined ? {} : { composerId } })
     this.refreshHeaders(hit, [match])
     this.fetchCandidates(hit, [match])
   }
@@ -210,17 +218,18 @@ export class InputTriggerController {
    * @param source - source (group) name.
    * @param index - candidate index within the group.
    * @param action - settling pick (default) or the candidate's drill action.
+   * @param composerId - mounted composer supplying the gesture, when available.
    */
-  pick(source: string, index: number, action: PickAction = 'pick'): void {
+  pick(source: string, index: number, action: PickAction = 'pick', composerId?: ComposerOccurrenceId): void {
     const state = this.menu.getSnapshot()
     const hit = this.hit
-    if (this.disposed || !state.open || hit === null) return
+    if (this.disposed || !state.open || !this.matchesComposer(state, composerId) || hit === null) return
     const group = state.groups.find(g => g.source === source)
     const candidate = group !== undefined && group.status === 'ready' ? group.items[index] : undefined
     if (candidate === undefined) return
     const src = this.deps.roster.sources(hit.trigger).find(s => s.name === source)
     if (src === undefined) return
-    this.settle(src, candidate, hit, action)
+    this.settle(src, candidate, hit, action, composerId)
   }
 
   /**
@@ -229,15 +238,17 @@ export class InputTriggerController {
    * into one share one outcome.
    * @param source - source (group) name.
    * @param index - crumb index within that source's published header.
+   * @param composerId - mounted composer supplying the gesture, when available.
    */
-  pickCrumb(source: string, index: number): void {
+  pickCrumb(source: string, index: number, composerId?: ComposerOccurrenceId): void {
     const hit = this.hit
-    if (this.disposed || !this.menu.getSnapshot().open || hit === null) return
+    const state = this.menu.getSnapshot()
+    if (this.disposed || !state.open || !this.matchesComposer(state, composerId) || hit === null) return
     const crumb = this.headers.getSnapshot().get(source)?.[index]
     if (crumb === undefined || crumb.current === true) return
     const src = this.deps.roster.sources(hit.trigger).find(s => s.name === source)
     if (src === undefined) return
-    this.settle(src, { name: crumb.label, value: crumb.value }, hit, 'drill')
+    this.settle(src, { name: crumb.label, value: crumb.value }, hit, 'drill', composerId)
   }
 
   /**
@@ -256,16 +267,17 @@ export class InputTriggerController {
    * Keyboard arbitration while the menu is open.
    * @param key - intercepted key.
    * @param composing - inside IME composition: everything passes.
+   * @param composerId - mounted composer supplying the gesture, when available.
    * @returns `pass` when the browser keeps the key (closed menu, no
    * highlight, or a vanished candidate), `consumed` when the menu handled
    * the key without a settling pick (move, close, drill descent, or a
    * pending-refinement no-op), or `pick-highlighted` when the highlighted
    * candidate settled and the menu closed.
    */
-  arbitrate(key: ArbitrateKey, composing: boolean): ArbitrateOutcome {
+  arbitrate(key: ArbitrateKey, composing: boolean, composerId?: ComposerOccurrenceId): ArbitrateOutcome {
     if (composing || this.disposed) return 'pass'
     const state = this.menu.getSnapshot()
-    if (!state.open) return 'pass'
+    if (!state.open || !this.matchesComposer(state, composerId)) return 'pass'
     switch (key) {
       case 'up': {
         this.reduce({ type: 'move', dir: -1 })
@@ -291,7 +303,7 @@ export class InputTriggerController {
         // falls through to submit — an explicit no-op until the group is ready.
         const group = state.groups.find(g => g.source === state.highlight?.source)
         if (group === undefined || group.status !== 'ready') return 'consumed'
-        this.pick(state.highlight.source, state.highlight.index)
+        this.pick(state.highlight.source, state.highlight.index, 'pick', composerId)
         return 'pick-highlighted'
       }
       case 'tab': {
@@ -303,10 +315,10 @@ export class InputTriggerController {
         const item = group.items[state.highlight.index]
         if (item === undefined) return 'pass'
         if (item.drill === true) {
-          this.pick(state.highlight.source, state.highlight.index, 'drill')
+          this.pick(state.highlight.source, state.highlight.index, 'drill', composerId)
           return 'consumed'
         }
-        this.pick(state.highlight.source, state.highlight.index)
+        this.pick(state.highlight.source, state.highlight.index, 'pick', composerId)
         return 'pick-highlighted'
       }
     }
@@ -446,6 +458,10 @@ export class InputTriggerController {
     this.refreshLexicon()
   }
 
+  private matchesComposer(state: MenuState, composerId: ComposerOccurrenceId | undefined): boolean {
+    return state.composerId === undefined || state.composerId === composerId
+  }
+
   /** External dismiss (e.g. pointer outside the composer area). */
   dismiss(): void {
     if (this.disposed) return
@@ -459,7 +475,7 @@ export class InputTriggerController {
     if (this.disposed || !this.menu.getSnapshot().open || this.hit === null) return
     const launched = this.launcher.getSnapshot()
     const roster = this.deps.roster.sources(this.hit.trigger)
-      .filter(source => launched === null || source.name === launched)
+      .filter(source => launched === null || source.name === launched.source)
     if (roster.length === 0) return
     this.fetchCandidates(this.hit, roster)
   }
@@ -580,12 +596,14 @@ export class InputTriggerController {
    * @param candidate - the picked candidate, or a crumb projected as one.
    * @param hit - the authoritative hit supplying position and span CAS.
    * @param action - settling pick or drill.
+   * @param composerId - mounted composer supplying the gesture, when available.
    */
   private settle(
     src: InputTriggerSource,
     candidate: InputTriggerCandidate,
     hit: TriggerHit,
     action: PickAction,
+    composerId?: ComposerOccurrenceId,
   ): void {
     const outcome = src.onPick({
       candidate,
@@ -593,6 +611,7 @@ export class InputTriggerController {
       position: hit.position,
       via: 'menu',
       action,
+      ...composerId === undefined ? {} : { composerId },
       span: hit.span,
     })
     this.stopFetch()

@@ -45,6 +45,8 @@ Menus use the shared `MenuSurface` material, including the macOS backing for bac
 
 `src/core/` is the pure core — trigger detection, menu reduction, and exact match, with zero React/DOM/cordis — while `src/client/service.ts` wires the core to the menu snapshot store, the per-hit candidate fetch (generation-gated, `AbortSignal`-superseded, failed sources dropping silently with a console record), and the pick paths. One `InputTriggerController` resolves per session scope (`sessionOf`); the conversation wiring layer drives `track`/`arbitrate`/`onSpace`/`adjudicate` on the controller. A source is warmed into every session controller it can reach; sources whose `lexicon` rolls change after warm implement `subscribeLexicon` and the controller re-polls on each notification. `MenuView` self-registers into `conversation.input.overlay` (list kind, session scope) and renders null while closed. The `listbox` role sits on its scrolling viewport rather than the bounded shell, because a breadcrumb header is not an option and a listbox may not carry one; crumbs ride their own snapshot store beside the menu store, so the frozen reducer stays unaware of them. The overlay SlotMap merge lives here because the dependency direction (ui-conversation → ui-input-trigger) admits no reverse type import.
 
+Menu picks and Enter adjudication carry the initiating composer’s `composerId` when a mounted view supplies it. For a composer-owned opening, only that view renders the menu and handles outside clicks. A source can use the same identity to open its own panel even when several views share one Session.
+
 </details>
 
 -----

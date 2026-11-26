@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import type { InputTriggerLauncher } from '../src/client/contract/input.ts'
 import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 import type { GlobalStandardProps, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -323,7 +324,7 @@ function mount(
           useStopShortcut={bindSnapshotSelector(createSnapshotStore<readonly string[]>([]))}
           useNotices={bindSnapshotSelector(wiring.notices)}
           useLexicon={bindSnapshotSelector(wiring.lexicon)}
-          useMenuLauncher={bindSnapshotSelector(createSnapshotStore<string | null>(null))}
+          useMenuLauncher={bindSnapshotSelector(createSnapshotStore<InputTriggerLauncher | null>(null))}
           stop={stop}
           t={t}
           renderSlot={((key: string, seatOwner: object) => {
@@ -484,7 +485,7 @@ describe('ConversationRoot resident composer', () => {
     // asking for the one thing it prevents — every block this contract has is
     // cleared by choosing a model.
     const seat = (key: string) => b.seatOwners.filter(call => call.key === key).at(-1)?.owner
-    expect(seat('conversation.input.model')).toEqual({ locked: false })
+    expect(seat('conversation.input.model')).toHaveProperty('locked', false)
     expect(seat('conversation.input.plan')).toEqual({ locked: true })
   })
 
@@ -501,7 +502,7 @@ describe('ConversationRoot resident composer', () => {
     expect(box.getAttribute('aria-haspopup')).toBe('menu')
     expect(box.getAttribute('data-placeholder')).not.toBe('select a model first')
     const modelSeat = b.seatOwners.filter(call => call.key === 'conversation.input.model').at(-1)?.owner
-    expect(modelSeat).toEqual({ locked: true })
+    expect(modelSeat).toHaveProperty('locked', true)
   })
 
   it('keeps composer text in the machine, mirrors to the Conversation store, and submits through the sink', () => {

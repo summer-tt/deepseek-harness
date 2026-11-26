@@ -25,7 +25,7 @@ import { WeakMapWithValues } from '@deepseek-ai/dsh-util-values'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-locale/client'
 import { rankByName } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
-  CandidateRequest, ClientSessionContext, CommandClaim, PickOutcome, InputTriggerCandidate, InputTriggerPick,
+  CandidateRequest, ClientSessionContext, ComposerOccurrenceId, CommandClaim, PickOutcome, InputTriggerCandidate, InputTriggerPick,
   SubmitAttachment, SubmitEnvelope, SubmitOutcome,
 } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { CommandContribution, CommandDecoration, CommandUiContract } from './contract.ts'
@@ -254,7 +254,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     const name = pick.candidate.name
     const contribution = this.live.contributions.get(name)
     if (contribution !== undefined && contribution.available(pick.session)) {
-      this.invoke(name, contribution.ui, pick.session, { via: 'menu', span: pick.span })
+      this.invoke(name, contribution.ui, pick.session, { via: 'menu', span: pick.span }, pick.composerId)
       return 'handled'
     }
     const desc = this.directory.resolve(pick.session.sessionId, name)
@@ -264,7 +264,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     // never manufactures one, and never touches the argument claim below.
     const decoration = this.live.decorations.get(name)
     if (decoration !== undefined && decoration.available(pick.session)) {
-      this.invoke(name, decoration.ui, pick.session, { via: 'menu', span: pick.span })
+      this.invoke(name, decoration.ui, pick.session, { via: 'menu', span: pick.span }, pick.composerId)
       return 'handled'
     }
     if (desc.input !== undefined) return { claim: this.leadingClaim(desc, pick.session, claimToken(desc, this.t)) }
@@ -336,7 +336,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     if (contribution !== undefined && contribution.available(session)) {
       if (!bare) return undefined
       if (envelope.attachments > 0 && contribution.ui.kind !== 'action') refuseAttachments()
-      this.invoke(typedName, contribution.ui, session, { via: 'enter', token })
+      this.invoke(typedName, contribution.ui, session, { via: 'enter', token }, envelope.composerId)
       return 'handled'
     }
     await this.directory.ensureReady(session.sessionId, signal)
@@ -350,7 +350,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
       const decoration = this.live.decorations.get(name)
       if (decoration !== undefined && decoration.available(session)) {
         if (envelope.attachments > 0 && decoration.ui.kind !== 'action') refuseAttachments()
-        this.invoke(name, decoration.ui, session, { via: 'enter', token })
+        this.invoke(name, decoration.ui, session, { via: 'enter', token }, envelope.composerId)
         return 'handled'
       }
     }
@@ -374,6 +374,7 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     ui: CommandContribution['ui'],
     session: ClientSessionContext,
     segment: TokenSegment,
+    composerId: ComposerOccurrenceId | undefined,
   ): void {
     if (ui.kind === 'action') {
       this.consumeVia(session.sessionId, segment)
@@ -382,7 +383,13 @@ export class CommandUiRuntime extends Service implements CommandUiContract {
     }
     const actx = this.scopeFor(session.sessionId)
     if (actx === undefined) return
-    this.popupFor(actx).open(name, ui, session, segment)
+    const popup = this.popupFor(actx)
+    if (composerId !== undefined && ui.openInComposer?.(session, composerId) === true) {
+      popup.dismiss()
+      this.consumeVia(session.sessionId, segment)
+      return
+    }
+    popup.open(name, ui, session, segment, composerId)
   }
 
   /**

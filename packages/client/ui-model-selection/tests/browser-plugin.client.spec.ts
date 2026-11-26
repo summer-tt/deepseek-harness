@@ -19,6 +19,7 @@ import type { ModelSelection } from '@deepseek-ai/dsh-agent/types'
 import type { ModelSelectionProjection } from '@deepseek-ai/dsh-agent/types'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm/brand'
 import type { CommandContribution, PopupSelectSpec, SelectOption } from '@deepseek-ai/dsh-client-ui-commands/client'
+import type { ComposerOccurrenceId } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { ModelSelectInjected } from '../src/client/slots.ts'
 import { apply, inject } from '../src/client/index.ts'
 import { zh } from '../src/client/locales.ts'
@@ -206,6 +207,43 @@ async function bench(locale: 'zh' | 'en' = 'zh') {
 const projection = (id: string) => ({ sessionId: sid(id) })
 
 describe('ui-model-selection dual entry', () => {
+  it('shares the same opener between the model seat and /model for one Session composer', async () => {
+    const b = await bench()
+    b.mint('a')
+    b.mint('b')
+    const models = b.ctx.modelDirectories
+    const first = 'first' as ComposerOccurrenceId
+    const second = 'second' as ComposerOccurrenceId
+    const a = projection('a')
+    const other = projection('b')
+    const openFirst = vi.fn(() => true)
+    const openSecond = vi.fn(() => true)
+    const openOther = vi.fn(() => false)
+    const dispose = models.registerPickerOpener({ ...a, composerId: first }, openFirst)
+    models.registerPickerOpener({ ...a, composerId: second }, openSecond)
+    models.registerPickerOpener({ ...other, composerId: first }, openOther)
+    expect(b.popup().openInComposer?.(a, first)).toBe(true)
+    expect(b.seat().inject!(a.sessionId).openPicker?.(first)).toBe(true)
+    expect(openFirst).toHaveBeenCalledTimes(2)
+    expect(openSecond).not.toHaveBeenCalled()
+    expect(openOther).not.toHaveBeenCalled()
+    expect(b.popup().openInComposer?.(a, second)).toBe(true)
+    expect(openSecond).toHaveBeenCalledTimes(1)
+    expect(b.popup().openInComposer?.(other, first)).toBe(false)
+    expect(openOther).toHaveBeenCalledTimes(1)
+    expect(() => models.registerPickerOpener({ ...a, composerId: first }, openFirst)).toThrow('already has a picker opener')
+    dispose()
+    expect(b.popup().openInComposer?.(a, first)).toBe(false)
+    const replacement = vi.fn(() => true)
+    models.registerPickerOpener({ ...a, composerId: first }, replacement)
+    dispose()
+    expect(b.popup().openInComposer?.(a, first)).toBe(true)
+    expect(replacement).toHaveBeenCalledTimes(1)
+    b.address(a.sessionId)
+    expect(b.popup().openInComposer?.(a, first)).toBe(false)
+    expect(b.calls.select).toBe(0)
+  })
+
   it('carries writer contention to the model seat and localizes the command failure', async () => {
     const b = await bench()
     b.mint('owned')
@@ -464,14 +502,24 @@ describe('ui-model-selection dual entry', () => {
     }
   })
 
-  it('scope disposal drops the directory; a reborn scope gets a fresh one', async () => {
+  it('scope disposal drops the directory and opens no picker for a rebound Session', async () => {
     const b = await bench()
     const first = b.mint('s1')
-    const face1 = b.seat().inject!(sid('s1'))
+    const target = { ...projection('s1'), composerId: 'composer' as ComposerOccurrenceId }
+    const opener = vi.fn(() => true)
+    const models = b.ctx.modelDirectories
+    const face1 = b.seat().inject!(target.sessionId)
+    models.registerPickerOpener(target, opener)
+    expect(models.openPicker(target)).toBe(true)
     await first.fiber.dispose()
+    expect(models.openPicker(target)).toBe(false)
+    expect(() => models.registerPickerOpener(target, opener)).toThrow('requires a retained Session')
     b.mint('s1')
-    const face2 = b.seat().inject!(sid('s1'))
+    const face2 = b.seat().inject!(target.sessionId)
     expect(face2.directory).not.toBe(face1.directory)
+    expect(models.openPicker(target)).toBe(false)
+    expect(opener).toHaveBeenCalledTimes(1)
+    await b.ctx.fiber.dispose()
   })
 
   it('retains saved effort for existing and new sessions after credentials disappear', async () => {

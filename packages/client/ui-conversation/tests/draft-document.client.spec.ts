@@ -76,7 +76,7 @@ function textReferences(shell: SessionInputShell): string[] {
 function triggerProvider(lexicon: InputTriggerController['lexicon']): InputTriggerController {
   return {
     lexicon,
-    launcher: createSnapshotStore<string | null>(null),
+    launcher: createSnapshotStore<ReturnType<InputTriggerController['launcher']['getSnapshot']>>(null),
     track: () => {},
     arbitrate: () => 'pass',
     onSpace: () => false,

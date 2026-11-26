@@ -5,7 +5,7 @@
  */
 import type { ComponentType } from 'react'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
-import type { ClientSessionContext } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
+import type { ClientSessionContext, ComposerOccurrenceId } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { IconProps } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** Copy for an option that must be acknowledged before onSelect can run. */
@@ -63,6 +63,16 @@ export interface PopupSearchLabels {
  */
 export interface PopupSelectSpec {
   readonly kind: 'popupSelect'
+  /**
+   * Open a composer-owned picker for a menu pick or bare Enter invocation.
+   * If it opens, the runtime consumes the initiating command token. Menu picks
+   * preserve draft attachments. Bare Enter with attachments follows the popupSelect refusal policy.
+   * An invocation without a composer identity opens the popupSelect shell directly.
+   * @param session - Session captured by the invocation.
+   * @param composerId - identity of the mounted composer starting the invocation.
+   * @returns true when the picker opened, false to open the registered popupSelect shell.
+   */
+  openInComposer?(session: ClientSessionContext, composerId: ComposerOccurrenceId): boolean
   /** Defaults to substring search; fuzzy-label ranks names within each group. */
   readonly searchMode?: PopupSearchMode
   /**

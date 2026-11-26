@@ -14,7 +14,7 @@ import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import { zh } from '../src/client/locales.ts'
 import type {
-  InputTriggerCrumb, MenuState, TriggerHit,
+  ComposerOccurrenceId, InputTriggerCrumb, MenuState, TriggerHit,
 } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import { MenuView } from '../src/client/MenuView.tsx'
 
@@ -59,7 +59,11 @@ afterEach(() => {
 // unknown source comes back verbatim (its raw name).
 const t = makeTranslate(zh, commonZh)
 
-function mount(state: MenuState, crumbs: ReadonlyMap<string, readonly InputTriggerCrumb[]> = new Map()) {
+function mount(
+  state: MenuState,
+  crumbs: ReadonlyMap<string, readonly InputTriggerCrumb[]> = new Map(),
+  composerId?: ComposerOccurrenceId,
+) {
   const menu = createSnapshotStore<MenuState>(state)
   const headers = createSnapshotStore<ReadonlyMap<string, readonly InputTriggerCrumb[]>>(crumbs)
   const onPick = vi.fn()
@@ -68,6 +72,7 @@ function mount(state: MenuState, crumbs: ReadonlyMap<string, readonly InputTrigg
   const onDismiss = vi.fn()
   const view = render(
     <MenuView
+      {...composerId === undefined ? {} : { composerId }}
       menu={menu}
       headers={headers}
       onPick={onPick}
@@ -94,6 +99,13 @@ function titles(container: HTMLElement): string[] {
 }
 
 describe('MenuView', () => {
+  it('passes the originating composer on a pointer menu pick', () => {
+    const composerId = 'composer-b' as ComposerOccurrenceId
+    const { onPick } = mount(openState(), new Map(), composerId)
+    fireEvent.mouseDown(screen.getAllByRole('option')[0]!)
+    expect(onPick).toHaveBeenCalledExactlyOnceWith('command', 0, 'pick', composerId)
+  })
+
   it('renders null while closed and appears when the store opens', () => {
     const { menu, view } = mount(CLOSED)
     expect(view.container.childElementCount).toBe(0)
@@ -187,7 +199,7 @@ describe('MenuView', () => {
       'Session · Research',
     ])
     fireEvent.mouseDown(options[2]!)
-    expect(onPick).toHaveBeenCalledWith('reference', 2)
+    expect(onPick).toHaveBeenCalledWith('reference', 2, 'pick', undefined)
   })
 
   it('renders the drill chevron only on drillable rows and routes its own action', () => {
@@ -206,9 +218,9 @@ describe('MenuView', () => {
     expect(chevrons).toHaveLength(1)
     // The chevron drills; the row body still settles the pick untouched.
     fireEvent.mouseDown(chevrons[0]!)
-    expect(onPick).toHaveBeenCalledWith('reference', 0, 'drill')
+    expect(onPick).toHaveBeenCalledWith('reference', 0, 'drill', undefined)
     fireEvent.mouseDown(screen.getAllByRole('option')[0]!)
-    expect(onPick).toHaveBeenCalledWith('reference', 0)
+    expect(onPick).toHaveBeenCalledWith('reference', 0, 'pick', undefined)
   })
 
   it('exposes the highlight via aria-activedescendant and aria-selected', () => {
@@ -328,7 +340,7 @@ describe('MenuView', () => {
     const notPrevented = fireEvent.mouseDown(options[1]!)
     // fireEvent returns false when preventDefault was called.
     expect(notPrevented).toBe(false)
-    expect(onPick).toHaveBeenCalledWith('command', 1)
+    expect(onPick).toHaveBeenCalledWith('command', 1, 'pick', undefined)
   })
 
   it('pointer motion over a row routes hover; the highlighted row stays silent', () => {
@@ -362,7 +374,7 @@ describe('MenuView', () => {
     ]]]))
     const crumbs = screen.getByRole('navigation', { name: '目录导航' }).querySelectorAll('button')
     expect(fireEvent.mouseDown(crumbs[0]!)).toBe(false)
-    expect(onCrumb).toHaveBeenCalledWith('command', 0)
+    expect(onCrumb).toHaveBeenCalledWith('command', 0, undefined)
     onCrumb.mockClear()
     expect(crumbs[1]!.disabled).toBe(true)
     fireEvent.mouseDown(crumbs[1]!)

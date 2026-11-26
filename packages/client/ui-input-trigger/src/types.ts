@@ -9,13 +9,13 @@
  */
 import type { ComponentType } from 'react'
 import type {
-  CommandClaim, PickOutcome, ReferenceInsert, TokenSpan,
+  CommandClaim, ComposerOccurrenceId, PickOutcome, ReferenceInsert, TokenSpan,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { IconProps } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
 export type {
-  ArbitrateKey, ArbitrateOutcome, BeginCommandRequest, CommandClaim, ConsumeTokenRequest,
+  ArbitrateKey, ArbitrateOutcome, BeginCommandRequest, CommandClaim, ComposerOccurrenceId, ConsumeTokenRequest,
   InsertReferenceRequest, InsertTextRequest, PickOutcome, ReferenceInsert, SubmitAttachment,
   SubmitOutcome, TokenSpan,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
@@ -108,6 +108,8 @@ export interface HeaderRequest {
 export interface SubmitEnvelope {
   /** Number of attachments accompanying the draft. */
   readonly attachments: number
+  /** Initiating composer, absent for view-independent submissions. */
+  readonly composerId?: ComposerOccurrenceId
 }
 
 /** Candidate request passed to a source. The signal is superseded on query change / menu close. */
@@ -125,6 +127,8 @@ export interface CandidateRequest {
 export interface InputTriggerPick {
   readonly candidate: InputTriggerCandidate
   readonly session: ClientSessionContext
+  /** Initiating composer, absent for picks outside a mounted composer. */
+  readonly composerId?: ComposerOccurrenceId
   readonly position: TriggerPosition
   readonly via: PickVia
   /** Settling pick, or the candidate's drill action (Tab / row chevron). */

@@ -443,7 +443,7 @@ describe('programmatic source launcher', () => {
     controller.toggleSource('command', hit)
     await tick()
 
-    expect(controller.launcher.getSnapshot()).toBe('command')
+    expect(controller.launcher.getSnapshot()).toEqual({ source: 'command' })
     expect(controller.menu.getSnapshot()).toMatchObject({
       open: true,
       hit,

@@ -13,7 +13,7 @@
  * trigger instead of a parallel tree.
  */
 
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, KeyboardEvent, MouseEvent } from 'react'
 import clsx from 'clsx'
 import {
@@ -28,11 +28,12 @@ import type {} from '@deepseek-ai/dsh-goal/client'
 // wire types: apiproxy's sessions contract declares it, and client-runtime's
 // api-remotes import already places it in every client program.
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
+import type { ComposerOccurrenceId } from '../contract/draft-editor.ts'
 import type { ComposerBarProps } from '../contract/slots.ts'
 import { DraftEditor } from '../input/editor/DraftEditor.tsx'
 import {
   focusDraftEditor, installDraftFilePicker, installDraftKeyboardDismissal, installDraftKeymap, installDraftWheel,
-  keepDraftFocus, revealDraftSelection,
+  revealDraftSelection,
 } from '../input/editor/view-binding.ts'
 import { resolveSubmitMode } from '../input/submission-policy.ts'
 import { attachmentErrorText, imageSizeText } from '../image-labels.ts'
@@ -53,6 +54,7 @@ export const InputBar = memo(function InputBar({
   workspacePickerOpen = false, onRequestWorkspace,
   placeholder, accessory,
 }: InputBarProps) {
+  const composerId = useId() as ComposerOccurrenceId
   const input = useInput(s => s)
   const notice = useNotices(s => s)
   const busyEnter = useBusyEnter(s => s)
@@ -65,7 +67,8 @@ export const InputBar = memo(function InputBar({
   const uploadDenied = useAccess('fileUploads/upload') === false
   const stopAction = cancelDenied ? undefined : stop
   void useLexicon // hook seat stays bound by the inject compartment; text-ref decoration rides the shell's editor transforms
-  const commandMenuOpen = useMenuLauncher(source => source === 'command')
+  const commandMenuOpen = useMenuLauncher(launcher => launcher?.source === 'command'
+    && (launcher.composerId === undefined || launcher.composerId === composerId))
   const [activity, setActivity] = useState(false)
   useEffect(() => { setActivity(false) }, [sessionId])
   const promptError = useSession(s => s.promptError) ?? null
@@ -149,6 +152,10 @@ export const InputBar = memo(function InputBar({
     return observeControlRow(row)
   }, [])
   const cardRef = useRef<HTMLDivElement | null>(null)
+  const editorRef = useRef<HTMLDivElement>(null)
+  const onEditorBinding = useCallback((bound: boolean): void => {
+    keyboard?.setEditorComposer?.(bound ? composerId : undefined)
+  }, [keyboard, composerId])
   const scrollRef = useRef<HTMLDivElement | null>(null)
 
   const continuable = subagent?.address.mode === 'continuable'
@@ -192,7 +199,7 @@ export const InputBar = memo(function InputBar({
   // Automatic desktop focus restores and reveals the draft selection without
   // scrolling the conversation.
   useEffect(() => {
-    if (locked || editor === null) return
+    if (locked || editor === null || editor.getRootElement() !== editorRef.current) return
     if (isMobileDevice()) return
     focusDraftEditor(editor, revealSelection)
   }, [locked, sessionId, editor])
@@ -208,7 +215,7 @@ export const InputBar = memo(function InputBar({
     }
     if (!busyPhaseSeen.current) return
     busyPhaseSeen.current = false
-    if (locked || editor === null) return
+    if (locked || editor === null || editor.getRootElement() !== editorRef.current) return
     if (document.activeElement !== null && document.activeElement !== document.body) return
     if (isMobileDevice()) {
       if (cardRef.current !== null) focusWithoutRing(cardRef.current, { preventScroll: true })
@@ -302,12 +309,12 @@ export const InputBar = memo(function InputBar({
 
   useEffect(() => {
     if (editor === null || keyboard === undefined) return
-    return installDraftKeymap(editor, keyboard, gate)
-  }, [editor, keyboard])
+    return installDraftKeymap(editor, keyboard, gate, composerId, editorRef)
+  }, [editor, keyboard, composerId])
 
   useEffect(() => {
     if (editor === null) return
-    return installDraftKeyboardDismissal(editor, cardRef)
+    return installDraftKeyboardDismissal(editor, cardRef, editorRef)
   }, [editor])
 
   // A document paste outside an editable control addresses at most one
@@ -326,7 +333,8 @@ export const InputBar = memo(function InputBar({
   // restores the previous selection, so no reveal is needed: the caret has
   // not moved, and the next keystroke gets the browser's native one.
   const keepFocus = (e: MouseEvent<HTMLButtonElement>): void => {
-    keepDraftFocus(e, editor)
+    e.preventDefault()
+    editorRef.current?.focus({ preventScroll: true })
   }
 
   const onCardMouseDown = (e: MouseEvent<HTMLDivElement>): void => {
@@ -340,8 +348,14 @@ export const InputBar = memo(function InputBar({
     e.preventDefault()
     // Lexical's stored selection can lag behind native caret moves, so calling
     // editor.focus() on a focused editor can restore an older caret.
-    if (document.activeElement !== editor.getRootElement()) focusDraftEditor(editor, revealSelection)
+    if (document.activeElement !== editorRef.current) focusComposer()
   }
+
+  const focusComposer = useCallback((): void => {
+    if (editor === null || editorRef.current === null) return
+    editorRef.current.focus({ preventScroll: true })
+    focusDraftEditor(editor, () => { revealDraftSelection(scrollRef) })
+  }, [editor])
 
   const onToggleCommandMenu = (): void => {
     if (keyboard === undefined) return
@@ -349,8 +363,8 @@ export const InputBar = memo(function InputBar({
     // before the launcher opens it: activating the button from the keyboard
     // leaves focus on the button, and restoring it afterwards would re-track an
     // empty draft and close the menu again.
-    if (editor !== null) focusDraftEditor(editor, revealSelection)
-    toggleCommandMenu?.(keyboard.caretSpan())
+    focusComposer()
+    toggleCommandMenu?.(keyboard.caretSpan(), composerId)
   }
 
   // The no-session Workspace trigger: the resident editable div acts as the
@@ -403,7 +417,7 @@ export const InputBar = memo(function InputBar({
     }
     if (keyboard === undefined) return // absent machine: the button is disabled
     /* v8 ignore next -- defensive: the primary button is disabled for empty, disabled, and pending-upload states. */
-    if (!empty && !disabled && !machineBusy && !uploadsPending) keyboard.submit(primarySubmitMode, 'click')
+    if (!empty && !disabled && !machineBusy && !uploadsPending) keyboard.submit(primarySubmitMode, 'click', composerId)
   }
 
   // Claim ghost hint: rendered by CSS as generated content after the last
@@ -465,7 +479,7 @@ export const InputBar = memo(function InputBar({
         onMouseDown={onCardMouseDown}
       >
         {sessionId !== undefined && (
-          <div className={css.overlayAnchor} data-composer-overlay>{renderSlot('conversation.input.overlay', {})}</div>
+          <div className={css.overlayAnchor} data-composer-overlay>{renderSlot('conversation.input.overlay', { composerId, focusComposer })}</div>
         )}
         {accessory !== undefined && <div className={css.accessory}>{accessory}</div>}
         {renderSlot('conversation.input.attachments', {
@@ -489,6 +503,8 @@ export const InputBar = memo(function InputBar({
         <DraftEditor
           classNames={css}
           editor={editor}
+          editorRef={editorRef}
+          onEditorBinding={onEditorBinding}
           scrollRef={scrollRef}
           editable={editable}
           editorDisabled={editorDisabled}
@@ -537,8 +553,8 @@ export const InputBar = memo(function InputBar({
             <div className={css.standardControls} hidden={activity}>
               {input === undefined || sessionId === undefined
                 ? null
-                : renderSlot('conversation.input.right', {})}
-              {sessionId === undefined ? null : renderSlot('conversation.input.model', { locked: modelSeatLocked })}
+                : renderSlot('conversation.input.right', { composerId })}
+              {sessionId === undefined ? null : renderSlot('conversation.input.model', { locked: modelSeatLocked, composerId })}
             </div>
             {input === undefined || sessionId === undefined ? null : <div className={activity ? css.activityExpanded : css.activity}>
               {renderSlot('conversation.input.activity', { locked, onActiveChange: setActivity })}

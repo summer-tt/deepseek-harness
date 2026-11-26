@@ -33,6 +33,7 @@ import { orderModelProviders } from './provider-order.ts'
 export { ModelDirectory } from './directory.ts'
 export type { ModelDirectoryState } from './directory.ts'
 export { ModelDirectoryResolver } from './service.ts'
+export type { SessionModelPickerTarget } from './service.ts'
 export type { ModelLabelOwner, ModelSelectInjected } from './slots.ts'
 export type { ModelKey } from './locales.ts'
 
@@ -134,6 +135,7 @@ export function apply(ctx: ClientContext): void {
       available: session => sessions.subagentAddress(session.sessionId) === undefined,
       ui: {
         kind: 'popupSelect',
+        openInComposer: ({ sessionId }, composerId) => models.openPicker({ sessionId, composerId }),
         searchMode: 'fuzzy-label',
         searchLabels: () => ({
           placeholder: t('search.placeholder'),
@@ -181,6 +183,7 @@ export function apply(ctx: ClientContext): void {
         const available = sessions.subagentAddress(sessionId) === undefined
         return {
           available,
+          openPicker: composerId => models.openPicker({ sessionId, composerId }),
           directory: directory.store,
           load: () => {
             if (available) directory.load().catch(() => { /* surfaced on the store */ })

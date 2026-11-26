@@ -12,7 +12,7 @@ import type { InboxState } from '@deepseek-ai/dsh-agent/types'
 import type { ObservableSnapshot, SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { QuoteSummary } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { ArbitrateKey, ArbitrateOutcome, DraftQuote, Occurrence, ReferenceInsert, TokenSpan } from './draft-editor.ts'
+import type { ArbitrateKey, ArbitrateOutcome, ComposerOccurrenceId, DraftQuote, Occurrence, ReferenceInsert, TokenSpan } from './draft-editor.ts'
 import type { InputSubmitMode, MessageSubmission } from './composer-submission.ts'
 
 /** Attachment payload passed to a claimed command submission. */
@@ -97,9 +97,15 @@ export interface InputTriggerHit {
   readonly span: TokenSpan
 }
 
+/** The source and occurrence for one programmatically launched menu. */
+export interface InputTriggerLauncher {
+  readonly source: string
+  readonly composerId?: ComposerOccurrenceId
+}
+
 /** Structural per-Session trigger provider consumed by the input shell. */
 export interface InputTriggerController {
-  readonly launcher: ObservableSnapshot<string | null>
+  readonly launcher: ObservableSnapshot<InputTriggerLauncher | null>
   readonly lexicon: ObservableSnapshot<ReadonlyMap<'/' | '@', readonly string[]>>
   /** @param draft - current draft. @param caret - caret offset. @param guard - availability tier. @param draftRev - input revision. */
   track(
@@ -107,9 +113,10 @@ export interface InputTriggerController {
     caret: number,
     guard: { readonly tier: 'plain' | 'claimed' | 'frozen' },
     draftRev: number,
+    composerId?: ComposerOccurrenceId,
   ): void
   /** @param key - intercepted key. @param composing - whether IME composition is active. @returns routing result. */
-  arbitrate(key: ArbitrateKey, composing: boolean): ArbitrateOutcome
+  arbitrate(key: ArbitrateKey, composing: boolean, composerId?: ComposerOccurrenceId): ArbitrateOutcome
   /** @returns whether Space applied a trigger result. */
   onSpace(): boolean
   /** @param source - reference source. @param ref - source-local id. @param signal - submit cancellation. @returns model text. */
@@ -118,7 +125,7 @@ export interface InputTriggerController {
   adjudicate(
     line: string,
     signal: AbortSignal,
-    envelope: { readonly attachments: number },
+    envelope: { readonly attachments: number; readonly composerId?: ComposerOccurrenceId },
   ): Promise<PickOutcome>
   /**
    * Resolve the claim a persisted command chip names without acting on it.
@@ -134,7 +141,7 @@ export interface InputTriggerController {
    */
   openReference(source: string | undefined, reference: Pick<ReferenceInsert, 'ref' | 'appearance'>): boolean
   /** @param source - source name. @param hit - synthetic trigger hit. */
-  toggleSource(source: string, hit: InputTriggerHit): void
+  toggleSource(source: string, hit: InputTriggerHit, composerId?: ComposerOccurrenceId): void
 }
 
 declare module '@deepseek-ai/cordis' {

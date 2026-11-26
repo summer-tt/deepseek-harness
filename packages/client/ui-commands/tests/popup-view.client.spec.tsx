@@ -13,6 +13,7 @@
 import * as uiPrimitives from '@deepseek-ai/dsh-client-ui-primitives'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import type { ComposerOccurrenceId } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import type { SelectOption } from '../src/client/contract.ts'
 import type { PopupSpec, TokenSegment } from '../src/client/popup.ts'
 import { PopupSelectController } from '../src/client/popup.ts'
@@ -80,6 +81,34 @@ function rowLabels(): string[] {
 }
 
 describe('PopupSelectView', () => {
+  it('shows the fallback only in the composer that invoked it', async () => {
+    const defaultFocus = vi.fn()
+    const popup = new PopupSelectController<string>({ consume: () => true, focusComposer: defaultFocus })
+    const first = 'first' as ComposerOccurrenceId
+    const second = 'second' as ComposerOccurrenceId
+    const focusFirst = vi.fn()
+    const focusSecond = vi.fn()
+    const firstView = render(<PopupSelectView popup={popup} t={t} composerId={first} focusComposer={focusFirst} />)
+    const secondView = render(<PopupSelectView popup={popup} t={t} composerId={second} focusComposer={focusSecond} />)
+    await act(async () => { popup.open('model', spec(), 'session', SEGMENT, second) })
+    expect(firstView.container.querySelector('[role="listbox"]')).toBeNull()
+    expect(secondView.container.querySelector('[role="listbox"]')).not.toBeNull()
+    const search = secondView.container.querySelector('input')!
+    expect(document.activeElement).toBe(search)
+    fireEvent.keyDown(search, { key: 'Escape' })
+    expect(focusSecond).toHaveBeenCalledTimes(1)
+    expect(focusFirst).not.toHaveBeenCalled()
+    expect(defaultFocus).not.toHaveBeenCalled()
+    const options = vi.fn<PopupSpec<string>['options']>(() => new Promise(() => {}))
+    act(() => { popup.open('model', spec({ options }), 'session', SEGMENT, second) })
+    firstView.unmount()
+    expect(popup.state.getSnapshot().open).toBe(true)
+    secondView.unmount()
+    expect(options.mock.calls[0]![1].aborted).toBe(true)
+    expect(popup.state.getSnapshot().open).toBe(false)
+    expect(focusSecond).toHaveBeenCalledTimes(1)
+  })
+
   it('renders provider groups and selects the same fuzzy-ranked row the user sees', async () => {
     const alpha = { name: 'alpha', label: 'Alpha provider' }
     const beta = { name: 'beta', label: 'Beta provider' }

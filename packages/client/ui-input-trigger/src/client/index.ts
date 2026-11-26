@@ -22,7 +22,7 @@ export type { MenuViewInjected } from './slots.ts'
 export type { MenuViewProps } from './MenuView.tsx'
 export type { MenuKey } from './locales.ts'
 export type {
-  ArbitrateKey, ArbitrateOutcome, BeginCommandRequest, CandidateRequest, ClientSessionContext,
+  ArbitrateKey, ArbitrateOutcome, BeginCommandRequest, CandidateRequest, ClientSessionContext, ComposerOccurrenceId,
   CommandClaim, ConsumeTokenRequest, HeaderRequest, InsertReferenceRequest, PickOutcome, PickVia,
   ReferenceCodec, ReferenceInsert, InputTriggerCandidate, InputTriggerCrumb, InputTriggerPick,
   InputTriggerSource, SubmitAttachment, SubmitEnvelope, SubmitOutcome, TokenSpan, TriggerChar,
@@ -76,8 +76,8 @@ export function apply(ctx: ClientContext): void {
         return {
           menu: controller.menu,
           headers: controller.headers,
-          onPick: (source, index, action) => { controller.pick(source, index, action) },
-          onCrumb: (source, index) => { controller.pickCrumb(source, index) },
+          onPick: (source, index, action, composerId) => { controller.pick(source, index, action, composerId) },
+          onCrumb: (source, index, composerId) => { controller.pickCrumb(source, index, composerId) },
           onHover: (source, index) => { controller.hover(source, index) },
           onDismiss: () => { controller.dismiss() },
         }
