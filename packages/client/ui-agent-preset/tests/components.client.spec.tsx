@@ -54,6 +54,7 @@ function renderSeat(
   select: () => Promise<string | undefined> = () => Promise.resolve(undefined),
   session?: { id: string; retainInfo: SessionRetainInfo | undefined },
   enabled = true,
+  draftPreset?: AgentPresetSeatProps['draftPreset'],
 ) {
   const store = createSnapshotStore<AgentPresetSeatState>({ ...SEAT_READY, ...state })
   const developerTools = createSnapshotStore(enabled)
@@ -67,6 +68,7 @@ function renderSeat(
   }
   const props = {
     ...actions,
+    draftPreset,
     sessionId: session === undefined ? undefined : SessionId(session.id),
     useDeveloperTools: bindSnapshotSelector(developerTools),
     useAgentPresetSeat: bindSnapshotSelector(store),
@@ -100,6 +102,22 @@ function renderLabel(
 }
 
 describe('the new-session chip', () => {
+  it('renders the draft roster with native descriptions and stages the draft selection only', () => {
+    const onSelect = vi.fn()
+    const actions = renderSeat({}, undefined, undefined, false, {
+      options: [{ id: 'standard' }, { id: 'ptc' }, { id: 'custom', name: 'Custom mode', description: 'For this Host' }],
+      selectedId: 'standard', onSelect,
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Standard mode' }))
+    expect(screen.getByText(en.presetStandardDescription)).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: /^PTC mode/ })).toBeNull()
+    expect(screen.getByText('For this Host')).toBeTruthy()
+    fireEvent.click(screen.getByRole('menuitem', { name: /^Custom mode/ }))
+    expect(onSelect).toHaveBeenCalledWith('custom')
+    expect(actions.select).not.toHaveBeenCalled()
+    expect(actions.load).not.toHaveBeenCalled()
+  })
+
   it.each([false, true])('offers Standard, Creator and custom presets with Developer tools %s', (enabled) => {
     const actions = renderSeat({ options: [
       { id: 'standard' }, { id: 'ptc' }, { id: 'minimal' }, { id: 'cordis' }, { id: 'mine' },

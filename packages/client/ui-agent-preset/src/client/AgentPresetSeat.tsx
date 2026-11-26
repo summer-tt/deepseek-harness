@@ -79,10 +79,15 @@ export type AgentPresetSeatProps =
  * @returns The chip and any pending selection refusal, or null outside the main view.
  */
 export function AgentPresetSeat({
-  sessionId, useSessionRetainInfo, load, select, dismissRefusal, introduced, useAgentPresetSeat, useDeveloperTools, presetDisplay, t,
+  sessionId, useSessionRetainInfo, load, select, dismissRefusal, introduced,
+  useAgentPresetSeat, useDeveloperTools, presetDisplay, draftPreset, t,
 }: AgentPresetSeatProps) {
   const developerTools = useDeveloperTools(value => value)
-  const state = useAgentPresetSeat(snapshot => snapshot)
+  const nativeState = useAgentPresetSeat(snapshot => snapshot)
+  const state = draftPreset === undefined ? nativeState : {
+    options: draftPreset.options, current: draftPreset.selectedId ?? '',
+    error: null, busy: draftPreset.disabled === true, introduce: false,
+  }
   const main = useSessionRetainInfo(info => sessionId === undefined
     || (info?.retainedBy.mainView ?? 0) > 0)
   const [open, setOpen] = useState(false)
@@ -99,8 +104,8 @@ export function AgentPresetSeat({
   }, [state.error])
 
   useEffect(() => {
-    void load()
-  }, [load])
+    if (draftPreset === undefined) void load()
+  }, [load, draftPreset === undefined])
 
   const options = useMemo(
     () => state.options.flatMap((option) => {
@@ -118,8 +123,9 @@ export function AgentPresetSeat({
 
   const chosen = state.options.find(option => option.id === state.current)
   const chosenText = chosen === undefined ? undefined : presetDisplayText(chosen, t)
-  const label = options.find(option => option.id === state.current)?.text.name ?? chosenText?.name ?? state.current
-  const ready = state.options.length > 0 && state.current !== ''
+  const label = options.find(option => option.id === state.current)?.text.name ?? chosenText?.name
+    ?? (state.current || t('seatHint'))
+  const ready = draftPreset !== undefined || (state.options.length > 0 && state.current !== '')
 
   // The introduce cue: the pick was staged from another screen (the settings
   // creator entry), so the chip announces it — the icon eases in and each
@@ -185,7 +191,8 @@ export function AgentPresetSeat({
         selectedId={state.current}
         onSelect={(id) => {
           setOpen(false)
-          void select(id)
+          if (draftPreset === undefined) void select(id)
+          else draftPreset.onSelect(id)
         }}
         align="start"
         portal

@@ -415,8 +415,17 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
   }
 }
 
+/** Preset options controlled by a draft that has no Session binding. */
+export interface HeroDraftPresetControl {
+  readonly options: readonly { id: string; name?: string; description?: string }[]
+  readonly selectedId?: string | undefined
+  readonly disabled?: boolean | undefined
+  readonly onSelect: (id: string) => void
+}
+
 /** Owner share of the Hero agent-preset control. */
 export interface HeroAgentPresetOwnerProps {
+  draftPreset?: HeroDraftPresetControl | undefined
   /** Optional display policy for the mode menu. A missing result hides the preset. */
   presetDisplay?: ((id: string, name: string) => string | undefined) | undefined
 }
@@ -757,6 +766,7 @@ export type ComposerAttachmentsProps =
 export interface HeroDraftTargetOwnerProps {
   readonly draftAvailable: boolean
   readonly targetSessionId?: SessionId | undefined
+  readonly renderDraftPreset?: ((control: HeroDraftPresetControl) => ReactNode) | undefined
   readonly renderNativeTarget?: ((display: NonNullable<HeroAgentPresetOwnerProps['presetDisplay']>) => ReactNode) | undefined
   readonly renderWorkspace: (options: {
     label?: string | undefined
