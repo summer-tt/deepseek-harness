@@ -89,6 +89,10 @@ export interface UiWorkspace {
    * whether existing text or attachments are kept, replaced, or followed by the prompt.
    */
   startSession(workspaceId?: WorkspaceId, options?: StartSessionOptions): void
+  /** Register the optional draft opener used by interactive New Session actions. */
+  registerNewSessionDraft(open: (workspaceId?: WorkspaceId) => boolean): () => void
+  /** Show the native empty Conversation and track when a later navigation supersedes it. */
+  openSessionDraft(): AbortSignal
   /**
    * Archive a Session and clear it when it is the current selection.
    * @param sessionId - Session to archive.
@@ -174,6 +178,8 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     {}, { persist: { name: 'dsh.sessions.current' } },
   )
   private mainReference: SessionReference | undefined
+  private newSessionDraft: ((workspaceId?: WorkspaceId) => boolean) | undefined
+  private sessionDraftNavigation: AbortSignal | undefined
   private restorationNavigation: AbortSignal | undefined
 
   /**
@@ -334,7 +340,20 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     })
   }
 
+  registerNewSessionDraft(open: (workspaceId?: WorkspaceId) => boolean): () => void {
+    this.newSessionDraft = open
+    return () => { if (this.newSessionDraft === open) this.newSessionDraft = undefined }
+  }
+
+  openSessionDraft(): AbortSignal {
+    this.clearMain()
+    const navigation = this.ctx.layout.beginNavigation()
+    this.sessionDraftNavigation = navigation
+    return navigation
+  }
+
   startSession(workspaceId?: WorkspaceId, options?: StartSessionOptions): void {
+    if (options === undefined && this.newSessionDraft?.(workspaceId) === true) return
     const { agentPreset, ...draft } = options ?? {}
     const draftOptions = options === undefined ? undefined : draft
     const initializeDraft = draftOptions !== undefined && (draftOptions.prompt !== undefined
@@ -433,7 +452,8 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     const reconcile = (): void => {
       if (this.lifetime.signal.aborted) return
       if (this.clearArchivedCurrent()) return
-      if (initial !== 'waiting' || this.restorationNavigation?.aborted === true) return
+      if (initial !== 'waiting' || this.restorationNavigation?.aborted === true
+        || this.sessionDraftNavigation?.aborted === false) return
       const workspace = this.workspaces.list.getSnapshot()
       const sessions = this.sessions.list.getSnapshot()
       if (workspace.phase !== 'ready' || sessions.phase !== 'ready') return

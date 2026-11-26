@@ -53,6 +53,8 @@ export interface WorkspacePickFlowProps {
   side?: 'bottom' | 'top' | 'right'
   /** Currently active workspace (trailing check in the picker list). */
   selectedId?: WorkspaceId | undefined
+  filterWorkspace?: ((id: WorkspaceId) => boolean) | undefined
+  allowAddWorkspace?: boolean | undefined
 }
 
 /**
@@ -74,11 +76,14 @@ export function WorkspacePickFlow({
   onBusyChange,
   side = 'bottom',
   selectedId,
+  filterWorkspace,
+  allowAddWorkspace = true,
 }: WorkspacePickFlowProps) {
   // Without an owner-provided anchor, the menu remains hidden.
   const absentAnchor = useRef<HTMLElement>(null)
   const workspaceSnapshot = useWorkspaces(state => state)
-  const workspaces = workspaceSnapshot.items
+  const workspaces = useMemo(() => filterWorkspace === undefined ? workspaceSnapshot.items
+    : workspaceSnapshot.items.filter(row => filterWorkspace(row.workspaceId)), [workspaceSnapshot.items, filterWorkspace])
   const [errorOpen, setErrorOpen] = useState(false)
   const [modalError, setModalError] = useState<string | null>(null)
   const [flowOpen, setFlowOpen] = useState(false)
@@ -94,7 +99,7 @@ export function WorkspacePickFlow({
   // entry simply is not there (the seam's documented no-flow default). The
   // framework-bound hook keeps occupancy live: flow plugins activate (and
   // HMR-reload) independently of this menu's renders.
-  const flowAvailable = useDirectoryFlow(occupied => occupied)
+  const flowAvailable = useDirectoryFlow(occupied => occupied && allowAddWorkspace)
   // An occupant that unloads mid-interaction leaves nobody to cancel: an
   // open flow over an empty hole withdraws so the menu actions come back.
   // flowOpen is a dependency because the flow can also OPEN over an already
@@ -251,10 +256,11 @@ export function WorkspacePickFlow({
 type PickerSurfaceProps = Pick<
   WorkspacePickFlowProps,
   't' | 'open' | 'anchorRef' | 'useWorkspaces' | 'createWorkspace' | 'useDirectoryFlow' | 'selectedId' | 'onPick' | 'onClose'
->
+> & Pick<WorkspacePickFlowProps, 'filterWorkspace' | 'allowAddWorkspace'>
 
 function surfaceFlow(
-  { t, open, anchorRef, useWorkspaces, createWorkspace, useDirectoryFlow, selectedId, onPick, onClose }: PickerSurfaceProps,
+  { t, open, anchorRef, useWorkspaces, createWorkspace, useDirectoryFlow, selectedId,
+    onPick, onClose, filterWorkspace, allowAddWorkspace }: PickerSurfaceProps,
   renderDirectoryFlow: WorkspacePickFlowProps['renderDirectoryFlow'],
 ): ReactElement {
   return (
@@ -267,6 +273,8 @@ function surfaceFlow(
       useDirectoryFlow={useDirectoryFlow}
       renderDirectoryFlow={renderDirectoryFlow}
       selectedId={selectedId}
+      filterWorkspace={filterWorkspace}
+      allowAddWorkspace={allowAddWorkspace}
       onPick={onPick}
       onClose={onClose}
     />

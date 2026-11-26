@@ -290,6 +290,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
     'conversation.composer': { kind: 'chain'; scope: 'session'; owner: ComposerChainProps }
     /** Workspace picker shown by the blank-session Hero. */
     'conversation.hero.workspace': { kind: 'single'; scope: 'root'; owner: EmptyWorkspaceOwnerProps }
+    'conversation.hero.draftTarget': { kind: 'hoc'; scope: 'root'; owner: HeroDraftTargetOwnerProps }
+    'conversation.hero.draftComposer': { kind: 'hoc'; scope: 'root'; owner: { readonly draftAvailable: boolean } }
     /** Layers wrapping the Conversation scroll body; `hero` reports a blank, standalone home. */
     'conversation.hero.frame': { kind: 'hoc'; scope: 'root'; owner: HeroFrameOwnerProps }
     /** Brand mark shown before the blank-session headline. */
@@ -375,6 +377,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
         'conversation.hero.frame': { kind: 'hoc'; scope: 'root' }
         'conversation.hero.brand.mark': { kind: 'single'; scope: 'root' }
         'conversation.hero.workspace': { kind: 'single'; scope: 'root' }
+        'conversation.hero.draftTarget': { kind: 'hoc'; scope: 'root' }
+        'conversation.hero.draftComposer': { kind: 'hoc'; scope: 'root' }
         'conversation.hero.agentPreset': { kind: 'single'; scope: 'session-maybe' }
         'conversation.hero.options': { kind: 'list'; scope: 'session' }
       }
@@ -749,12 +753,28 @@ export type ConversationSessionHeaderSlotProps =
 export type ComposerAttachmentsProps =
   PropsRuntime<'conversation.input.attachments'> & PropsLocale<'conversation'>
 
+/** Native workspace control available to a sessionless hero draft. */
+export interface HeroDraftTargetOwnerProps {
+  readonly draftAvailable: boolean
+  readonly renderWorkspace: (options: {
+    label?: string | undefined
+    selectedId?: WorkspaceId | undefined
+    filterWorkspace: (id: WorkspaceId) => boolean
+    allowAddWorkspace: boolean
+    onPick: (id: WorkspaceId) => void
+  }) => ReactNode
+}
+
 /** Owner share common to blank-session Workspace pickers. */
 export interface EmptyWorkspaceOwnerProps {
   open: boolean
   anchorRef?: RefObject<HTMLElement>
   /** Currently selected Workspace, when available. */
   selectedId?: WorkspaceId | undefined
+  /** Optional restriction applied to the native list. */
+  filterWorkspace?: ((id: WorkspaceId) => boolean) | undefined
+  /** Whether the native local directory picker is available for this target. */
+  allowAddWorkspace?: boolean | undefined
   onPick: (workspaceId: WorkspaceId) => void
   onClose: () => void
 }

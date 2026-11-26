@@ -806,6 +806,36 @@ describe('UiWorkspaceService', () => {
     expect(b.selectPanel).toHaveBeenCalledWith(null)
   })
 
+  it('opens an interactive draft without creating a Session and releases it on later navigation', async () => {
+    const b = bench({ workspaces: workspaceState([workspace('a')]) })
+    b.uiWorkspace.openSession(sid('previous'))
+    const previous = b.sessions.retained[0]!
+    let draft: AbortSignal | undefined
+    const open = vi.fn(() => {
+      draft = b.uiWorkspace.openSessionDraft()
+      return true
+    })
+    const unregister = b.uiWorkspace.registerNewSessionDraft(open)
+
+    b.uiWorkspace.startSession()
+
+    expect(open).toHaveBeenCalledExactlyOnceWith(undefined)
+    expect(previous.release).toHaveBeenCalledOnce()
+    expect(b.sessions.create).not.toHaveBeenCalled()
+    expect(draft?.aborted).toBe(false)
+
+    const opening = vi.spyOn(b.uiWorkspace, 'openWorkspace')
+    b.uiWorkspace.startSession(wid('a'), { prompt: 'prefilled' })
+    await lastOpening(opening)
+    expect(draft?.aborted).toBe(true)
+    expect(open).toHaveBeenCalledOnce()
+
+    unregister()
+    b.uiWorkspace.startSession(wid('a'))
+    await lastOpening(opening)
+    expect(open).toHaveBeenCalledOnce()
+  })
+
   describe('startSession draft initialization', () => {
     it.each<{ name: string; options: DraftInitializationOptions }>([
       { name: 'plain text', options: { prompt: '草稿 🧭\nsecond line', clearPreviousDraft: true } },
