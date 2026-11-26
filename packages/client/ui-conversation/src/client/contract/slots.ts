@@ -760,6 +760,7 @@ export interface HeroDraftTargetOwnerProps {
     label?: string | undefined
     selectedId?: WorkspaceId | undefined
     filterWorkspace: (id: WorkspaceId) => boolean
+    workspaceTitle?: ((id: WorkspaceId, title: string) => string) | undefined
     allowAddWorkspace: boolean
     onPick: (id: WorkspaceId) => void
   }) => ReactNode
@@ -773,6 +774,8 @@ export interface EmptyWorkspaceOwnerProps {
   selectedId?: WorkspaceId | undefined
   /** Optional restriction applied to the native list. */
   filterWorkspace?: ((id: WorkspaceId) => boolean) | undefined
+  /** Display-only title override for the filtered list. */
+  workspaceTitle?: ((id: WorkspaceId, title: string) => string) | undefined
   /** Whether the native local directory picker is available for this target. */
   allowAddWorkspace?: boolean | undefined
   onPick: (workspaceId: WorkspaceId) => void

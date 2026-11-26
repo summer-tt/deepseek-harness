@@ -123,6 +123,7 @@ export function ConversationContent(props: ConversationContentProps) {
         selectedId: options === undefined ? pendingWorkspaceId ?? sessionWorkspace?.workspaceId : options.selectedId,
         ...(options === undefined ? {} : {
           filterWorkspace: options.filterWorkspace,
+          workspaceTitle: options.workspaceTitle,
           allowAddWorkspace: options.allowAddWorkspace,
         }),
         onPick: (workspaceId) => {

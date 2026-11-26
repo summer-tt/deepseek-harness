@@ -54,6 +54,7 @@ export interface WorkspacePickFlowProps {
   /** Currently active workspace (trailing check in the picker list). */
   selectedId?: WorkspaceId | undefined
   filterWorkspace?: ((id: WorkspaceId) => boolean) | undefined
+  workspaceTitle?: ((id: WorkspaceId, title: string) => string) | undefined
   allowAddWorkspace?: boolean | undefined
 }
 
@@ -77,6 +78,7 @@ export function WorkspacePickFlow({
   side = 'bottom',
   selectedId,
   filterWorkspace,
+  workspaceTitle,
   allowAddWorkspace = true,
 }: WorkspacePickFlowProps) {
   // Without an owner-provided anchor, the menu remains hidden.
@@ -121,12 +123,12 @@ export function WorkspacePickFlow({
     if (!pinAdd) return []
     const rows = workspaces.map(workspace => ({
       id: workspace.workspaceId,
-      title: workspaceDisplayTitle(workspace.title, defaultWorkspaceName),
+      title: workspaceDisplayTitle(workspaceTitle?.(workspace.workspaceId, workspace.title) ?? workspace.title, defaultWorkspaceName),
       path: workspace.path,
     }))
     const suffixes = distinguishingPathSuffixes(rows)
     return rows.map(row => ({ ...row, suffix: suffixes.get(row.id) }))
-  }, [pinAdd, workspaces, defaultWorkspaceName])
+  }, [pinAdd, workspaces, defaultWorkspaceName, workspaceTitle])
   const items: MenuEntry[] = pinAdd
     ? listed.map(({ id, title, path, suffix }) => ({
       id,
@@ -256,11 +258,11 @@ export function WorkspacePickFlow({
 type PickerSurfaceProps = Pick<
   WorkspacePickFlowProps,
   't' | 'open' | 'anchorRef' | 'useWorkspaces' | 'createWorkspace' | 'useDirectoryFlow' | 'selectedId' | 'onPick' | 'onClose'
-> & Pick<WorkspacePickFlowProps, 'filterWorkspace' | 'allowAddWorkspace'>
+> & Pick<WorkspacePickFlowProps, 'filterWorkspace' | 'workspaceTitle' | 'allowAddWorkspace'>
 
 function surfaceFlow(
   { t, open, anchorRef, useWorkspaces, createWorkspace, useDirectoryFlow, selectedId,
-    onPick, onClose, filterWorkspace, allowAddWorkspace }: PickerSurfaceProps,
+    onPick, onClose, filterWorkspace, workspaceTitle, allowAddWorkspace }: PickerSurfaceProps,
   renderDirectoryFlow: WorkspacePickFlowProps['renderDirectoryFlow'],
 ): ReactElement {
   return (
@@ -274,6 +276,7 @@ function surfaceFlow(
       renderDirectoryFlow={renderDirectoryFlow}
       selectedId={selectedId}
       filterWorkspace={filterWorkspace}
+      workspaceTitle={workspaceTitle}
       allowAddWorkspace={allowAddWorkspace}
       onPick={onPick}
       onClose={onClose}
