@@ -417,8 +417,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 
 /** Owner share of the Hero agent-preset control. */
 export interface HeroAgentPresetOwnerProps {
-  /** Marker field: the occupant owns its roster and staged selection. */
-  children?: never
+  /** Optional display policy for the mode menu. A missing result hides the preset. */
+  presetDisplay?: ((id: string, name: string) => string | undefined) | undefined
 }
 
 /** Header actions derive their state from standard Session props. */
@@ -756,6 +756,8 @@ export type ComposerAttachmentsProps =
 /** Native workspace control available to a sessionless hero draft. */
 export interface HeroDraftTargetOwnerProps {
   readonly draftAvailable: boolean
+  readonly targetSessionId?: SessionId | undefined
+  readonly renderNativeTarget?: ((display: NonNullable<HeroAgentPresetOwnerProps['presetDisplay']>) => ReactNode) | undefined
   readonly renderWorkspace: (options: {
     label?: string | undefined
     selectedId?: WorkspaceId | undefined

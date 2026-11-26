@@ -79,7 +79,7 @@ export type AgentPresetSeatProps =
  * @returns The chip and any pending selection refusal, or null outside the main view.
  */
 export function AgentPresetSeat({
-  sessionId, useSessionRetainInfo, load, select, dismissRefusal, introduced, useAgentPresetSeat, useDeveloperTools, t,
+  sessionId, useSessionRetainInfo, load, select, dismissRefusal, introduced, useAgentPresetSeat, useDeveloperTools, presetDisplay, t,
 }: AgentPresetSeatProps) {
   const developerTools = useDeveloperTools(value => value)
   const state = useAgentPresetSeat(snapshot => snapshot)
@@ -103,8 +103,13 @@ export function AgentPresetSeat({
   }, [load])
 
   const options = useMemo(
-    () => state.options.filter(option => developerTools || !requiresCodingTools(option)),
-    [state.options, developerTools],
+    () => state.options.flatMap((option) => {
+      if (!developerTools && requiresCodingTools(option)) return []
+      const text = presetDisplayText(option, t)
+      const name = presetDisplay === undefined ? text.name : presetDisplay(option.id, text.name)
+      return name === undefined ? [] : [{ id: option.id, text: { ...text, name } }]
+    }),
+    [state.options, developerTools, presetDisplay, t],
   )
 
   useEffect(() => {
@@ -113,7 +118,7 @@ export function AgentPresetSeat({
 
   const chosen = state.options.find(option => option.id === state.current)
   const chosenText = chosen === undefined ? undefined : presetDisplayText(chosen, t)
-  const label = chosenText?.name ?? state.current
+  const label = options.find(option => option.id === state.current)?.text.name ?? chosenText?.name ?? state.current
   const ready = state.options.length > 0 && state.current !== ''
 
   // The introduce cue: the pick was staged from another screen (the settings
@@ -164,10 +169,9 @@ export function AgentPresetSeat({
       {ready && <Menu
         open={open && options.length > 0}
         onClose={() => { setOpen(false) }}
-        items={options.map((option) => {
-          const text = presetDisplayText(option, t)
+        items={options.map(({ id, text }) => {
           return {
-            id: option.id,
+            id,
             // Name and description together: the id alone never says what a
             // preset does, which is why the roster carries display copy.
             label: (

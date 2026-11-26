@@ -175,7 +175,10 @@ export function ConversationContent(props: ConversationContentProps) {
       {hero && <HeroShell t={t} renderSlot={renderSlot} />}
       {hero && (
         <div className={css.heroWorkspaceRow}>
-          {renderSlot('conversation.hero.draftTarget', { draftAvailable: heroDraft, renderWorkspace }, {
+          {renderSlot('conversation.hero.draftTarget', {
+            draftAvailable: heroDraft, targetSessionId: sessionId, renderWorkspace,
+            renderNativeTarget: presetDisplay => <>{renderWorkspace()}{renderSlot('conversation.hero.agentPreset', { presetDisplay })}</>,
+          }, {
             children: <>{renderWorkspace()}{renderSlot('conversation.hero.agentPreset', {})}</>,
           })}
           {sessionId === undefined ? null : <div className={css.heroOptions}>{renderSlot('conversation.hero.options', {})}</div>}
