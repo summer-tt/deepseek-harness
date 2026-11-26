@@ -165,7 +165,12 @@ async function measure(checkout: string, count: number, slow: boolean): Promise<
           showEnds += 1
           lastShowEnd = ended
           if (held) slowShowMs = ended - started
-          if (error !== null) errors.push({ unit, code: error.code, signal: error.signal, message: error.message })
+          if (error !== null) errors.push({
+            unit,
+            ...(error.code === undefined ? {} : { code: error.code }),
+            ...(error.signal === undefined ? {} : { signal: error.signal }),
+            message: error.message,
+          })
           else if (inactive && stdout === 'LoadState=loaded\nActiveState=inactive\nTasksCurrent=[not set]\n') owner.confirmedAt ??= ended
           queries.delete(completion.promise)
           completion.resolve(undefined)
