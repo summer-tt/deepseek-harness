@@ -7,7 +7,7 @@ import {
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { streamHandle } from '@deepseek-ai/dsh-remote-mock'
 import { LlmAttemptId } from '@deepseek-ai/dsh-llm'
-import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session/types'
+import { SESSION_FORMAT_VERSION, SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { RemoteResult, RemoteStreamHandle } from '@deepseek-ai/dsh-typert-protocol'
 import {
   createSessionControlStream,
@@ -15,6 +15,7 @@ import {
   type SessionJournalChange,
   type SessionRemote,
 } from '../src/client/index.ts'
+import type { HistoryAuthorization } from '../src/client/sessions/history-cache.ts'
 import type { SessionRemotes } from '../src/client/sessions/remotes.ts'
 import type {
   SessionAddress,
@@ -53,7 +54,7 @@ function snapshot(
   records: readonly SessionHistoryRecord[],
   hasMore = false,
   assistantStream: SessionAssistantStreamBaseline = { revision: 0 },
-): SessionFollowFrame {
+): Extract<SessionFollowFrame, { type: 'snapshot' }> {
   return {
     type: 'snapshot',
     header: {
@@ -722,4 +723,153 @@ describe('Session Client stream adapters', () => {
     expect(failed).not.toHaveBeenCalled()
     await after.dispose()
   })
+})
+
+
+const VERIFIED_GRANT: HistoryAuthorization = { ownerEpoch: 'fixture-owner' as HistoryAuthorization['ownerEpoch'] }
+
+const verifiedOpening = snapshot(2, [entry(0), entry(1), entry(2)])
+
+it.each([
+  ['unsafe cursor', { ...verifiedOpening, cursor: Number.MAX_SAFE_INTEGER + 1 }],
+  ['negative cursor', { ...verifiedOpening, cursor: -2 }],
+  ['negative zero cursor', { ...verifiedOpening, cursor: -0 }],
+  ['projection cut', { ...verifiedOpening, projections: { asOfSeq: 1, values: {} } }],
+  ['unexpected subagent origin', { ...verifiedOpening, header: { ...verifiedOpening.header, origin: 'subagent' } }],
+  ['short positive cut', snapshot(2, [])],
+  ['range does not reach cut', snapshot(2, [entry(0), entry(1)])],
+  ['hasMore disagrees with start', snapshot(2, [entry(1), entry(2)])],
+  ['sequence gap', snapshot(2, [entry(0), entry(0), entry(2)])],
+] as const)('rejects a verified opening with %s before publication', async (_name, opening) => {
+  const remote = new ScriptedSessionRemote([{ frames: [opening], hold: true }], [])
+  const publish = vi.fn()
+  const stream = new SessionEventStream(sessionClient(remote), ADDRESS, {
+    publish, failed: vi.fn(), history: () => ({ authorization: VERIFIED_GRANT }),
+  })
+  await expect(stream.open({})).rejects.toMatchObject({ code: 'gateway/internal' })
+  expect(publish).not.toHaveBeenCalled()
+  await stream.dispose()
+})
+
+it.each([true, false])('requires the explicit subagent mode to match the opening (%s)', async (matches) => {
+  const address = {
+    kind: 'subagent', childSessionId: 'session-child' as never, parentSessionId: 'session-parent' as never, mode: 'one-shot',
+  } as const
+  const identity = matches ? { mode: 'one-shot' as const, seq: SessionSeq(1) }
+    : { mode: 'continuable' as const, seq: SessionSeq(1), label: 'fixture child' }
+  const opening = {
+    ...verifiedOpening,
+    header: { ...verifiedOpening.header, id: address.childSessionId, parentSession: address.parentSessionId, origin: 'subagent' as const },
+    projections: { asOfSeq: 2, values: { subagent: identity } },
+  } satisfies SessionFollowFrame
+  const remote = new ScriptedSessionRemote([{ frames: [opening], hold: true }], [])
+  const publish = vi.fn()
+  const stream = new SessionEventStream(sessionClient(remote), address, {
+    publish, failed: vi.fn(), history: () => ({ authorization: VERIFIED_GRANT }),
+  })
+  try {
+    if (matches) {
+      await stream.open({})
+      expect(publish).toHaveBeenCalledOnce()
+    } else {
+      await expect(stream.open({})).rejects.toMatchObject({ code: 'gateway/internal' })
+      expect(publish).not.toHaveBeenCalled()
+    }
+  } finally {
+    await stream.dispose()
+  }
+})
+
+it.each([
+  ['cursor', { ...page([entry(0)]), cursor: 1 }],
+  ['range', { ...page([entry(1)]), cursor: 2 }],
+] as const)('rejects a verified page with the wrong %s', async (_name, response) => {
+  const remote = new ScriptedSessionRemote([{ frames: [snapshot(2, [entry(1), entry(2)], true)], hold: true }], [
+    { ok: true, value: response },
+  ])
+  const publish = vi.fn()
+  const stream = new SessionEventStream(sessionClient(remote), ADDRESS, {
+    publish, failed: vi.fn(), history: () => ({ authorization: VERIFIED_GRANT }),
+  })
+  try {
+    await stream.open({})
+    await expect(stream.prepend({ beforeSeq: 1 })).rejects.toMatchObject({ code: 'gateway/internal' })
+    expect(publish).toHaveBeenCalledOnce()
+  } finally {
+    await stream.dispose()
+  }
+})
+
+it('discards a verified page response when its grant changes during the read', async () => {
+  const remote = new ScriptedSessionRemote([{ frames: [snapshot(2, [entry(1), entry(2)], true)], hold: true }], [])
+  const response = Promise.withResolvers<RemoteResult<SessionEventsPage>>()
+  vi.spyOn(remote, 'page').mockReturnValueOnce(response.promise)
+  let grant: HistoryAuthorization | undefined = VERIFIED_GRANT
+  const publish = vi.fn()
+  const stream = new SessionEventStream(sessionClient(remote), ADDRESS, {
+    publish, failed: vi.fn(), history: () => grant === undefined ? undefined : { authorization: grant },
+  })
+  try {
+    await stream.open({})
+    const loading = stream.prepend({ beforeSeq: 1 })
+    grant = undefined
+    response.resolve({ ok: true, value: { ...page([entry(0)]), cursor: 2 } })
+    await expect(loading).rejects.toBeInstanceOf(RemoteStreamCarrierError)
+    expect(publish).toHaveBeenCalledOnce()
+  } finally {
+    await stream.dispose()
+  }
+})
+
+
+it('reopens after a verified follow frame arrives under an obsolete grant', async () => {
+  const requested = Promise.withResolvers<undefined>()
+  const opening = Promise.withResolvers<undefined>()
+  class GatedFollow extends ScriptedSessionRemote {
+    override follow(request: SessionFollowRequest, signal?: AbortSignal): RemoteStreamHandle<SessionFollowFrame, never> {
+      if (request.verifiedHistoryWindow !== true) return super.follow(request, signal)
+      return streamHandle((async function* () {
+        requested.resolve(undefined)
+        await opening.promise
+        yield verifiedOpening
+      })())
+    }
+  }
+  const remote = new GatedFollow([{ frames: [snapshot(1, [entry(1)], true)], hold: true }], [])
+  let grant: HistoryAuthorization | undefined = VERIFIED_GRANT
+  const publish = vi.fn()
+  const carrierFailed = vi.fn()
+  const stream = new SessionEventStream(sessionClient(remote), ADDRESS, {
+    publish, failed: vi.fn(), carrierFailed, history: () => grant === undefined ? undefined : { authorization: grant },
+  })
+  try {
+    const ready = stream.open({})
+    await requested.promise
+    grant = undefined
+    opening.resolve(undefined)
+    await ready
+    expect(carrierFailed).toHaveBeenCalledOnce()
+    expect(publish).toHaveBeenCalledOnce()
+    expect(publish.mock.calls[0]?.[0]).toMatchObject({ page: { authority: false } })
+  } finally {
+    opening.resolve(undefined)
+    await stream.dispose()
+  }
+})
+
+it('validates a verified page without an explicit older offset against the full cut', async () => {
+  const remote = new ScriptedSessionRemote([{ frames: [snapshot(2, [entry(1), entry(2)], true)], hold: true }], [
+    { ok: true, value: page([entry(0), entry(1), entry(2)]) },
+  ])
+  const publish = vi.fn()
+  const stream = new SessionEventStream(sessionClient(remote), ADDRESS, {
+    publish, failed: vi.fn(), history: () => ({ authorization: VERIFIED_GRANT }),
+  })
+  try {
+    await stream.open({})
+    await stream.prepend({})
+    expect(publish.mock.calls.at(-1)?.[0]).toMatchObject({ type: 'prepend', entries: [entry(0)] })
+  } finally {
+    await stream.dispose()
+  }
 })

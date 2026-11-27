@@ -7,6 +7,7 @@ import {
   historyEntries,
   historyRecordFirstSeq,
   historyRecordLastSeq,
+  sameHistoryValue,
 } from '../src/client/sessions/history-records.ts'
 
 describe('Session history record projection', () => {
@@ -91,4 +92,21 @@ describe('Session history record projection', () => {
     expect(Object.hasOwn(record as object, 'name')).toBe(false)
     expect(historyRecordLastSeq(attempt)).toBe(20)
   })
+})
+
+
+it('compares reordered JSON keys and distinguishes own keys from inherited keys', () => {
+  expect(sameHistoryValue({ a: [1], b: 2 }, { b: 2, a: [1] })).toBe(true)
+  expect(sameHistoryValue({ constructor: 1 }, Object.assign(Object.create({ constructor: 1 }), { different: 1 }))).toBe(false)
+  expect(sameHistoryValue([1], { 0: 1 })).toBe(false)
+})
+
+it('compares deeply nested JSON without exhausting the call stack', () => {
+  let left: unknown = 'last'
+  let right: unknown = 'last'
+  for (let depth = 0; depth < 15_000; depth += 1) {
+    left = { child: left }
+    right = { child: right }
+  }
+  expect(sameHistoryValue(left, right)).toBe(true)
 })

@@ -59,6 +59,9 @@ export interface PendingSubmission {
 /** History-open lifecycle of a Session event window. */
 export type OpenState = 'cold' | 'loading' | 'open' | 'error'
 
+/** History presentation state, independent of follow readiness for operations and pagination. */
+export type HistoryAvailability = 'unavailable' | 'cached' | 'confirmed'
+
 /** Send/stop failure surfaced by Session consumers. */
 export interface PromptError {
   readonly op: 'send' | 'stop'
@@ -77,6 +80,10 @@ export interface SessionSnapshot {
   readonly removed: boolean
   readonly openState: OpenState
   readonly openError: RemoteFailure | null
+  /** Cached history is visible while its authorized follow opening is pending. Omitted by older sources. */
+  readonly historyAvailability?: HistoryAvailability
+  /** Binding-local generation of the history and its associated reading position handles. */
+  readonly historyEpoch?: number
   readonly hasMore: boolean
   /** This Client Session has exposed an incomplete history window; remains true across replacements. */
   readonly historyWasPartial: boolean

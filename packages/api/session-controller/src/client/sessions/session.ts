@@ -17,20 +17,23 @@ import type {
   SessionAssistantStreamBaseline,
   SessionProjectionBaseline,
   SessionRequestId,
+  SessionWireHeader,
 } from '../../types.ts'
 import type {
-  BeginSubmissionInput, PendingSubmissionRetirement, SessionFace, SubmissionHandle,
+  BeginSubmissionInput, PendingSubmissionRetirement, SessionFace, SessionReadingPosition, SubmissionHandle,
 } from '../contract/session.ts'
 import type {
-  OpenState, PendingSubmission, PromptError, SessionSnapshot,
+  HistoryAvailability, OpenState, PendingSubmission, PromptError, SessionSnapshot,
 } from '../contract/snapshot.ts'
 import { MutableSessionEventSource } from '../contract/events.ts'
 import type {
-  SessionEventLike, SessionEventLikeEntry, SessionLiveEventEntry,
+  SessionEventLike, SessionLiveEventEntry,
 } from '../contract/events.ts'
 import { Notifier } from './notifier.ts'
 import { isRemoteFailure } from '@deepseek-ai/dsh-api-gateway/client'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import { sameHistoryValue } from './history-records.ts'
+import { MAX_HISTORY_CACHE_RECORDS, type DurableHistoryWindow, type HistoryAuthorization } from './history-cache.ts'
 import type { RemoteFailure, RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { SessionRemotes } from './remotes.ts'
 import { ProjectionValueStore } from './projection-store.ts'
@@ -51,6 +54,9 @@ function projectionsBaseline(value: SessionProjectionBaseline): ProjectionsBasel
 /** Minimum message count for ordinary history windows. */
 export const PAGE_MESSAGES = 50
 
+// A re-established event stream may need to relay a fresh Zen route notice before compatibility follow resumes.
+const RELAY_HISTORY_AUTHORIZATION_GRACE_MS = 500
+
 const HISTORY_PAGE_OPTIONS = { maxMessages: 500, turnWindow: { minMessages: PAGE_MESSAGES, minTurns: 2 } }
 
 /** Minimum messages per page while a turn jump loops backwards. */
@@ -64,15 +70,13 @@ const JUMP_PAGE_OPTIONS = {
 interface PendingHistory {
   beforeSeq: SessionLogOffset
   hasMore: boolean
-  readonly pages: (readonly SessionEventLikeEntry[])[]
+  readonly pages: (readonly SessionLiveEventEntry[])[]
 }
 
 interface OlderHistoryRequest {
   readonly generation: number
   readonly beforeSeq: SessionLogOffset
-  page: { readonly entries: readonly SessionEventLikeEntry[]; readonly hasMore: boolean } | null
-  invalidated: boolean
-  recovering: boolean
+  page: { readonly entries: readonly SessionLiveEventEntry[]; readonly hasMore: boolean } | null
   consuming: boolean
   promise?: Promise<void>
 }
@@ -93,6 +97,15 @@ export interface SessionOptions {
    * private store (bare object-layer construction).
    */
   projections?: ProjectionValueStore
+  /** Capability scoped to the Manager's current authorization and this exact resident binding. */
+  history?: {
+    authorization(address: SessionAddress): HistoryAuthorization | undefined
+    read(address: SessionAddress, grant: HistoryAuthorization): DurableHistoryWindow | undefined
+    readPosition(address: SessionAddress, key: string): unknown
+    writePosition(address: SessionAddress, key: string, value: unknown): void
+    invalidate(address: SessionAddress, grant: HistoryAuthorization | undefined, error: RemoteFailure): void
+    resetProjections(): void
+  }
 }
 
 /**
@@ -107,6 +120,15 @@ export class Session implements SessionFace {
   private hasMore = false
   private historyWasPartial = false
   private openState: OpenState = 'cold'
+  private historyAvailability: HistoryAvailability = 'unavailable'
+  private durableEntries: SessionLiveEventEntry[] = []
+  private consumedPages: (readonly SessionLiveEventEntry[])[] = []
+  private historyHeader: SessionWireHeader | undefined
+  private historyEpoch = 0
+  private historyGrant: HistoryAuthorization | undefined
+  private historyConfirmed = false
+  private historyFollowPaused: 'local' | 'relay' | undefined
+  private historyFallbackTimer: ReturnType<typeof setTimeout> | undefined
   private openError: RemoteFailure | null = null
   private openPromise: Promise<void> | null = null
   /** Bumped by stream replacement to invalidate an in-flight doOpen. Stale
@@ -206,6 +228,9 @@ export class Session implements SessionFace {
     this.notifier = new Notifier(() => {
       this.snapshotCache = this.buildSnapshot()
     })
+    const grant = this.options.history?.authorization(this.sessionAddress())
+    const seed = grant === undefined ? undefined : this.options.history?.read(this.sessionAddress(), grant)
+    if (seed !== undefined && grant !== undefined) this.installHistorySeed(seed, grant)
     this.snapshotCache = this.buildSnapshot()
     this.stopObservingInbox = this.projections.faceOf('inbox').subscribe(() => {
       this.observeSubmissionInbox()
@@ -396,10 +421,11 @@ export class Session implements SessionFace {
    * @returns the rename result (normalized accepted title + title event seq).
    */
   async rename(title: string): Promise<RemoteResult<{ title: string; seq: SessionSeq }>> {
+    const epoch = this.projections.epoch
     const result = await this.remote.session.rename({ sessionId: this.sessionId, title })
     if (!result.ok) return result
     const seq = SessionSeq(result.value.seq)
-    this.projections.apply('title', result.value.title, seq)
+    if (this.projections.epoch === epoch) this.projections.apply('title', result.value.title, seq)
     return { ok: true, value: { title: result.value.title, seq } }
   }
 
@@ -418,7 +444,7 @@ export class Session implements SessionFace {
 
   /** First open: pull the tail page (idempotent — in-flight/already-open returns the existing promise). */
   open(): Promise<void> {
-    if (this.openState === 'open') return Promise.resolve()
+    if (this.openState === 'open' || this.historyFollowPaused === 'relay') return Promise.resolve()
     if (this.openPromise !== null) return this.openPromise
     const promise = this.doOpen(this.openGeneration).finally(() => {
       // Identity-guarded: a superseded open must not null out the promise resync just started.
@@ -439,13 +465,11 @@ export class Session implements SessionFace {
   private prepareOlder(): OlderHistoryRequest | null {
     if (this.olderRequest !== null) return this.olderRequest
     const events = this.events
-    if (this.openState !== 'open' || !this.hasMore || this.loadingOlder || events === undefined) return null
+    if (this.openState !== 'open' || this.historyAvailability !== 'confirmed' || !this.hasMore || this.loadingOlder || events === undefined) return null
     const request: OlderHistoryRequest = {
       generation: this.openGeneration,
       beforeSeq: this.baseSeq,
       page: null,
-      invalidated: false,
-      recovering: false,
       consuming: false,
     }
     this.olderRequest = request
@@ -455,7 +479,7 @@ export class Session implements SessionFace {
       try {
         await events.prepend({ beforeSeq: request.beforeSeq, ...HISTORY_PAGE_OPTIONS })
         if (this.olderRequest !== request) return
-        if (request.invalidated || request.generation !== this.openGeneration || request.beforeSeq !== this.baseSeq) return
+        if (request.generation !== this.openGeneration || request.beforeSeq !== this.baseSeq) return
         const page = request.page
         const first = page?.entries[0]
         this.historyLoadStatus = page === null || (first === undefined ? page.hasMore : first.event.seq >= request.beforeSeq)
@@ -463,16 +487,13 @@ export class Session implements SessionFace {
       } catch (error) {
         if (this.olderRequest !== request) return
         request.page = null
+        void this.handleHistoryFailure(error)
+        if (this.olderRequest !== request) return
         this.historyLoadStatus = 'error'
         if (!isRemoteFailure(error)) console.error('[session-controller] loadOlder failed:', error)
       } finally {
         if (this.olderRequest === request) {
-          if (request.invalidated && this.events === events) {
-            // A replacement restores the transport cursor before another page uses the visible window.
-            request.recovering = true
-            this.historyLoadStatus = 'loading'
-            events.restart()
-          } else if (this.historyLoadStatus === 'error') this.olderRequest = null
+          if (this.historyLoadStatus === 'error') this.olderRequest = null
           this.notifier.markDirty()
         }
       }
@@ -484,7 +505,7 @@ export class Session implements SessionFace {
   consumeOlder(): boolean {
     const request = this.olderRequest
     if (request === null || request.consuming || this.historyLoadStatus !== 'pendingConsumption' || request.page === null) return false
-    if (this.openState !== 'open' || request.invalidated || request.generation !== this.openGeneration
+    if (this.openState !== 'open' || request.generation !== this.openGeneration
       || request.beforeSeq !== this.baseSeq) {
       this.clearOlderHistory()
       return false
@@ -509,7 +530,10 @@ export class Session implements SessionFace {
 
   private clearOlderHistory(): void {
     this.olderRequest = null
-    this.historyLoadStatus = this.pendingHistory === null ? 'idle' : 'loading'
+    this.pendingHistory = null
+    this.jumpTargetSeq = null
+    this.jumpPromise = null
+    this.historyLoadStatus = 'idle'
     this.notifier.markDirty()
   }
 
@@ -517,7 +541,7 @@ export class Session implements SessionFace {
   loadThrough(seq: SessionSeq): Promise<void> {
     this.consumeOlder()
     if (this.olderRequest !== null) return Promise.resolve()
-    if (this.openState !== 'open' || !this.hasMore || this.baseSeq <= seq) return Promise.resolve()
+    if (this.openState !== 'open' || this.historyAvailability !== 'confirmed' || !this.hasMore || this.baseSeq <= seq) return Promise.resolve()
     if (this.jumpPromise !== null) {
       // Retarget the running loop to the lowest requested seq.
       this.jumpTargetSeq = SessionSeq(Math.min(this.jumpTargetSeq ?? seq, seq))
@@ -559,7 +583,10 @@ export class Session implements SessionFace {
           if (!pending.hasMore) return
         }
       } catch (error) {
-        if (generation === this.openGeneration && this.pendingHistory === pending) this.historyLoadStatus = 'error'
+        if (generation === this.openGeneration && this.pendingHistory === pending) {
+          void this.handleHistoryFailure(error)
+          if (this.pendingHistory === pending) this.historyLoadStatus = 'error'
+        }
         if (!isRemoteFailure(error)) {
           console.error('[session-controller] loadThrough failed:', error)
         }
@@ -588,13 +615,12 @@ export class Session implements SessionFace {
     this.clearOlderHistory()
     const events = this.events
     this.events = undefined
-    await events?.dispose()
+    const closing = events?.dispose()
     this.openPromise = null
     this.openState = 'cold'
     this.openError = null
-    this.baseSeq = SessionLogOffset(0)
     this.notifier.markDirty()
-    await this.open()
+    await Promise.all([closing, this.open()])
   }
 
   // ---- Subscription API (useSyncExternalStore direct wiring) ----
@@ -645,8 +671,11 @@ export class Session implements SessionFace {
       && this.address?.childSessionId === address?.childSessionId
       && this.address?.mode === address?.mode
     this.address = address
-    if (!same && this.openState !== 'cold') void this.resync()
-    else this.notifier.markDirty()
+    if (!same) {
+      if (this.options.history !== undefined) this.discardHistory()
+      if (this.openState !== 'cold') void this.resync()
+    }
+    this.notifier.markDirty()
   }
 
   /**
@@ -685,6 +714,7 @@ export class Session implements SessionFace {
    * @returns when the Remote iterator has completed teardown.
    */
   async dispose(): Promise<void> {
+    this.cancelHistoryFallback()
     this.stopObservingInbox()
     // Unsettled echoes retire as failed so their owners can restore or
     // release browser resources; admitted echoes keep their observed outcome.
@@ -693,10 +723,168 @@ export class Session implements SessionFace {
       else this.retireFailedSubmission(requestId)
     }
     this.openGeneration++
+    this.openPromise = null
     this.clearOlderHistory()
     const events = this.events
     this.events = undefined
     await events?.dispose()
+  }
+
+  /** @inheritdoc */
+  readingPosition(key: string): SessionReadingPosition | undefined {
+    const history = this.options.history
+    const grant = this.historyGrant
+    if (history === undefined || grant === undefined) return undefined
+    const address = this.sessionAddress()
+    const epoch = this.historyEpoch
+    const current = (): boolean => this.historyEpoch === epoch && history.authorization(address) === grant
+    return {
+      read: () => current() ? history.readPosition(address, key) : undefined,
+      write: (value) => { if (current()) history.writePosition(address, key, value) },
+    }
+  }
+
+  /**
+   * Snapshot an accepted journal synchronously before the Manager releases this binding.
+   * @returns current grant and durable window, or undefined while a seed awaits validation.
+   */
+  releasedHistory(): { grant: HistoryAuthorization; window: DurableHistoryWindow | undefined } | undefined {
+    if (!this.historyConfirmed || this.historyGrant === undefined || this.historyHeader === undefined) return undefined
+    return {
+      grant: this.historyGrant,
+      window: this.durableEntries.length + this.consumedPages.reduce((count, page) => count + page.length, 0) > MAX_HISTORY_CACHE_RECORDS
+        ? undefined : { header: this.historyHeader, entries: this.durableWindow(), hasMore: this.hasMore },
+    }
+  }
+
+  /**
+   * Read the binding identity used for history ownership.
+   * @returns the exact ordinary or direct subagent address of this binding.
+   */
+  historyAddress(): SessionAddress { return this.sessionAddress() }
+
+  /**
+   * Reopen under a replacement grant or ordinary compatibility route. An old verified generation cannot publish again.
+   * @param previous - grant known before the change.
+   * @param connected - whether a new physical follow may start.
+   */
+  historyAuthorizationChanged(previous: HistoryAuthorization | undefined, connected: boolean): void {
+    this.cancelHistoryFallback()
+    if (previous !== undefined) this.discardHistory()
+    const grant = this.options.history?.authorization(this.sessionAddress())
+    if (grant !== undefined && this.historyAvailability === 'unavailable') {
+      const seed = this.options.history?.read(this.sessionAddress(), grant)
+      if (seed !== undefined) this.installHistorySeed(seed, grant)
+    }
+    if (this.openState === 'cold') return
+    if (connected) {
+      this.historyFollowPaused = undefined
+      void this.resync()
+      return
+    }
+    this.historyFollowPaused = previous?.route === undefined ? 'local' : 'relay'
+    this.openGeneration++
+    const events = this.events
+    this.events = undefined
+    this.openPromise = null
+    this.openState = 'loading'
+    void events?.dispose()
+    this.notifier.markDirty()
+  }
+
+  /** Restart a verified follow paused at the previous Connection's authorization loss. */
+  resumeHistoryFollow(): void {
+    if (this.historyFollowPaused === 'local') {
+      this.historyFollowPaused = undefined
+      void this.open()
+    } else if (this.historyFollowPaused === 'relay' && this.historyFallbackTimer === undefined) {
+      this.historyFallbackTimer = setTimeout(() => {
+        this.historyFallbackTimer = undefined
+        this.historyFollowPaused = undefined
+        void this.open()
+      }, RELAY_HISTORY_AUTHORIZATION_GRACE_MS)
+    }
+  }
+
+  /** Cancel compatibility recovery when its authenticated event carrier ends. */
+  cancelHistoryFallback(): void {
+    clearTimeout(this.historyFallbackTimer)
+    this.historyFallbackTimer = undefined
+  }
+
+  /**
+   * Remove visible history and stop the current follow after an access refusal.
+   * @param failure - definitive access failure of this address or route.
+   */
+  revokeHistory(failure: RemoteFailure): void {
+    this.cancelHistoryFallback()
+    this.historyFollowPaused = undefined
+    this.discardHistory()
+    if (this.openState === 'cold') return
+    this.openGeneration++
+    const events = this.events
+    this.events = undefined
+    this.openPromise = null
+    this.openError = failure
+    this.openState = 'error'
+    void events?.dispose()
+    this.notifier.markDirty()
+  }
+
+  private installHistorySeed(seed: DurableHistoryWindow, grant: HistoryAuthorization): void {
+    this.historyGrant = grant
+    this.historyHeader = seed.header
+    this.historyConfirmed = false
+    this.durableEntries = [...seed.entries]
+    this.consumedPages = []
+    this.baseSeq = SessionLogOffset(seed.entries[0]?.event.seq ?? 0)
+    this.hasMore = seed.hasMore
+    this.historyWasPartial ||= seed.hasMore
+    this.historyAvailability = 'cached'
+    this.eventSource.replace(seed.entries, seed.hasMore)
+    this.notifier.markDirty()
+  }
+
+  private discardHistory(): void {
+    this.historyEpoch++
+    this.historyGrant = undefined
+    this.historyHeader = undefined
+    this.historyConfirmed = false
+    this.historyAvailability = 'unavailable'
+    this.assistantStream.replace([])
+    this.durableEntries = []
+    this.consumedPages = []
+    this.hasMore = false
+    this.baseSeq = SessionLogOffset(0)
+    this.clearOlderHistory()
+    const visible = this.eventSource.getSnapshot()
+    if (visible.entries.length > 0 || visible.hasMore) this.eventSource.replace([], false)
+  }
+
+  private durableWindow(): readonly SessionLiveEventEntry[] {
+    if (this.consumedPages.length === 0) return this.durableEntries
+    return [...this.consumedPages].reverse().flat().concat(this.durableEntries)
+  }
+
+  private handleHistoryFailure(error: unknown): Promise<void> | undefined {
+    if (!isRemoteFailure(error)) return
+    const code: string = error.code
+    const grant = this.events?.requestAuthority
+    if (code === 'history-route-changed' && grant !== undefined && this.options.history !== undefined) {
+      const address = this.sessionAddress()
+      // A terminal iterator cannot restart. Replace its logical owner before the Manager handles the old route.
+      const events = this.events
+      this.events = undefined
+      this.openGeneration++
+      this.openPromise = null
+      this.openState = 'loading'
+      this.discardHistory()
+      void events?.dispose()
+      this.options.history.invalidate(address, grant, error)
+      return this.open()
+    }
+    this.options.history?.invalidate(this.sessionAddress(), grant, error)
+    return undefined
   }
 
   // ---- Private ----
@@ -707,6 +895,14 @@ export class Session implements SessionFace {
     this.openError = null
     this.notifier.markDirty()
     const events = new SessionEventStream(this.remote, this.sessionAddress(), {
+      history: () => {
+        const authorization = this.options.history?.authorization(this.sessionAddress())
+        if (authorization === undefined) return undefined
+        return this.historyGrant === authorization && this.durableEntries.length > 0
+          ? { authorization, start: this.baseSeq }
+          : { authorization }
+      },
+      carrierFailed: () => { this.pauseHistoryPagination() },
       publish: (change) => {
         if (generation !== this.openGeneration || this.events !== events) return
         this.acceptEventChange(change)
@@ -718,11 +914,19 @@ export class Session implements SessionFace {
     this.events = events
     try {
       await events.open(HISTORY_PAGE_OPTIONS)
-      if (generation !== this.openGeneration || this.events !== events) return
+      if (generation !== this.openGeneration || this.events !== events) {
+        await this.openPromise
+        return
+      }
       this.openState = 'open'
     } catch (error) {
-      if (generation !== this.openGeneration || this.events !== events) return
+      if (generation !== this.openGeneration || this.events !== events) {
+        await this.openPromise
+        return
+      }
       if (!isRemoteFailure(error)) throw error
+      await this.handleHistoryFailure(error)
+      if (generation !== this.openGeneration || this.events !== events) return
       this.events = undefined
       this.openState = 'error'
       this.openError = error
@@ -740,6 +944,7 @@ export class Session implements SessionFace {
           change.hasMore,
           change.page.projections === undefined ? undefined : projectionsBaseline(change.page.projections),
           change.page.assistantStream,
+          change.page,
         )
         return
       case 'prepend':
@@ -748,6 +953,7 @@ export class Session implements SessionFace {
         } else this.prependWindow(change.entries, change.hasMore)
         return
       case 'append':
+        this.durableEntries.push(change.entry)
         this.publishAssistantEntry(this.assistantStream.acceptDurable(change.entry))
         return
       case 'assistant-stream':
@@ -757,30 +963,42 @@ export class Session implements SessionFace {
 
   /** Replace the complete contiguous window and apply page-owned projection metadata. */
   private installWindow(
-    entries: readonly SessionEventLikeEntry[],
+    entries: readonly SessionLiveEventEntry[],
     hasMore: boolean,
-    projections?: ProjectionsBaseline,
-    assistantStream?: SessionAssistantStreamBaseline,
+    projections: ProjectionsBaseline | undefined,
+    assistantStream: SessionAssistantStreamBaseline | undefined,
+    page: Extract<SessionJournalChange, { type: 'replace' | 'prepend' }>['page'],
   ): void {
-    // A durable gap-repair page has no assistant baseline. Clearing transient
-    // attempts makes a held notification reopen follow once for an atomic
-    // page/baseline pair instead of applying it to an unrelated repair cut.
-    const visible = this.assistantStream.replace(entries, assistantStream)
-    if (this.olderRequest !== null && this.loadingOlder && !this.olderRequest.recovering) {
-      this.olderRequest.invalidated = true
-      this.olderRequest.page = null
-    } else this.clearOlderHistory()
+    const prior = page.authority ? this.durableWindow() : []
+    const before = this.eventSource.getSnapshot()
+    const reconciled = page.authority && this.historyHeader !== undefined && page.header !== undefined
+      ? reconcileHistory(prior, this.historyHeader, entries, page.header)
+      : { entries, branched: false, shared: 0 }
+    if (reconciled.branched) {
+      if (this.options.history !== undefined) this.options.history.resetProjections()
+      else this.projections.clear()
+    }
+    // A page used for gap repair shares the physical grant, but only a follow opening establishes it.
+    if (page.authorization !== this.historyGrant) this.historyEpoch++
+    this.historyGrant = page.authorization
+    this.historyHeader = page.header ?? (page.authorization === undefined ? undefined : this.historyHeader)
+    this.historyConfirmed = page.authorization !== undefined
+    this.historyAvailability = 'confirmed'
+    this.durableEntries = [...reconciled.entries]
+    this.consumedPages = []
+    const visible = this.assistantStream.replace(reconciled.entries, assistantStream)
+    this.clearOlderHistory()
     this.baseSeq = SessionLogOffset(entries[0]?.event.seq ?? 0)
     this.hasMore = hasMore
     this.historyWasPartial ||= hasMore
-    if (this.pendingHistory !== null) {
-      this.pendingHistory.beforeSeq = this.baseSeq
-      this.pendingHistory.hasMore = hasMore
-      this.pendingHistory.pages.length = 0
-    }
     if (visible.some(entry => entry.event.type === 'turn/start')) this.firstPromptPendingTurn = false
     if (projections !== undefined) this.projections.seed(projections)
-    this.eventSource.replace(visible, hasMore)
+    const priorVisibleIsDurable = before.entries.length === prior.length
+      && before.entries.every((entry, index) => entry === prior[index])
+    if (page.authority && !reconciled.branched && priorVisibleIsDurable
+      && visible.length === entries.length && before.hasMore === hasMore && reconciled.shared === prior.length) {
+      if (entries.length > prior.length) this.eventSource.appendHistory(reconciled.entries.slice(prior.length))
+    } else this.eventSource.replace(visible, hasMore)
     // A new follow baseline replaces confirmed optimistic inputs with Host-owned rows.
     // Receipt-backed inputs are accepted, not failed, even if their history is outside this window.
     if (projections !== undefined) {
@@ -800,12 +1018,18 @@ export class Session implements SessionFace {
     this.notifier.markDirty()
   }
 
+  private pauseHistoryPagination(): void {
+    if (this.historyGrant !== undefined && this.historyAvailability === 'confirmed') this.historyAvailability = 'cached'
+    this.clearOlderHistory()
+  }
+
   private publishAssistantEntry(result: ClientAssistantStreamResult): void {
     if (result?.type === 'rebaseline') {
       const events = this.events
-      queueMicrotask(() => {
-        if (events !== undefined && this.events === events) events.restart()
-      })
+      if (events !== undefined) {
+        this.pauseHistoryPagination()
+        events.restart()
+      }
       return
     }
     if (result?.type === 'settlement') {
@@ -830,7 +1054,7 @@ export class Session implements SessionFace {
   }
 
   /** Prepend one stream-validated history page. */
-  private prependWindow(entries: readonly SessionEventLikeEntry[], hasMore: boolean): void {
+  private prependWindow(entries: readonly SessionLiveEventEntry[], hasMore: boolean): void {
     if (this.pendingHistory !== null) {
       const pending = this.pendingHistory
       pending.beforeSeq = entries[0] === undefined ? pending.beforeSeq : SessionLogOffset(entries[0].event.seq)
@@ -841,6 +1065,7 @@ export class Session implements SessionFace {
     this.baseSeq = entries[0] === undefined ? this.baseSeq : SessionLogOffset(entries[0].event.seq)
     this.hasMore = hasMore
     this.historyWasPartial ||= hasMore
+    if (entries.length > 0) this.consumedPages.push(entries)
     this.eventSource.prepend(entries, hasMore)
   }
 
@@ -987,6 +1212,8 @@ export class Session implements SessionFace {
   private failEventStream(events: SessionEventStream, generation: number, error: unknown): void {
     if (generation !== this.openGeneration || this.events !== events) return
     if (!isRemoteFailure(error)) throw error
+    void this.handleHistoryFailure(error)
+    if (generation !== this.openGeneration || this.events !== events) return
     this.openGeneration++
     this.clearOlderHistory()
     this.events = undefined
@@ -1013,6 +1240,8 @@ export class Session implements SessionFace {
       removed: this.removed,
       openState: this.openState,
       openError: this.openError,
+      historyAvailability: this.historyAvailability,
+      historyEpoch: this.historyEpoch,
       hasMore: this.hasMore,
       historyWasPartial: this.historyWasPartial,
       loadingOlder: this.loadingOlder,
@@ -1052,4 +1281,36 @@ function attachmentRefsIn(content: unknown): readonly (ImageAttachmentRef | File
     }
   }
   return refs
+}
+
+function reconcileHistory(
+  prior: readonly SessionLiveEventEntry[],
+  priorHeader: SessionWireHeader,
+  next: readonly SessionLiveEventEntry[],
+  header: SessionWireHeader,
+): { entries: readonly SessionLiveEventEntry[]; branched: boolean; shared: number } {
+  if (!sameHistoryValue(priorHeader, header)) return { entries: next, branched: true, shared: 0 }
+  const priorStart = prior[0]?.event.seq ?? 0
+  const nextStart = next[0]?.event.seq ?? 0
+  const commonStart = Math.max(priorStart, nextStart)
+  const priorEnd = prior.at(-1)?.event.seq ?? -1
+  const nextEnd = next.at(-1)?.event.seq ?? -1
+  let shared = 0
+  for (let seq = commonStart; seq <= Math.min(priorEnd, nextEnd); seq += 1) {
+    if (!sameHistoryValue(prior[seq - priorStart], next[seq - nextStart])) {
+      return { entries: withSharedPrefix(), branched: true, shared: 0 }
+    }
+    shared += 1
+  }
+  return {
+    entries: withSharedPrefix(), branched: priorEnd > nextEnd,
+    shared: priorStart === nextStart ? shared : 0,
+  }
+
+  function withSharedPrefix(): readonly SessionLiveEventEntry[] {
+    if (shared === 0) return next
+    const sharedOffset = commonStart - nextStart
+    return next.map((entry, index) => index >= sharedOffset && index < sharedOffset + shared
+      ? prior[nextStart + index - priorStart] ?? entry : entry)
+  }
 }

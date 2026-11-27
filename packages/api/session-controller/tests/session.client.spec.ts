@@ -361,7 +361,7 @@ describe('paging', () => {
     expect(eventSeqs(session)).toEqual(newer.map(event => event.seq))
   })
 
-  it('repairs the transport cursor when follow replaces a window during an older request', async ({ mock, start }) => {
+  it('discards an older request when follow replaces its window', async ({ mock, start }) => {
     const session = await sessionBench(mock, start, SID)
     const older = plainTurn(SessionSeq(0), 0, 'old', 'answer')
     const newer = plainTurn(SessionSeq(6), 1, 'new', 'answer')
@@ -377,7 +377,7 @@ describe('paging', () => {
     page.resolve(history(older))
     await loading
     await vi.waitFor(() => {
-      expect(mock.log.requests(FOLLOW)).toHaveLength(3)
+      expect(mock.log.requests(FOLLOW)).toHaveLength(2)
       expect(session.getSnapshot().historyLoadStatus).toBe('idle')
     })
     expect(session.consumeOlder()).toBe(false)

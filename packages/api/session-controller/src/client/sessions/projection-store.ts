@@ -92,6 +92,10 @@ interface Channel {
 export class ProjectionValueStore {
   private readonly rows = new Map<string, Row>()
   private readonly channels = new Map<string, Channel>()
+  private generation = 0
+  /** Identity of the current journal sequence space. */
+  get epoch(): number { return this.generation }
+
   private valuesCache: Readonly<Partial<SessionProjectionMap>> | undefined
   /** Coarse any-key channel (no snapshot cache to rebuild: reads hit rows directly). */
   private readonly anyNotifier = new Notifier(() => {})
@@ -213,6 +217,7 @@ export class ProjectionValueStore {
 
   /** Discard one Host generation's values and watermarks while preserving subscribed faces. */
   clear(): void {
+    this.generation++
     for (const key of this.rows.keys()) {
       this.rows.delete(key)
       this.changed(key)

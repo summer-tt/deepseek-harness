@@ -64,12 +64,29 @@ export interface ProjectionsFace {
   faceOf(key: string): ObservableSnapshot<unknown>
 }
 
+/** Reading position owned by one authorized, retained Session history generation. */
+export interface SessionReadingPosition {
+  /** Read a detached value, or undefined after eviction, revocation, or release. */
+  read(): unknown
+  /**
+   * Save a small JSON position while this handle remains valid.
+   * @param value - a small JSON value, or undefined to remove it.
+   */
+  write(value: unknown): void
+}
+
 /** Identity plus the behavior verbs features may invoke on a session. */
 export interface ISession {
   /** The session's host identity (agent id — same axis). */
   readonly sessionId: SessionId
   /** Host-computed projection values by key (the useProjection seat). */
   readonly projections: ProjectionsFace
+  /**
+   * Borrow a reading position for the currently displayed history generation, when supported.
+   * @param key - the reader's stable key.
+   * @returns a handle valid until that generation or the retained binding ends.
+   */
+  readingPosition?(key: string): SessionReadingPosition | undefined
   /**
    * Register one local submission echo before the caller serializes and sends
    * the prompt. The echo reconciles against Host events from then on, and

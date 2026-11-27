@@ -268,12 +268,14 @@ export class ClientSessions implements ISessions {
   /**
    * @param ctx - client root context (scope fibers mount under it).
    * @param remote - generated Remote namespaces shared with every Session.
+   * @param restartControl - stop the current projection-control generation before a journal reset.
    */
   constructor(
     private readonly rootCtx: Context,
     remote: SessionRemotes,
+    restartControl?: () => void,
   ) {
-    this.manager = new SessionManager(remote)
+    this.manager = new SessionManager(remote, restartControl)
     this.list = createSnapshotStore<SessionListState>({
       ids: [], byId: {}, phase: 'pending', projectionsBySession: {},
     })
@@ -433,6 +435,47 @@ export class ClientSessions implements ISessions {
    */
   handleSessionError(...args: Parameters<SessionManager['handleSessionError']>): void {
     this.manager.handleSessionError(...args)
+  }
+
+  /**
+   * Forward the Connection generation to the history owner.
+   * @param generation - current Connection generation, or undefined after loss.
+   */
+  connectHistory(generation: number | undefined): void {
+    this.manager.connectHistory(generation)
+  }
+
+  /**
+   * Forward an authenticated owner announcement to the Manager.
+   * @param owner - authenticated owner and local capability announcement.
+   */
+  handleHistoryOwner(owner: Parameters<SessionManager['handleHistoryOwner']>[0]): void {
+    this.manager.handleHistoryOwner(owner)
+  }
+
+  /**
+   * Forward a verified relay route change to the Manager.
+   * @param route - verified relay route announcement.
+   */
+  handleHistoryRoute(route: Parameters<SessionManager['handleHistoryRoute']>[0]): void {
+    this.manager.handleHistoryRoute(route)
+  }
+
+  /**
+   * Forward an addressed history revocation to the Manager.
+   * @param invalidation - revoked Session in the current relay route.
+   */
+  handleHistoryInvalidation(invalidation: Parameters<SessionManager['handleHistoryInvalidation']>[0]): void {
+    this.manager.handleHistoryInvalidation(invalidation)
+  }
+
+  /**
+   * Forward the loss of an event stream or rejection of credentials.
+   * @param generation - generation of the lost events connection or rejected HTTP request.
+   * @param rejected - whether credentials were definitively rejected.
+   */
+  endHistoryAuthorization(generation: number | undefined, rejected: boolean): void {
+    this.manager.endHistoryAuthorization(generation, rejected)
   }
 
   /** Rebuild the Session baseline and every opened window after connection. */

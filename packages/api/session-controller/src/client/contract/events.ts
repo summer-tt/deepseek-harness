@@ -99,6 +99,7 @@ export type SessionEventChange =
   | { readonly kind: 'replace'; readonly entries: readonly SessionEventLikeEntry[] }
   | { readonly kind: 'prepend'; readonly entries: readonly SessionEventLikeEntry[] }
   | { readonly kind: 'append'; readonly entries: readonly SessionEventLikeEntry[] }
+  | { readonly kind: 'history-append'; readonly entries: readonly SessionLiveEventEntry[] }
   | {
     readonly kind: 'settle-assistant'
     readonly attemptId: LlmAttemptId
@@ -171,6 +172,15 @@ export class MutableSessionEventSource implements SessionEventSource {
       kind: 'append',
       entries,
     })
+  }
+
+  /**
+   * Append records recovered by a verified opening without replaying live effects.
+   * @param entries - contiguous durable suffix.
+   */
+  appendHistory(entries: readonly SessionLiveEventEntry[]): void {
+    this.window = concat(this.window, leaf(entries))
+    this.publish(this.snapshot.hasMore, { kind: 'history-append', entries })
   }
 
   /**

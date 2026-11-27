@@ -180,6 +180,11 @@ describe('Client Session contracts', () => {
       kind: 'settle-assistant',
       attemptId: 'attempt-two',
     })
+
+    const tail = assistantSettlement(SessionSeq(4))
+    feed.settleAssistant(LlmAttemptId('attempt-three'), tail)
+    expect(feed.getSnapshot().entries).toEqual([opening, settlement, later, tail])
+    expect(feed.getSnapshot().change).toEqual({ kind: 'settle-assistant', attemptId: 'attempt-three', entry: tail })
   })
 
 })

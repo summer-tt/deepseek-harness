@@ -5,8 +5,12 @@ import { SessionSeq, type SessionId, type SessionSeqCursor } from '@deepseek-ai/
 import type { SessionProjectionMap, SessionProjectionViewValues } from '@deepseek-ai/dsh-session-projection/types'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type {
+  SessionAddress,
   SessionControlBaseline,
   SessionControlFrame,
+  SessionHistoryInvalidation,
+  SessionHistoryOwner,
+  SessionHistoryRoute,
   SessionProjectionHints,
   SessionRenameValue,
   SessionSummary,
@@ -14,6 +18,7 @@ import type {
 import { mergeOrderedBaseline } from '../ordered-baseline.ts'
 import { isRemoteFailure } from '@deepseek-ai/dsh-api-gateway/client'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import type { RemoteFailure, RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import type { SessionListEntry, TitledSessionSummary } from './lineage.ts'
 import { flattenLineage } from './lineage.ts'
@@ -24,6 +29,7 @@ import type {} from '@deepseek-ai/dsh-session-title/client'
 import { Notifier } from './notifier.ts'
 import { ProjectionValueStore } from './projection-store.ts'
 import { Session } from './session.ts'
+import { historyDependsOn, historyServer, SessionHistoryCache, type HistoryAuthorization } from './history-cache.ts'
 import type { SessionRemotes } from './remotes.ts'
 import type { SessionTarget } from '../contract/sessions.ts'
 
@@ -88,6 +94,9 @@ type SessionListMutation =
 /** Instance cluster + frame entry + the session list. */
 export class SessionManager {
   private readonly sessions = new Map<SessionId, Session>()
+  private readonly history = new SessionHistoryCache()
+  private generation: number | undefined
+  private lastGeneration: number | undefined
   /** In-flight Session disposals remain here after instances leave `sessions`, so manager disposal can await quiescence. */
   private readonly sessionDisposals = new Set<Promise<void>>()
   /**
@@ -113,6 +122,7 @@ export class SessionManager {
   /** Active list request's mutation log; its identity also fences completion after reconnect. */
   private listMutations: SessionListMutation[] | null = null
   private readonly addresses = new Map<SessionId, SubagentAddress>()
+  private readonly projectionAddresses = new Map<SessionId, SubagentAddress | undefined>()
   private readonly projectionLoads = new Map<SessionId, ProjectionLoad>()
   private readonly projectionInflight = new Map<SessionId, ProjectionInflight>()
 
@@ -127,8 +137,11 @@ export class SessionManager {
     this.listSnapshotCache = this.buildListSnapshot()
   })
 
-  /** @param remote - generated Remote namespaces used by catalog and history readers. */
-  constructor(private readonly remote: SessionRemotes) {
+  /**
+   * @param remote - generated Remote namespaces used by catalog and history readers.
+   * @param restartControl - synchronously abort the previous control generation before accepting new projection cuts.
+   */
+  constructor(private readonly remote: SessionRemotes, private readonly restartControl?: () => void) {
     this.listSnapshotCache = this.buildListSnapshot()
   }
 
@@ -146,7 +159,18 @@ export class SessionManager {
       && address === undefined) {
       throw new Error(`sessions.retain: unknown session ${id}`)
     }
+    this.history.invalidate(candidate => candidate.kind === 'subagent'
+      ? candidate.childSessionId === id && (address === undefined || candidate.parentSessionId !== address.parentSessionId
+        || candidate.mode !== address.mode)
+      : candidate.sessionId === id && address !== undefined)
     if (address !== undefined) this.addresses.set(id, address)
+    if (this.projectionStores.has(id)) {
+      const previous = this.projectionAddresses.get(id)
+      if (!sameSubagentAddress(previous, address)) {
+        this.projectionAddresses.set(id, address)
+        this.resetProjectionEpoch(candidate => candidate === id)
+      }
+    }
     this.sessions.get(id)?.configureSubagent(address)
     return id
   }
@@ -191,6 +215,8 @@ export class SessionManager {
   drop(sessionId: SessionId, expected: Session): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (session !== expected) return Promise.resolve()
+    const released = session.releasedHistory()
+    if (released !== undefined) this.history.retain(session.historyAddress(), released.grant, released.window)
     this.sessions.delete(sessionId)
     this.addresses.delete(sessionId)
     this.pruneEngagement(sessionId, this.retainedIds(this.summaries))
@@ -203,6 +229,7 @@ export class SessionManager {
    */
   async dispose(): Promise<void> {
     this.disposed = true
+    this.history.invalidate(() => true)
     this.listMutations = null
     this.listInflight = null
     this.engagedSessions.clear()
@@ -213,6 +240,7 @@ export class SessionManager {
     const sessions = [...this.sessions.values()]
     this.sessions.clear()
     this.addresses.clear()
+    this.projectionAddresses.clear()
     for (const session of sessions) void this.startSessionDisposal(session)
     await this.drainSessionDisposals()
   }
@@ -271,7 +299,7 @@ export class SessionManager {
 
   private createSession(sessionId: SessionId): Session {
     const address = this.addresses.get(sessionId)
-    return new Session(sessionId, this.remote, {
+    const session: Session = new Session(sessionId, this.remote, {
       ...(address === undefined ? {} : { address }),
       // The sender's local first-send flip mirrors into the list row so the
       // session surfaces (lists filter on blank) before any host frame lands.
@@ -285,7 +313,21 @@ export class SessionManager {
         this.sessions.get(engaged.sessionId)?.handleBlank(false)
       },
       projections: this.projectionStore(sessionId),
+      history: {
+        authorization: candidate => this.history.authorization(candidate),
+        read: (candidate, grant) => this.history.read(candidate, grant),
+        readPosition: (candidate, key) => this.sessions.get(sessionId) === session
+          ? this.history.readPosition(candidate, key) : undefined,
+        writePosition: (candidate, key, value) => {
+          if (this.sessions.get(sessionId) === session) this.history.writePosition(candidate, key, value)
+        },
+        invalidate: (candidate, grant, error) => {
+          if (this.sessions.get(sessionId) === session) this.handleHistoryFailure(candidate, grant, error)
+        },
+        resetProjections: () => { this.resetProjectionEpoch(id => id === sessionId) },
+      },
     })
+    return session
   }
 
   private effectiveBlank(summary: SessionSummary): boolean {
@@ -328,6 +370,7 @@ export class SessionManager {
         this.notifier.markDirty()
       })
       this.projectionStores.set(sessionId, store)
+      this.projectionAddresses.set(sessionId, this.subagentAddress(sessionId))
     }
     return store
   }
@@ -563,9 +606,11 @@ export class SessionManager {
    * @returns the accepted title and event position, or the Remote failure.
    */
   async rename(sessionId: SessionId, title: string): Promise<RemoteResult<SessionRenameValue>> {
+    const store = this.projectionStore(sessionId)
+    const epoch = store.epoch
     const result = await this.remote.session.rename({ sessionId, title })
-    if (result.ok) {
-      this.projectionStore(sessionId).apply('title', result.value.title, SessionSeq(result.value.seq))
+    if (result.ok && store.epoch === epoch) {
+      store.apply('title', result.value.title, SessionSeq(result.value.seq))
     }
     return result
   }
@@ -682,6 +727,7 @@ export class SessionManager {
    * @param sessionId - removed Session identity.
    */
   handleSessionRemoved(sessionId: SessionId): void {
+    this.history.invalidate(address => historyDependsOn(address, sessionId))
     const durableSubagent = this.subagentAddress(sessionId) !== undefined
       || this.summaries.some(summary => summary.sessionId === sessionId && summary.origin === 'subagent')
     this.recordMutation(durableSubagent
@@ -692,6 +738,7 @@ export class SessionManager {
     const catalog = this.projectionStores.get(sessionId)?.values().subagentCatalog
     if (!durableSubagent && (catalog === undefined || catalog.length === 0)) {
       this.projectionStores.delete(sessionId)
+      this.projectionAddresses.delete(sessionId)
     }
     this.pruneEngagement(sessionId, this.retainedIds(this.summaries))
     this.projectionInflight.get(sessionId)?.controller.abort()
@@ -729,6 +776,149 @@ export class SessionManager {
   }
 
   /**
+   * Fence history reads when the Connection changes generations.
+   * @param generation - current Connection generation, or undefined on loss.
+   */
+  connectHistory(generation: number | undefined): void {
+    if (this.generation !== generation) {
+      this.freezeLocalHistory()
+      for (const session of this.sessions.values()) session.cancelHistoryFallback()
+    }
+    this.generation = generation
+    if (generation !== undefined) this.lastGeneration = generation
+    this.updateHistoryAuthorization(() => { this.history.connect(generation) })
+  }
+
+  /**
+   * Accept a browser owner announcement and resume eligible bindings.
+   * @param owner - authenticated owner and local capability announcement.
+   */
+  handleHistoryOwner(owner: SessionHistoryOwner): void {
+    this.updateHistoryAuthorization(() => { this.history.authorize(owner) })
+  }
+
+  /**
+   * Apply a relay authorization change to caches and current bindings.
+   * @param route - verified relay route announcement.
+   */
+  handleHistoryRoute(route: SessionHistoryRoute): void {
+    this.updateHistoryAuthorization(() => { this.history.updateRoute(route) })
+  }
+
+  /**
+   * Revoke the named Session and its dependent child addresses.
+   * @param invalidation - revoked Session in the current relay route.
+   */
+  handleHistoryInvalidation(invalidation: SessionHistoryInvalidation): void {
+    if (!this.history.isCurrentRoute(invalidation)) return
+    this.revokeHistory(address => historyServer(address) === invalidation.serverId
+      && historyDependsOn(address, invalidation.sessionId), historyUnavailable())
+  }
+
+  /**
+   * Invalidate live grants when their event stream ends or HTTP rejects credentials.
+   * @param generation - generation of the event stream or rejected HTTP request.
+   * @param rejected - whether the carrier definitively rejected credentials.
+   */
+  endHistoryAuthorization(generation: number | undefined, rejected: boolean): void {
+    if (generation !== this.generation && !(rejected && this.generation === undefined && generation === this.lastGeneration)) return
+    if (rejected) {
+      this.history.end(generation, true)
+      this.revokeHistory(() => true, historyUnavailable())
+    } else {
+      for (const session of this.sessions.values()) session.cancelHistoryFallback()
+      this.freezeLocalHistory()
+      this.updateHistoryAuthorization(() => { this.history.end(generation, false) }, false)
+    }
+  }
+
+  private freezeLocalHistory(): void {
+    for (const session of this.sessions.values()) {
+      const released = session.releasedHistory()
+      if (released !== undefined && released.grant.route === undefined) {
+        this.history.retain(session.historyAddress(), released.grant, released.window)
+      }
+    }
+  }
+
+  private updateHistoryAuthorization(update: () => void, connected = this.generation !== undefined): void {
+    const previousScopes = new Map<SessionId, HistoryAuthorization | undefined>()
+    for (const id of this.projectionStores.keys()) {
+      previousScopes.set(id, this.history.authorization({ kind: 'session', sessionId: id }))
+    }
+    const prior = [...this.sessions.values()].map(session => ({
+      session, grant: this.history.authorization(session.historyAddress()),
+    }))
+    update()
+    const changed = new Set<SessionId>()
+    for (const [id, previous] of previousScopes) {
+      const next = this.history.authorization({ kind: 'session', sessionId: id })
+      if (next !== previous && (previous !== undefined || next?.route !== undefined)) changed.add(id)
+    }
+    if (changed.size > 0) this.resetProjectionEpoch(id => changed.has(id), connected)
+    for (const { session, grant } of prior) {
+      if (this.history.authorization(session.historyAddress()) !== grant) {
+        session.historyAuthorizationChanged(grant, connected)
+      }
+    }
+  }
+
+  private handleHistoryFailure(address: SessionAddress, grant: HistoryAuthorization | undefined, error: RemoteFailure): void {
+    const code: string = error.code
+    const current = this.history.authorization(address)
+    if (grant !== current) return
+    if (code === 'history-route-changed' || code === 'revoked' || code === 'unpaired') {
+      const route = grant?.route
+      if (route !== undefined && this.history.isCurrentRoute(route)) {
+        if (code === 'history-route-changed') this.updateHistoryAuthorization(() => { this.history.endRoute(route.serverId) })
+        else {
+          this.history.endRoute(route.serverId)
+          this.revokeHistory(candidate => historyServer(candidate) === route.serverId, error)
+        }
+      }
+      return
+    }
+    if (!['remote-access/denied', 'session/not-found', 'subagent/not-found', 'subagent/unauthorized',
+      'unshared', 'not-shared'].includes(code)) return
+    const id = address.kind === 'session' ? address.sessionId : address.childSessionId
+    this.revokeHistory(candidate => historyDependsOn(candidate, id), error)
+  }
+
+  private addressFor(id: SessionId): SessionAddress {
+    const child = this.subagentAddress(id)
+    return child === undefined ? { kind: 'session', sessionId: id } : { kind: 'subagent', ...child }
+  }
+
+  private revokeHistory(matches: (address: SessionAddress) => boolean, error: RemoteFailure): void {
+    this.history.invalidate(matches)
+    const affected = new Set<SessionId>()
+    for (const [id, session] of this.sessions) {
+      if (!matches(session.historyAddress())) continue
+      affected.add(id)
+      session.revokeHistory(error)
+    }
+    for (const id of this.projectionStores.keys()) {
+      if (matches(this.addressFor(id))) affected.add(id)
+    }
+    if (affected.size > 0) this.resetProjectionEpoch(id => affected.has(id), false)
+  }
+
+  private resetProjectionEpoch(matches: (id: SessionId) => boolean, refresh = true): void {
+    this.restartControl?.()
+    this.listMutations = null
+    this.listInflight = null
+    for (const [id, store] of this.projectionStores) {
+      if (!matches(id)) continue
+      this.projectionInflight.get(id)?.controller.abort()
+      this.projectionInflight.delete(id)
+      this.projectionLoads.delete(id)
+      store.clear()
+    }
+    if (refresh) void this.refreshList()
+    else this.notifier.markDirty()
+  }
+
+  /**
    * Repair one re-established Host-event generation with queryable baselines.
    * Discard old projection cuts before new queries, including cold Sessions
    * absent from the process-local control baseline.
@@ -748,6 +938,7 @@ export class SessionManager {
     this.projectionInflight.clear()
     this.projectionLoads.clear()
     for (const parentSessionId of parents) void this.refreshProjections(parentSessionId)
+    for (const session of this.sessions.values()) session.resumeHistoryFollow()
   }
 
   private buildListSnapshot(): SessionListSnapshot {
@@ -854,4 +1045,12 @@ function applyMutation(summaries: readonly SessionSummary[], mutation: SessionLi
 /** Temporary source-plane bridge while the Host contract and client project build independently. */
 function workspaceAttachSessionId(error: RemoteFailure): SessionId | undefined {
   return error.code === 'session/workspace-attach-failed' ? error.details.sessionId : undefined
+}
+
+function historyUnavailable(): RemoteError<'gateway/cancelled'> {
+  return new RemoteError('gateway/cancelled', 'session history authorization ended', {})
+}
+
+function sameSubagentAddress(left: SubagentAddress | undefined, right: SubagentAddress | undefined): boolean {
+  return left?.childSessionId === right?.childSessionId && left?.parentSessionId === right?.parentSessionId && left?.mode === right?.mode
 }
