@@ -13,7 +13,7 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-llm'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
-import { NamedEntries, ScopedLayers, scopeChainOf, scopeOf } from '@deepseek-ai/dsh-scope'
+import { AnonymousEntries, NamedEntries, ScopedLayers, scopeChainOf, scopeOf } from '@deepseek-ai/dsh-scope'
 import type { ScopeKey, ScopeLayer } from '@deepseek-ai/dsh-scope'
 import z from '@deepseek-ai/schemastery'
 import type Schema from '@deepseek-ai/schemastery'
@@ -329,6 +329,7 @@ class SkillLayer implements ScopeLayer {
   readonly providers: NamedEntries<RegisteredProvider>
   /** Runtime skills registered through contexts carrying this scope. */
   readonly runtime = new Map<string, SkillDefinition>()
+  readonly userInvocation = new AnonymousEntries<true>()
 
   constructor(scope: ScopeKey | undefined) {
     this.providers = new NamedEntries(name => new Error(scope === undefined
@@ -338,7 +339,7 @@ class SkillLayer implements ScopeLayer {
 
   /** Whether every contribution table in this aggregate layer is empty. */
   isEmpty(): boolean {
-    return this.providers.isEmpty() && this.runtime.size === 0
+    return this.providers.isEmpty() && this.runtime.size === 0 && this.userInvocation.isEmpty()
   }
 }
 
@@ -457,6 +458,27 @@ export class SkillRegistry extends Service {
       },
       { label: 'skills.register()' },
     )
+  }
+
+  /**
+   * Mark the calling scope as having a native user skill invocation listener using this registry.
+   * @returns The Cordis disposer that removes this capability when the listener's plugin unloads.
+   */
+  registerUserInvocation(): () => void {
+    return this.layers.effect(this.ctx, layer => layer.userInvocation.append(true), {
+      label: 'skills.registerUserInvocation()',
+      notify: false,
+    })
+  }
+
+  /**
+   * Check whether a native `/name` listener uses this registry in the viewing scope.
+   * @param scope - Scope of the Agent or standing preset being inspected.
+   * @returns Whether the global layer or an inherited scope owns such a listener.
+   */
+  hasUserInvocation(scope?: ScopeKey): boolean {
+    return !this.layers.global.userInvocation.isEmpty()
+      || this.layers.chainLayers(scope).some(layer => !layer.userInvocation.isEmpty())
   }
 
   /**

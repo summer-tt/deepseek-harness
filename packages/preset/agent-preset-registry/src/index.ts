@@ -382,19 +382,26 @@ export class AgentPresetRegistry extends TypertRemoteService {
     }
   }
 
-  /** Read current registrations for cold transcript presentation.
+  /** Read current registrations without binding an Agent.
    * @param id Preset identity or the default.
-   * @returns A revision lease; dispose it after the scoped read completes.
+   * @returns A revision lease with scoped service lookup until disposal. Dispose it after the read completes.
    */
-  async acquireScope(id?: string): Promise<{ key: ScopeKey } & AsyncDisposable> {
+  async acquireScope(id?: string): Promise<{
+    key: ScopeKey
+    serviceFor<K extends string & keyof Context>(name: K): Context[K] | undefined
+  } & AsyncDisposable> {
     const generation = await this.retain(id)
     let disposed = false
-    return { key: generation.key, [Symbol.asyncDispose]: async () => {
-      if (disposed) return
-      disposed = true
-      generation.users--
-      await this.collect(generation)
-    } }
+    return {
+      key: generation.key,
+      serviceFor: name => disposed ? undefined : serviceForMount(this.owner, generation.mount, name),
+      [Symbol.asyncDispose]: async () => {
+        if (disposed) return
+        disposed = true
+        generation.users--
+        await this.collect(generation)
+      },
+    }
   }
 
   /** Read plugin rows without creating an Agent.

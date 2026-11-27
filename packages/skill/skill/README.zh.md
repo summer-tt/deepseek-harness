@@ -52,7 +52,7 @@ kind: "package-reference"
 - **嵌入式 skill。** 插件可用 `ctx.skills.register(...)` 注册内存中的 skill；注册表会补入默认调用策略与 `runtime` 提供方标签。同层同名运行时注册采用先到先得，并记录警告。
 - **提供方注册。** 提供方用 `ctx.skills.registerProvider(...)` 贡献目录；注册是同步的，返回的 disposer（资源释放）会移除该提供方。`runtime` 是保留的提供方名称。
 
-每个 skill 上的调用策略决定哪些接口可以展示并加载它：`modelInvocable` 用于面向模型的工具与目录，`userInvocable` 用于面向用户的命令。注册表保留全部四种组合，因此一次发现结果可以同时服务两个接口，而不会混淆各自的目录。
+每个 skill 上的调用策略决定哪些接口可以展示并加载它：`modelInvocable` 用于面向模型的工具与目录，`userInvocable` 用于面向用户的命令。注册表保留全部四种组合，因此一次发现结果可以同时服务两个接口，而不会混淆各自的目录。`hasUserInvocation(scope)` 查询此 registry 是否为指定 scope 提供原生 `/name` 监听器。监听器所属的插件登记这项能力，插件卸载时移除登记。
 
 | 策略 | 模型 | 用户 |
 |---|---|---|

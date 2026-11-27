@@ -66,6 +66,8 @@ Session 对象还承载本地提交回显：`session.beginSubmission` 在调用�
 
 面向用户调用的 `skills/list` 元数据包含胜出提供方可选的指令文件 `path`。输入框可据此预览文件，无需加载每个 skill 的正文或激活冷态 Agent。
 
+Host 插件可在创建 Session 前调用 `ctx.sessionSkillCatalog.previewDraft(request, signal)`。可选的 `agentPreset` 选择当前已挂载的 preset，省略时使用新 Session 的默认 preset。可选的 `workspaceId` 选择已登记的规范化目录，项目结果仅包含真实路径位于该目录内的 skill 文件。省略 Workspace 时只返回用户 skill。结果仅包含符合条件的胜出名称及其 scope，并要求 preset 支持原生 `/name` 调用。失败使用固定错误码和消息，不带提供方的诊断详情。
+
 Fork 将 `atSeq` 选定的含边界事件前缀（包括开放轮次内的截点）复制到不带 `parentSession` 的独立 Session。客户端占位项同样省略 `parentSessionId`；列表缩进仅适用于 subagent 来源的行，历史普通 fork 即使保留父 ID 也不缩进。工作区绑定及可选标题递增使用本次操作选定的源会话；递增时会跳过其他由 Host 列出的标题已使用的编号。子会话在合成的 fork 结果和结束事件之前记录继承标记。省略 `atSeq` 时选择最近已结束轮次及其独立尾部，在下一轮次或排队输入之前停止；不存在的事件会被拒绝。聊天操作选择已结束轮次。
 
 恢复会话时若已有写句柄占用，返回 `session/writer-held`，并携带会话 id；其他恢复失败仍返回 `gateway/internal`。

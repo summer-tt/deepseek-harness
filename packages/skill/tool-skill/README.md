@@ -53,7 +53,7 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 
 - **A session catalog.** When the `skill` tool is visible and either model-invocable skills exist or discovery is incomplete, the agent receives a durable user-role message before its first request, listing each confirmed skill's name and a capped description; a non-empty catalog tells the model to load a skill with the tool before acting on it, and never to infer instructions from the summary alone.
 - **A loader tool.** The model calls `skill` with the exact skill name and receives the full instruction body plus resource guidance in a canonical `<skill_content>` block; the result is retained as ordinary tool history.
-- **Explicit user invocation.** A `/name` token in direct user input that names a user-invocable skill injects that skill's instructions into the step, without the model having to load it.
+- **Explicit user invocation.** A `/name` token in direct user input that names a user-invocable skill injects that skill's instructions into the step. The listener registers this capability on its scoped skill registry for Host draft previews.
 - **Live catalog updates.** Later membership, description, visibility, or completeness changes append a replacement catalog; removing every skill appends an empty catalog that retires older names.
 
 ### Observable success and failures
