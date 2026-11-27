@@ -27,6 +27,8 @@ kind: "package-reference"
 
 与 `ui-workspace` 及宿主后端 [`dsh-host-directory-picker-browse`](../../host/directory-picker-browse/README.zh.md) 一起挂载本插件；一行 cordis.yml 随即组合出完整的浏览拾取交互。当工作区流程发起目录请求时，用户看到应用内对话框：头部承载路径面包屑与可编辑路径区，未选中行时是一整栏层级，选中后该行分为层级与子项两栏。
 
+客户端插件可通过根作用域的 `directoryPicker.browser` Factory 渲染同一个本地化对话框。以 type-only 方式导入 `@deepseek-ai/dsh-client-ui-directory-picker-browse/client`，再调用 renderer 提供的 `renderFactorySlot`，传入 `DirectoryBrowserOwnerProps`。调用方在省略路径时提供初始目录列表，并通过 `createDirectory` 返回新建目录的路径。浏览器插件激活期间可使用此 Factory。可传入 `fallback`，供 Factory 缺席时渲染。
+
 ### 导航与创建
 
 逐级进入文件夹、直接编辑路径，或用前缀过滤最后一栏；宿主标记的隐藏条目默认不显示，直到页脚开关揭开。**新建文件夹**打开一个嵌套创建对话框，目标为选中的文件夹，并选中它创建出来的那个；**打开**采纳选中的文件夹，没有选中时回落到当前层级。确认一个目录即为选中的路径；关闭对话框即为取消。

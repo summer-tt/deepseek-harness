@@ -27,6 +27,8 @@ This package provides the in-app directory-browsing surface for the Web GUI: a S
 
 Mount this plugin alongside `ui-workspace` and the host backend [`dsh-host-directory-picker-browse`](../../host/directory-picker-browse/README.md); one cordis.yml row then composes the whole browse picking interaction. When a workspace flow opens a directory request, the user sees the in-app dialog: a header with the path breadcrumb and an editable path zone, then a single full-width level until a row is selected, after which the row splits into level and children columns.
 
+Client plugins can render the same localized dialog through the root-scoped `directoryPicker.browser` Factory. Import `@deepseek-ai/dsh-client-ui-directory-picker-browse/client` for types and use the renderer's `renderFactorySlot` with `DirectoryBrowserOwnerProps`. The caller supplies the initial listing for an omitted path and returns the created directory's path from `createDirectory`. The Factory is available while this browse plugin is active. Pass a `fallback` to render when the Factory is absent.
+
 ### Navigating and creating
 
 Step through folders, edit the path directly, or filter the last pane by prefix; a Host-flagged hidden entry stays hidden until the footer toggle reveals it. **New folder** opens a nested create dialog targeting the selected folder and selects what it creates; **Open** adopts the selected folder, falling back to the listed level. Confirming a directory is the picked path; dismissing the dialog is the cancellation.

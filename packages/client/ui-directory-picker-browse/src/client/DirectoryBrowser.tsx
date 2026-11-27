@@ -41,11 +41,11 @@ import {
   IconPlusOutlineRegular, Modal,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { DirectoryEntry, DirectoryListing } from '@deepseek-ai/dsh-api-remotes/client'
-import type { Translate } from '@deepseek-ai/dsh-client-locale/client'
+import type { FactoryComponentPropsOf } from '@deepseek-ai/dsh-client-ui-slots'
 import css from './DirectoryBrowser.module.css'
 
-/** Owner-supplied browser props: browse calls, pick semantics, and copy. */
-export interface DirectoryBrowserProps {
+/** Owner-supplied visibility, browse operations, and directory selection callbacks. */
+export interface DirectoryBrowserOwnerProps {
   /** Dialog visibility (owner-local; closed unmounts nothing but resets on reopen). */
   open: boolean
   /**
@@ -67,9 +67,20 @@ export interface DirectoryBrowserProps {
   onClose: () => void
   /** The owner's confirm is in flight: Open disables, the view freezes. */
   busy: boolean
-  /** Localized copy. */
-  t: Translate
 }
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface SlotFactoryMap {
+    /** Render the workspace directory dialog with caller-owned listing, creation, and selection. */
+    'directoryPicker.browser': {
+      scope: 'root'
+      props: DirectoryBrowserOwnerProps
+      locale: 'directory-browser'
+    }
+  }
+}
+
+type DirectoryBrowserProps = Pick<FactoryComponentPropsOf<'directoryPicker.browser'>, keyof DirectoryBrowserOwnerProps | 't'>
 
 /** Failure text from the injected directory operation. */
 function failureText(error: unknown): string {

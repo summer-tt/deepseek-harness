@@ -1,15 +1,21 @@
 // @vitest-environment jsdom
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { DirectoryListing } from '@deepseek-ai/dsh-api-remotes/client'
-import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
+import { apply as applyRenderer, type StandardSourceBinding } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { usePinnedBrowserLanguages } from '@deepseek-ai/dsh-client-test-runtime'
 import type { DirectoryFlowOwnerProps } from '@deepseek-ai/dsh-client-ui-workspace/client'
 import { apply, inject } from '../src/client/index.ts'
 import { BrowseDirectoryFlow } from '../src/client/flow.ts'
 import { apply as nodeApply } from '../src/index.ts'
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface SlotMap {
+    'test.directoryPicker.host': { kind: 'hoc'; scope: 'root' }
+  }
+}
 
 // The service reads its initial locale from the browser; these specs assert
 // the shipped Chinese copy, so they state the browser they assume.
@@ -32,12 +38,14 @@ const homeListing: DirectoryListing = {
 
 async function bench() {
   const ctx = new Context()
-  await ctx.plugin(SlotRegistry).await()
-  ctx.provide('locale', new LocaleRuntime(ctx))
+  await ctx.plugin({ apply: applyRenderer }).await()
+  const locale = new LocaleRuntime(ctx)
+  ctx.provide('locale', locale)
   const listDirectory = vi.fn(async (): Promise<DirectoryListing> => homeListing)
   const createDirectory = vi.fn(async (path: string, name: string) => `${path}/${name}`)
   ctx.provide('uiWorkspace', { listDirectory, createDirectory } as never)
-  const slots = ctx.get('slots') as SlotRegistry
+  const slots = ctx.slots
+  slots.installLocale(locale)
   const declare = () => slots.register({
     name: 'root',
     children: Object.fromEntries(HOLES.map(name => [name, { kind: 'single', scope: 'root' }])),
@@ -208,6 +216,48 @@ describe('directory-picker-browse client half', () => {
     await expect(injected.createDirectory(HOME, 'fresh')).resolves.toBe(`${HOME}/fresh`)
     expect(b.listDirectory).toHaveBeenCalledOnce()
     expect(b.createDirectory).toHaveBeenCalledWith(HOME, 'fresh')
+  })
+
+  it('renders the localized browser from a hoc layer and restores its fallback on disposal', async () => {
+    const b = await bench()
+    const listDirectory = vi.fn(async (): Promise<DirectoryListing> => homeListing)
+    const createDirectory = vi.fn(async (path: string, name: string) => `${path}/${name}`)
+    const onOpen = vi.fn()
+    const onClose = vi.fn()
+    const binding: StandardSourceBinding = { key: undefined, hooks: {}, keyedHooks: {}, props: {} }
+    const current = { getSnapshot: () => binding, subscribe: () => () => {} }
+    b.slots.installScope('session', { current, bindingSource: () => current })
+    b.slots.register({ name: 'root', children: { 'test.directoryPicker.host': { kind: 'hoc', scope: 'root' } } },
+      ({ renderSlot }) => renderSlot('test.directoryPicker.host', {}, { children: <span>Host content</span> }))
+    b.slots.register({ name: 'test.directoryPicker.host', id: 'browser' },
+      ({ children, renderFactorySlot }) => (
+        <>
+          {children}
+          {renderFactorySlot('directoryPicker.browser', {
+            open: true, busy: false, listDirectory, createDirectory, onOpen, onClose,
+          }, { fallback: <span>Picker unavailable</span> })}
+        </>
+      ))
+    render(b.slots.renderSlot('root', {}))
+    expect(screen.getByText('Host content')).toBeDefined()
+    expect(screen.getByText('Picker unavailable')).toBeDefined()
+
+    const fiber = b.ctx.plugin({ inject: [...inject], apply })
+    await act(async () => { await fiber.await() })
+    expect(screen.queryByText('Picker unavailable')).toBeNull()
+    expect(screen.getByRole('dialog', { name: '选择工作区目录' })).toBeDefined()
+    const openButton = screen.getByRole<HTMLButtonElement>('button', { name: '打开' })
+    await waitFor(() => { expect(openButton.disabled).toBe(false) })
+    expect(listDirectory).toHaveBeenCalledWith(undefined, expect.any(AbortSignal))
+    expect(b.listDirectory).not.toHaveBeenCalled()
+    fireEvent.click(openButton)
+    expect(onOpen).toHaveBeenCalledWith(HOME)
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    expect(onClose).toHaveBeenCalledOnce()
+
+    await act(async () => { await fiber.dispose() })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.getByText('Picker unavailable')).toBeDefined()
   })
 
   it('adapts the owner conversation onto the dialog: confirm picks, dismissal cancels', async () => {

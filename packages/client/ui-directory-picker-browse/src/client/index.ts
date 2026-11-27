@@ -13,19 +13,44 @@ import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 // Type-only: pulls the SlotRegistry service merge (ctx.slots).
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import { DirectoryBrowser } from './DirectoryBrowser.tsx'
 import type { BrowseFlowInjected } from './flow.ts'
 import { BrowseDirectoryFlow } from './flow.ts'
 
 /** Locale namespace owning the browser dialog's copy. */
 const LOCALE_NS = 'directory-browser'
 
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface LocaleNamespaceMap {
+    /** Workspace directory browser controls and status messages. */
+    'directory-browser': keyof typeof zh
+  }
+}
+
+export type { DirectoryBrowserOwnerProps } from './DirectoryBrowser.tsx'
+
+const zh = {
+  'browser.title': '选择工作区目录',
+  'browser.home': '主目录',
+  'browser.newFolder': '新建文件夹',
+  'browser.folderName': '文件夹名称',
+  'browser.createIn': '在"{name}"中新建文件夹',
+  'browser.untitledFolder': '未命名文件夹',
+  'browser.create': '创建',
+  'browser.cancel': '取消',
+  'browser.open': '打开',
+  'browser.editPath': '编辑路径',
+  'browser.loading': '加载中…',
+  'browser.truncated': '文件夹过多，仅显示开头部分。',
+  'browser.showHidden': '显示隐藏文件',
+}
+
 /** Required services (cordis fiber inject): the slot registry, workspace UI service, and locale. */
 export const inject = ['slots', 'uiWorkspace', 'locale']
 
 /**
- * Client plugin body: register the dialog's dictionaries and the browse flow
- * into all three directory-flow holes through `slots.inject()` because the
- * ui-workspace declarations may activate later or be replaced.
+ * Register the reusable dialog and its dictionaries. The built-in browse
+ * flows follow the lifetimes of ui-workspace's three slot declarations.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
@@ -35,21 +60,7 @@ export function apply(ctx: ClientContext): void {
     // a failed activation must not squat the namespace's other locale.
     const disposers: (() => void)[] = []
     const dictionaries: [locale: string, dict: Record<string, string>][] = [
-      ['zh', {
-        'browser.title': '选择工作区目录',
-        'browser.home': '主目录',
-        'browser.newFolder': '新建文件夹',
-        'browser.folderName': '文件夹名称',
-        'browser.createIn': '在"{name}"中新建文件夹',
-        'browser.untitledFolder': '未命名文件夹',
-        'browser.create': '创建',
-        'browser.cancel': '取消',
-        'browser.open': '打开',
-        'browser.editPath': '编辑路径',
-        'browser.loading': '加载中…',
-        'browser.truncated': '文件夹过多，仅显示开头部分。',
-        'browser.showHidden': '显示隐藏文件',
-      }],
+      ['zh', zh],
       ['en', {
         'browser.title': 'Select Workspace Directory',
         'browser.home': 'Home',
@@ -164,6 +175,10 @@ export function apply(ctx: ClientContext): void {
     }
     return () => { for (const dispose of disposers) dispose() }
   }, 'directory-picker-browse: dialog dictionaries')
+
+  ctx.slots.registerFactory({
+    name: 'directoryPicker.browser', scope: 'root', locale: LOCALE_NS,
+  }, DirectoryBrowser)
 
   const injected = (): BrowseFlowInjected => ({
     listDirectory: (path, signal) => ctx.uiWorkspace.listDirectory(path, signal),

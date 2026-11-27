@@ -5,21 +5,14 @@
  */
 import { createElement } from 'react'
 import type { ReactElement } from 'react'
-import type { DirectoryListing } from '@deepseek-ai/dsh-api-remotes/client'
-import type { Translate } from '@deepseek-ai/dsh-client-locale/client'
+import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: the owner contract of the directory-flow holes.
 import type { DirectoryFlowOwnerProps } from '@deepseek-ai/dsh-client-ui-workspace/client'
-import { DirectoryBrowser } from './DirectoryBrowser.tsx'
+import { DirectoryBrowser, type DirectoryBrowserOwnerProps } from './DirectoryBrowser.tsx'
 
-/** Injected face: the browse wire calls and copy the dialog drives (bound in apply's closure). */
-export interface BrowseFlowInjected {
-  /** List one directory level (absent path = the Host home directory); the signal aborts a superseded scan. */
-  listDirectory: (path?: string, signal?: AbortSignal) => Promise<DirectoryListing>
-  /** Create one child directory under an existing parent. */
-  createDirectory: (path: string, name: string) => Promise<string>
-  /** Localized dialog copy (this package's namespace). */
-  t: Translate
-}
+/** The built-in flow's directory operations and localized dialog copy. */
+export type BrowseFlowInjected = Pick<DirectoryBrowserOwnerProps, 'listDirectory' | 'createDirectory'>
+  & PropsLocale<'directory-browser'>
 
 /**
  * Flow occupant: adapts the hole's owner conversation onto the browser
