@@ -147,7 +147,7 @@ export abstract class RemoteJournalStream<
    * Read one journal page through the addressed domain source.
    * @param request - domain page request.
    * @param through - inclusive journal cursor that fixes the source read.
-   * @param signal - cancellation lifetime shared with the logical stream.
+   * @param signal - cancellation lifetime for the physical journal generation.
    * @returns the requested page, whose tail equals `through` unless the domain request selects older entries.
    */
   protected abstract readPage(request: PageRequest, through: Cursor, signal: AbortSignal): Promise<Page>
@@ -193,7 +193,7 @@ export abstract class RemoteJournalStream<
   /**
    * Read and prepend one older page after a successful open.
    * @param request - domain page request bound to this stream's address.
-   * @returns after the page is applied or rejected as discontinuous.
+   * @returns after applying a current page or discarding one superseded by a replacement.
    */
   async prepend(request: PageRequest): Promise<void> {
     if (!this.opened || this.disposed) throw new Error(`${this.options.name} is not open`)
