@@ -10,6 +10,9 @@ const MAX_ENTRY_BYTES = 2 * 1024 * 1024
 const MAX_CACHE_BYTES = 8 * 1024 * 1024
 const MAX_ENTRIES = 12
 const MAX_POSITION_BYTES = 4 * 1024
+// Window object, property slots and names, empty entries array, and hasMore boolean.
+const WINDOW_OVERHEAD = 48 + 3 * 32 + 2 * ('header'.length + 'entries'.length + 'hasMore'.length) + 32 + 8
+const ARRAY_ELEMENT_OVERHEAD = 8
 
 /** Durable records from one accepted journal cut. */
 export interface DurableHistoryWindow {
@@ -24,13 +27,17 @@ export interface HistoryAuthorization {
   readonly route?: SessionHistoryRoute
 }
 
+interface RetainedWindow {
+  readonly window: DurableHistoryWindow
+  readonly weight: number
+}
+
 interface CacheEntry {
   readonly address: SessionAddress
   readonly route: SessionHistoryRoute | undefined
-  readonly window: DurableHistoryWindow | undefined
+  readonly history: RetainedWindow | undefined
   readonly positions: ReadonlyMap<string, { readonly value: string; readonly bytes: number }>
   readonly weight: number
-  readonly windowWeight: number | undefined
 }
 
 /**
@@ -174,20 +181,23 @@ export class SessionHistoryCache {
    * @returns the last confirmed window, if still retained.
    */
   read(address: SessionAddress, grant: HistoryAuthorization): DurableHistoryWindow | undefined {
-    return this.authorization(address) === grant ? this.touch(cacheKey(address, grant))?.window : undefined
+    return this.authorization(address) === grant ? this.touch(cacheKey(address, grant))?.history?.window : undefined
   }
 
   /**
-   * Store the released window and enforce the inactive history budgets.
-   * @param address - address released by the last retained Session binding.
+   * Retain an accepted window or a bounded suffix starting at a durable Turn boundary.
+   * @param address - address of the retained history.
    * @param grant - authorization of the accepted journal.
-   * @param window - latest accepted durable window; omitted when ineligible for retention.
+   * @param window - latest accepted durable window, or undefined to retain positions alone.
+   * @param truncated - whether the caller dropped records from the head for the cache count limit.
    */
-  retain(address: SessionAddress, grant: HistoryAuthorization, window: DurableHistoryWindow | undefined): void {
+  retain(address: SessionAddress, grant: HistoryAuthorization, window: DurableHistoryWindow | undefined, truncated = false): void {
     if (this.authorization(address) !== grant) return
     const key = cacheKey(address, grant)
     const positions = this.entries.get(key)?.positions ?? new Map()
-    this.store(key, address, grant, window, positions)
+    const history = window === undefined ? undefined
+      : selectHistory(window, MAX_ENTRY_BYTES - cacheEntryOverhead(key) - MAX_POSITION_BYTES, truncated)
+    this.store(key, address, grant, history, positions)
   }
 
   /**
@@ -238,7 +248,7 @@ export class SessionHistoryCache {
       if (otherBytes + retained > MAX_POSITION_BYTES) return
       positions.set(key, { value: encoded, bytes: retained })
     }
-    this.store(id, address, grant, existing?.window, positions, existing?.windowWeight)
+    this.store(id, address, grant, existing?.history, positions)
   }
 
   private freeze(): void {
@@ -273,22 +283,15 @@ export class SessionHistoryCache {
     key: string,
     address: SessionAddress,
     grant: HistoryAuthorization,
-    window: DurableHistoryWindow | undefined,
+    history: RetainedWindow | undefined,
     positions: CacheEntry['positions'],
-    measuredWindow?: number,
   ): void {
     this.delete(key)
-    let weight = 2 * key.length + 160
+    if (history === undefined && positions.size === 0) return
+    let weight = cacheEntryOverhead(key) + (history?.weight ?? 0)
     for (const position of positions.values()) weight += position.bytes
-    const measured = window === undefined || window.entries.length > MAX_HISTORY_CACHE_RECORDS
-      ? undefined : measuredWindow ?? retainedWeightWithin(window, MAX_ENTRY_BYTES - weight)
-    const windowWeight = measured !== undefined && weight + measured <= MAX_ENTRY_BYTES ? measured : undefined
-    if (windowWeight === undefined && positions.size === 0) return
-    weight += windowWeight ?? 0
     if (weight > MAX_ENTRY_BYTES) return
-    this.entries.set(key, {
-      address, route: grant.route, window: windowWeight === undefined ? undefined : window, positions, weight, windowWeight,
-    })
+    this.entries.set(key, { address, route: grant.route, history, positions, weight })
     this.weight += weight
     for (const oldest of this.entries.keys()) {
       if (this.entries.size <= MAX_ENTRIES && this.weight <= MAX_CACHE_BYTES) break
@@ -297,8 +300,37 @@ export class SessionHistoryCache {
   }
 }
 
+function cacheEntryOverhead(key: string): number {
+  return 2 * key.length + 160
+}
+
+function selectHistory(window: DurableHistoryWindow, budget: number, truncated: boolean): RetainedWindow | undefined {
+  const headerWeight = retainedWeightWithin(window.header, budget - WINDOW_OVERHEAD, 1)
+  if (headerWeight === undefined) return undefined
+  let weight = WINDOW_OVERHEAD + headerWeight
+  const { entries } = window
+  const firstAllowed = Math.max(0, entries.length - MAX_HISTORY_CACHE_RECORDS)
+  let start = entries.length
+  let suffixWeight = weight
+  for (let index = entries.length - 1; index >= firstAllowed; index -= 1) {
+    const entry = entries[index]
+    if (entry === undefined) break
+    const measured = retainedWeightWithin(entry, budget - weight - ARRAY_ELEMENT_OVERHEAD, 2)
+    if (measured === undefined) break
+    weight += ARRAY_ELEMENT_OVERHEAD + measured
+    if (index === 0 && !truncated) return { window, weight }
+    if (entry.event.type === 'turn/start') {
+      start = index
+      suffixWeight = weight
+    }
+  }
+  if (entries.length === 0 && !truncated) return { window, weight }
+  if (start === entries.length) return undefined
+  return { window: { header: window.header, entries: entries.slice(start), hasMore: true }, weight: suffixWeight }
+}
+
 /** Estimate retained JS heap weight with an upper bound on traversal work. */
-function retainedWeightWithin(value: unknown, budget: number): number | undefined {
+function retainedWeightWithin(value: unknown, budget: number, initialDepth = 0): number | undefined {
   const walk = (item: unknown, remaining: number, depth: number): number | undefined => {
     if (remaining < 0 || depth > 256) return undefined
     if (typeof item === 'string') {
@@ -324,5 +356,5 @@ function retainedWeightWithin(value: unknown, budget: number): number | undefine
     }
     return weight
   }
-  return walk(value, budget, 0)
+  return walk(value, budget, initialDepth)
 }

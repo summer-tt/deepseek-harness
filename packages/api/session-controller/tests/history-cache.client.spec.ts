@@ -111,6 +111,145 @@ it('reuses the complete window after A → B → A with zero notifications and e
   expect(requests.at(-1)?.historyWindowStart).toBe(0)
 })
 
+for (const mode of ['release', 'freeze']) {
+  it(`retains a bounded suffix of consumed pages on ${mode} and uses the confirmed head for paging`, async ({ mock, start }) => {
+    catalog(mock, A)
+    const requests: SessionFollowRequest[] = []
+    let opening = page(1_200, 1_799)
+    mock.stream(FOLLOW, ([value], stream) => {
+      const request = followRequest(value)
+      requests.push(request)
+      stream.push(followSnapshot(opening, request))
+    })
+    const tail = opening.records
+    const middle = page(600, 1_199)
+    mock.remote.session.page.mockResolvedValueOnce(ok({ ...middle, cursor: 1_799 }))
+    const oldest = page(0, 599)
+    const oversized = mode === 'freeze'
+    const records = oldest.records.map((entry) => {
+      if (entry.event.seq === 300) return { ...entry, event: { ...entry.event, type: 'turn/end' } }
+      return oversized && entry.event.seq === 350 ? record(350, 'x'.repeat(1_100_000)) : entry
+    })
+    mock.remote.session.page.mockResolvedValueOnce(ok({ ...oldest, records, cursor: 1_799 }))
+    const { ctx, connection } = await start()
+    await ctx.sessions.refresh()
+    await emit(mock, 'api-session/history-owner', OWNER)
+    using first = ctx.sessions.retain(A, { source: 'gateway' })
+    const { session, eventSource } = first.binding
+    await first.ready
+    await session.loadOlder()
+    await session.loadOlder()
+    const complete = eventSource.getSnapshot()
+    expect(complete.hasMore).toBe(false)
+    expect(complete.entries).toHaveLength(1_800)
+    const expectedStart = oversized ? 351 : 301
+    session.readingPosition?.('chat')?.write({ seq: 100, offset: 8 })
+    if (mode === 'freeze') {
+      const generation = connection.generation.getSnapshot()?.id
+      if (generation === undefined) throw new Error('expected a connected browser')
+      await ctx.parallel('connection/history-authorization-ended', { generation })
+      first.release()
+      connection.reconnect()
+      await mock.streams.opened('$events', 2)
+      await vi.waitFor(() => { expect(connection.generation.getSnapshot()?.id).toBe(generation + 1) })
+      await emit(mock, 'api-session/history-owner', OWNER)
+    } else first.release()
+
+    opening = { cursor: 1_799, records: structuredClone([...records.slice(200), ...middle.records, ...tail]), hasMore: true }
+    using wider = ctx.sessions.retain(A, { source: 'gateway' })
+    const source = wider.binding.eventSource
+    const cached = source.getSnapshot()
+    expect(wider.binding.session.getSnapshot().historyAvailability).toBe('cached')
+    expect(cached.hasMore).toBe(true)
+    expect(cached.entries.map(entry => entry.event.seq)).toEqual(complete.entries.slice(expectedStart).map(entry => entry.event.seq))
+    expect(cached.entries[0]).toBe(complete.entries[expectedStart])
+    const published = vi.fn()
+    const off = source.subscribe(published)
+    try {
+      await wider.ready
+      expect(requests.at(-1)?.historyWindowStart).toBe(expectedStart)
+      expect(published).toHaveBeenCalledOnce()
+      expect(source.getSnapshot().change.kind).toBe('replace')
+      expect(source.getSnapshot().entries[expectedStart - 200]).toBe(cached.entries[0])
+      expect(wider.binding.session.readingPosition?.('chat')?.read()).toEqual({ seq: 100, offset: 8 })
+    } finally {
+      off()
+    }
+    wider.release()
+
+    opening = page(500, 1_799)
+    using narrower = ctx.sessions.retain(A, { source: 'gateway' })
+    const cachedOverlap = narrower.binding.eventSource.getSnapshot().entries.find(entry => entry.event.seq === 500)
+    expect(cachedOverlap).toBeDefined()
+    await narrower.ready
+    expect(narrower.binding.eventSource.getSnapshot().change.kind).toBe('replace')
+    expect(narrower.binding.eventSource.getSnapshot().entries[0]).toBe(cachedOverlap)
+    mock.remote.session.page.mockResolvedValueOnce(ok({ ...page(0, 499), cursor: 1_799 }))
+    await narrower.binding.session.loadOlder()
+    expect(mock.remote.session.page).toHaveBeenLastCalledWith(expect.objectContaining({
+      beforeSeq: 500, throughSeq: 1_799, verifiedHistoryWindow: true,
+    }))
+  })
+}
+
+it('retains an entire 1,500-record window with a nonzero head even when its first record is inside a Turn', async ({ mock, start }) => {
+  catalog(mock, A)
+  const latest = page(1_000, 1_799)
+  const older = page(300, 999)
+  const records = older.records.map(entry => ({ ...entry, event: { ...entry.event, type: 'turn/end' } }))
+  let opening = latest
+  mock.stream(FOLLOW, ([request], stream) => { stream.push(followSnapshot(opening, followRequest(request))) })
+  mock.remote.session.page.mockResolvedValueOnce(ok({ ...older, records, cursor: latest.cursor }))
+  const { ctx } = await start()
+  await ctx.sessions.refresh()
+  await emit(mock, 'api-session/history-owner', OWNER)
+  using first = ctx.sessions.retain(A, { source: 'gateway' })
+  await first.ready
+  await first.binding.session.loadOlder()
+  const before = first.binding.eventSource.getSnapshot()
+  expect(before.entries).toHaveLength(1_500)
+  first.release()
+  opening = { ...latest, records: [...records, ...latest.records] }
+  using next = ctx.sessions.retain(A, { source: 'gateway' })
+  const cached = next.binding.eventSource.getSnapshot()
+  expect(next.binding.session.getSnapshot().historyAvailability).toBe('cached')
+  expect(cached.hasMore).toBe(true)
+  expect(cached.entries).toHaveLength(1_500)
+  expect(cached.entries[0]).toBe(before.entries[0])
+  await next.ready
+  expect(next.binding.eventSource.getSnapshot()).toBe(cached)
+})
+
+it('accepts a disjoint authoritative baseline at the old projection watermark', async ({ mock, start }) => {
+  catalog(mock, A)
+  let opening = page(2, 4)
+  let title = 'before'
+  mock.stream(FOLLOW, ([request], stream) => {
+    stream.push(followSnapshot({ ...opening, projections: { asOfSeq: opening.cursor, values: { title } } }, followRequest(request)))
+  })
+  const { ctx } = await start()
+  await ctx.sessions.refresh()
+  await emit(mock, 'api-session/history-owner', OWNER)
+  using first = ctx.sessions.retain(A, { source: 'gateway' })
+  await first.ready
+  mock.streams.push('session/control', { type: 'projection', sessionId: A, seq: 9, changes: [{ key: 'title', val: 'old watermark' }] })
+  await mock.streams.drained('session/control')
+  expect(first.binding.session.projections.faceOf('title').getSnapshot()).toBe('old watermark')
+  first.binding.session.readingPosition?.('chat')?.write({ seq: 3 })
+  const epoch = first.binding.session.getSnapshot().historyEpoch
+  opening = page(7, 9)
+  title = 'authoritative title'
+  mock.streams.fail(FOLLOW, new RemoteStreamCarrierError('reconnect without overlap'))
+  await vi.waitFor(() => {
+    expect(first.binding.eventSource.getSnapshot().entries.map(entry => entry.event.seq)).toEqual([7, 8, 9])
+    expect(first.binding.session.projections.faceOf('title').getSnapshot()).toBe('authoritative title')
+  })
+  expect(first.binding.eventSource.getSnapshot().change.kind).toBe('replace')
+  expect(first.binding.session.getSnapshot().historyEpoch).toBe(epoch)
+  expect(first.binding.session.readingPosition?.('chat')?.read()).toEqual({ seq: 3 })
+  await mock.streams.opened('session/control', 2)
+})
+
 it('sends offline suffix as history, keeps live appends separate, and rewinds the same physical journal with fresh projection watermarks', async ({ mock, start }) => {
   catalog(mock, A)
   let opening = page(0, 1)
@@ -136,16 +275,29 @@ it('sends offline suffix as history, keeps live appends separate, and rewinds th
   mock.streams.push('session/control', { type: 'projection', sessionId: A, seq: 99, changes: [{ key: 'title', val: 'stale watermark' }] })
   await vi.waitFor(() => { expect(session.projections.faceOf('title').getSnapshot()).toBe('stale watermark') })
 
-  opening = { ...page(0, 1), records: [record(0), record(1, 'different branch')] }
-  title = 'after rewind'
+  const beforeBranch = eventSource.getSnapshot().entries
+  opening = { ...page(0, 3), records: [record(0), record(1, 'different branch'), record(2), record(3)] }
+  title = 'after same-tail branch'
   mock.streams.fail(FOLLOW, new RemoteStreamCarrierError('reconnect changed journal'))
+  await vi.waitFor(() => {
+    expect(session.projections.faceOf('title').getSnapshot()).toBe('after same-tail branch')
+    expect(eventSource.getSnapshot().entries.map(item => item.event.seq)).toEqual([0, 1, 2, 3])
+    expect(eventSource.getSnapshot().entries[1]).not.toBe(beforeBranch[1])
+  })
+  expect(eventSource.getSnapshot().change.kind).toBe('replace')
+  expect(eventSource.getSnapshot().entries[0]).toBe(prefix)
+  await mock.streams.opened('session/control', 2)
+
+  opening = { ...page(0, 1), records: opening.records.slice(0, 2) }
+  title = 'after rewind'
+  mock.streams.fail(FOLLOW, new RemoteStreamCarrierError('reconnect rewound journal'))
   await vi.waitFor(() => {
     expect(session.projections.faceOf('title').getSnapshot()).toBe('after rewind')
     expect(eventSource.getSnapshot().entries.map(item => item.event.seq)).toEqual([0, 1])
   })
   expect(eventSource.getSnapshot().change.kind).toBe('replace')
   expect(eventSource.getSnapshot().entries[0]).toBe(prefix)
-  await mock.streams.opened('session/control', 2)
+  await mock.streams.opened('session/control', 3)
   mock.streams.push(FOLLOW, record(2))
   await vi.waitFor(() => { expect(eventSource.getSnapshot().entries.map(item => item.event.seq)).toEqual([0, 1, 2]) })
 
@@ -446,6 +598,36 @@ it('uses ordinary follow after an authenticated reconnect gives no verified rout
   expect(requests.at(-1)?.historyWindowStart).toBeUndefined()
 })
 
+
+it('suspends confirmation for ordinary follow during a carrier retry', async ({ mock, start }) => {
+  catalog(mock, A)
+  const next = Promise.withResolvers<undefined>()
+  let follows = 0
+  mock.stream(FOLLOW, async ([value], stream) => {
+    if (++follows > 1) await next.promise
+    const request = followRequest(value)
+    expect(request.verifiedHistoryWindow).toBeUndefined()
+    stream.push(followSnapshot(page(2, 4), request))
+  })
+  const { ctx } = await start()
+  await ctx.sessions.refresh()
+  using ref = ctx.sessions.retain(A, { source: 'gateway' })
+  await ref.ready
+  const { session, eventSource } = ref.binding
+  const previous = eventSource.getSnapshot()
+  expect(session.getSnapshot()).toMatchObject({ openState: 'open', historyAvailability: 'confirmed' })
+  mock.streams.fail(FOLLOW, new RemoteStreamCarrierError('ordinary follow lost its carrier'))
+  try {
+    await mock.streams.opened(FOLLOW, 2)
+    await vi.waitFor(() => { expect(session.getSnapshot().historyAvailability).toBe('cached') })
+    expect(eventSource.getSnapshot()).toBe(previous)
+    await session.loadOlder()
+    expect(mock.remote.session.page).not.toHaveBeenCalled()
+  } finally {
+    next.resolve(undefined)
+  }
+  await vi.waitFor(() => { expect(session.getSnapshot().historyAvailability).toBe('confirmed') })
+})
 
 it('discards a deferred older page as soon as Assistant requests a fresh opening', async ({ mock, start }) => {
   catalog(mock, A)

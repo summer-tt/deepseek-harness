@@ -761,15 +761,29 @@ export class Session implements SessionFace {
   }
 
   /**
-   * Snapshot an accepted journal synchronously before the Manager releases this binding.
-   * @returns current grant and durable window, or undefined while a seed awaits validation.
+   * Snapshot up to the cache's record limit before release or local authorization freeze.
+   * @returns the accepted durable suffix and whether it lost records, or undefined without confirmed history.
    */
-  releasedHistory(): { grant: HistoryAuthorization; window: DurableHistoryWindow | undefined } | undefined {
+  releasedHistory(): { grant: HistoryAuthorization; window: DurableHistoryWindow; truncated: boolean } | undefined {
     if (!this.historyConfirmed || this.historyGrant === undefined || this.historyHeader === undefined) return undefined
+    const entries: SessionLiveEventEntry[] = []
+    const appendReversed = (block: readonly SessionLiveEventEntry[]): void => {
+      for (let index = block.length - 1; index >= 0 && entries.length < MAX_HISTORY_CACHE_RECORDS; index -= 1) {
+        const entry = block[index]
+        if (entry === undefined) break
+        entries.push(entry)
+      }
+    }
+    appendReversed(this.durableEntries)
+    for (const page of this.consumedPages) {
+      if (entries.length === MAX_HISTORY_CACHE_RECORDS) break
+      appendReversed(page)
+    }
+    entries.reverse()
+    const truncated = entries[0] !== undefined && entries[0].event.seq > this.baseSeq
     return {
-      grant: this.historyGrant,
-      window: this.durableEntries.length + this.consumedPages.reduce((count, page) => count + page.length, 0) > MAX_HISTORY_CACHE_RECORDS
-        ? undefined : { header: this.historyHeader, entries: this.durableWindow(), hasMore: this.hasMore },
+      grant: this.historyGrant, truncated,
+      window: { header: this.historyHeader, entries, hasMore: this.hasMore || truncated },
     }
   }
 
@@ -989,8 +1003,8 @@ export class Session implements SessionFace {
     const before = this.eventSource.getSnapshot()
     const reconciled = page.authority && this.historyHeader !== undefined && page.header !== undefined
       ? reconcileHistory(prior, this.historyHeader, entries, page.header)
-      : { entries, branched: false, shared: 0 }
-    if (reconciled.branched) {
+      : { entries, continuity: 'shared', sharedPrefix: 0 }
+    if (reconciled.continuity !== 'shared') {
       if (this.options.history !== undefined) this.options.history.resetProjections()
       else this.projections.clear()
     }
@@ -1011,8 +1025,8 @@ export class Session implements SessionFace {
     if (projections !== undefined) this.projections.seed(projections)
     const priorVisibleIsDurable = before.entries.length === prior.length
       && before.entries.every((entry, index) => entry === prior[index])
-    if (page.authority && !reconciled.branched && priorVisibleIsDurable
-      && visible.length === entries.length && before.hasMore === hasMore && reconciled.shared === prior.length) {
+    if (page.authority && reconciled.continuity === 'shared' && priorVisibleIsDurable
+      && visible.length === entries.length && before.hasMore === hasMore && reconciled.sharedPrefix === prior.length) {
       if (entries.length > prior.length) this.eventSource.appendHistory(reconciled.entries.slice(prior.length))
     } else this.eventSource.replace(visible, hasMore)
     // A new follow baseline replaces confirmed optimistic inputs with Host-owned rows.
@@ -1035,7 +1049,7 @@ export class Session implements SessionFace {
   }
 
   private pauseHistoryPagination(): void {
-    if (this.historyGrant !== undefined && this.historyAvailability === 'confirmed') this.historyAvailability = 'cached'
+    if (this.historyAvailability === 'confirmed') this.historyAvailability = 'cached'
     this.clearOlderHistory()
   }
 
@@ -1304,23 +1318,27 @@ function reconcileHistory(
   priorHeader: SessionWireHeader,
   next: readonly SessionLiveEventEntry[],
   header: SessionWireHeader,
-): { entries: readonly SessionLiveEventEntry[]; branched: boolean; shared: number } {
-  if (!sameHistoryValue(priorHeader, header)) return { entries: next, branched: true, shared: 0 }
+): { entries: readonly SessionLiveEventEntry[]; continuity: 'shared' | 'branched' | 'unknown'; sharedPrefix: number } {
+  if (!sameHistoryValue(priorHeader, header)) return { entries: next, continuity: 'branched', sharedPrefix: 0 }
   const priorStart = prior[0]?.event.seq ?? 0
   const nextStart = next[0]?.event.seq ?? 0
   const commonStart = Math.max(priorStart, nextStart)
   const priorEnd = prior.at(-1)?.event.seq ?? -1
   const nextEnd = next.at(-1)?.event.seq ?? -1
+  const commonEnd = Math.min(priorEnd, nextEnd)
+  if (prior.length > 0 && next.length > 0 && commonStart > commonEnd) {
+    return { entries: next, continuity: 'unknown', sharedPrefix: 0 }
+  }
   let shared = 0
-  for (let seq = commonStart; seq <= Math.min(priorEnd, nextEnd); seq += 1) {
+  for (let seq = commonStart; seq <= commonEnd; seq += 1) {
     if (!sameHistoryValue(prior[seq - priorStart], next[seq - nextStart])) {
-      return { entries: withSharedPrefix(), branched: true, shared: 0 }
+      return { entries: withSharedPrefix(), continuity: 'branched', sharedPrefix: 0 }
     }
     shared += 1
   }
   return {
-    entries: withSharedPrefix(), branched: priorEnd > nextEnd,
-    shared: priorStart === nextStart ? shared : 0,
+    entries: withSharedPrefix(), continuity: priorEnd > nextEnd ? 'branched' : 'shared',
+    sharedPrefix: priorStart === nextStart ? shared : 0,
   }
 
   function withSharedPrefix(): readonly SessionLiveEventEntry[] {

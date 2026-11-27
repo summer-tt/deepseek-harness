@@ -217,7 +217,7 @@ export class SessionManager {
     if (session !== expected) return Promise.resolve()
     session.flushReadingPositions()
     const released = session.releasedHistory()
-    if (released !== undefined) this.history.retain(session.historyAddress(), released.grant, released.window)
+    if (released !== undefined) this.history.retain(session.historyAddress(), released.grant, released.window, released.truncated)
     this.sessions.delete(sessionId)
     this.addresses.delete(sessionId)
     this.pruneEngagement(sessionId, this.retainedIds(this.summaries))
@@ -837,7 +837,7 @@ export class SessionManager {
     for (const session of this.sessions.values()) {
       const released = session.releasedHistory()
       if (released !== undefined && released.grant.route === undefined) {
-        this.history.retain(session.historyAddress(), released.grant, released.window)
+        this.history.retain(session.historyAddress(), released.grant, released.window, released.truncated)
       }
     }
   }
