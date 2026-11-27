@@ -81,6 +81,7 @@ class FixtureJournal extends RemoteJournalStream<Page, Entry, number, PageReques
     changes: RemoteJournalChange<Page, Entry, string>[],
     failed: (error: unknown) => void,
     factory: RemoteStreamFactory = STREAM_FACTORY,
+    allowRewind?: (page: Page) => boolean,
   ) {
     super(factory, {
       name: 'fixture journal',
@@ -92,6 +93,7 @@ class FixtureJournal extends RemoteJournalStream<Page, Entry, number, PageReques
       compare: (left, right) => left - right,
       follows: (left, right) => right === left + 1,
       publish: (change) => { changes.push(change) },
+      ...(allowRewind === undefined ? {} : { allowRewind }),
       failed,
     })
   }
@@ -142,6 +144,7 @@ function journalFixture(
   generations: Generation[],
   pages: PageSource[],
   factory: RemoteStreamFactory = STREAM_FACTORY,
+  allowRewind?: (page: Page) => boolean,
 ): {
   readonly journal: RemoteJournalStream<Page, Entry, number, PageRequest, string>
   readonly changes: RemoteJournalChange<Page, Entry, string>[]
@@ -167,6 +170,7 @@ function journalFixture(
     changes,
     failed,
     factory,
+    allowRewind,
   )
   return { journal, changes, failed, calls, pageRequests, pageCursors, followRequests }
 }
@@ -1086,6 +1090,81 @@ describe('RemoteJournalStream', () => {
     expect(regressedFailure).toBeInstanceOf(Error)
     if (!(regressedFailure instanceof Error)) throw new Error('expected regressed-cursor failure')
     expect(regressedFailure.message).toContain('behind the last applied entry')
+  })
+
+  it('allows a verified rewind and discards an older page from the previous generation', async () => {
+    const stalePage = Promise.withResolvers<Page>()
+    let pageSignal: AbortSignal | undefined
+    const fixture = journalFixture(
+      [
+        { frames: [opened(4, page('initial', [3, 4], true))], hold: true },
+        { frames: [opened(3, page('verified', [3], true)), { type: 'entry', entry: { seq: 4 } }], hold: true },
+      ],
+      [(signal) => { pageSignal = signal; return stalePage.promise }, page('current', [0, 1, 2])],
+      STREAM_FACTORY,
+      opening => opening.marker === 'verified',
+    )
+    await fixture.journal.open({})
+    const pending = fixture.journal.prepend({ before: 3 })
+    fixture.journal.restart()
+    await vi.waitFor(() => { expect(fixture.changes.map(change => change.type)).toEqual(['replace', 'replace', 'append']) })
+    expect(pageSignal?.aborted).toBe(true)
+    stalePage.resolve(page('stale', [1, 2], true))
+    await pending
+    expect(fixture.changes).toHaveLength(3)
+    await fixture.journal.prepend({ before: 3 })
+    expect(fixture.changes.at(-1)).toEqual({
+      type: 'prepend', page: page('current', [0, 1, 2]), entries: entries(0, 1, 2), hasMore: false,
+    })
+    expect(fixture.failed).not.toHaveBeenCalled()
+    await fixture.journal.dispose()
+  })
+
+  it.each(['success', 'failure'])('drops stale repair %s between promise continuations', async (outcome) => {
+    const started = Promise.withResolvers<undefined>()
+    const repair = Promise.withResolvers<Page>()
+    const fixture = journalFixture(
+      [
+        { frames: [opened(0, page('initial', [0])), { type: 'entry', entry: { seq: 2 } }], hold: true },
+        { frames: [opened(3, page('current', [0, 1, 2, 3]))], hold: true },
+      ],
+      [() => { started.resolve(undefined); return repair.promise }],
+    )
+    await fixture.journal.open({})
+    await started.promise
+    if (outcome === 'success') repair.resolve(page('obsolete', [0, 1, 2]))
+    else repair.reject(new Error('obsolete repair request failed'))
+    // Allow promise adoption and racing to settle before the journal commits.
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    fixture.journal.restart()
+    await vi.waitFor(() => {
+      expect(fixture.changes).toEqual([
+        { type: 'replace', page: page('initial', [0]), entries: entries(0), hasMore: false },
+        { type: 'replace', page: page('current', [0, 1, 2, 3]), entries: entries(0, 1, 2, 3), hasMore: false },
+      ])
+    })
+    expect(fixture.failed).not.toHaveBeenCalled()
+    await fixture.journal.dispose()
+  })
+
+  it('ignores an in-flight older page after a same-generation gap repair', async () => {
+    const live = Promise.withResolvers<ScriptedFrame>()
+    const stalePage = Promise.withResolvers<Page>()
+    const fixture = journalFixture(
+      [{ frames: [opened(4, page('initial', [3, 4], true)), live.promise], hold: true }],
+      [() => stalePage.promise, page('repair', [3, 4, 5, 6], true)],
+    )
+    await fixture.journal.open({})
+    const pending = fixture.journal.prepend({ before: 3 })
+    live.resolve({ type: 'entry', entry: { seq: 6 } })
+    await vi.waitFor(() => { expect(fixture.changes.map(change => change.type)).toEqual(['replace', 'replace']) })
+    stalePage.resolve(page('stale', [0, 1, 2]))
+    await pending
+    expect(fixture.changes).toHaveLength(2)
+    expect(fixture.failed).not.toHaveBeenCalled()
+    await fixture.journal.dispose()
   })
 
   it('rejects a discontinuous older page after publishing the fail-soft pagination state', async () => {

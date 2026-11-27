@@ -76,6 +76,8 @@ export interface RemoteJournalStreamOptions<Page, Entry, Cursor, Notification = 
   readonly publish: (change: RemoteJournalChange<Page, Entry, Notification>) => void
   /** Observe a retryable carrier loss before reconnection. */
   readonly carrierFailed?: (error: RemoteStreamCarrierError) => void
+  /** Permit an authoritative opening page to replace a later cursor from an earlier generation. */
+  readonly allowRewind?: (page: Page) => boolean
   /** Publish a terminal stream, page, or protocol failure after opening. */
   readonly failed: (error: unknown) => void
 }
@@ -95,6 +97,8 @@ export abstract class RemoteJournalStream<
   private resumeCursor: Cursor | undefined
   private hasResumeCursor = false
   private generation = 0
+  private generationSignal: AbortSignal | undefined
+  private windowRevision = 0
   private firstCursor: Cursor | undefined
   private lastCursor: Cursor | undefined
   private started = false
@@ -120,9 +124,11 @@ export abstract class RemoteJournalStream<
         : protocolViolation(
           `${this.hasResumeCursor ? 'resumed ' : ''}${options.name} ended before its opening cursor`,
         ),
-      ...(options.carrierFailed === undefined
-        ? {}
-        : { carrierFailed: options.carrierFailed }),
+      carrierFailed: (error) => {
+        this.windowRevision++
+        this.generationSignal = undefined
+        options.carrierFailed?.(error)
+      },
     })
   }
 
@@ -169,9 +175,13 @@ export abstract class RemoteJournalStream<
     this.initialRequest = request
     const iterator = this.stream[Symbol.asyncIterator]()
     try {
-      const first = await this.takeNext(iterator)
-      if (first.done) throw protocolViolation(`${this.options.name} ended before its opening cursor`)
-      this.replaceGeneration(first.value, false)
+      while (true) {
+        const first = await this.takeNext(iterator)
+        if (first.done) throw protocolViolation(`${this.options.name} ended before its opening cursor`)
+        if (first.value.signal.aborted) continue
+        this.replaceGeneration(first.value, false)
+        break
+      }
       this.opened = true
       this.done = this.consume(iterator)
     } catch (error) {
@@ -187,8 +197,18 @@ export abstract class RemoteJournalStream<
    */
   async prepend(request: PageRequest): Promise<void> {
     if (!this.opened || this.disposed) throw new Error(`${this.options.name} is not open`)
-    const page = await this.readPage(request, this.currentCursor(), this.stream.signal)
-    this.stream.signal.throwIfAborted()
+    const signal = this.generationSignal
+    if (signal === undefined || signal.aborted) return
+    const windowRevision = this.windowRevision
+    const stale = (): boolean => signal.aborted || this.windowRevision !== windowRevision
+    let page: Page
+    try {
+      page = await this.readPage(request, this.currentCursor(), signal)
+    } catch (error) {
+      if (stale()) return
+      throw error
+    }
+    if (stale()) return
     const entries = this.options.entries(page)
     this.assertPage(entries)
     const before = this.firstCursor
@@ -240,6 +260,7 @@ export abstract class RemoteJournalStream<
         const next = await this.takeNext(iterator)
         if (next.done) return
         const item = next.value
+        if (item.signal.aborted) continue
         if (item.generation !== this.generation) {
           this.replaceGeneration(item, true)
           continue
@@ -263,7 +284,13 @@ export abstract class RemoteJournalStream<
     resumed: boolean,
   ): void {
     const opening = this.opening(initial, resumed)
-    this.replaceFromOpening(opening.page, opening.cursor)
+    this.assertPageThrough(opening.page, opening.cursor)
+    const entries = [...this.options.entries(opening.page)]
+    this.assertPage(entries)
+    this.generation = initial.generation
+    this.generationSignal = initial.signal
+    initial.accept()
+    this.replaceFromOpening(opening.page, opening.cursor, entries)
   }
 
   private opening(
@@ -275,22 +302,19 @@ export abstract class RemoteJournalStream<
     }
     const cursor = item.value.cursor
     if (resumed && this.lastCursor !== undefined
-      && this.options.compare(cursor, this.lastCursor) < 0) {
+      && this.options.compare(cursor, this.lastCursor) < 0
+      && this.options.allowRewind?.(item.value.page) !== true) {
       throw protocolViolation(
         `${this.options.name} resumed at a cursor behind the last applied entry`,
       )
     }
-    this.generation = item.generation
-    item.accept()
     return { cursor, page: item.value.page }
   }
 
-  /** Publish a generation's opening page without issuing a second Remote call. */
-  private replaceFromOpening(page: Page, cursor: Cursor): void {
-    this.assertPageThrough(page, cursor)
-    const entries = [...this.options.entries(page)]
-    this.assertPage(entries)
+  /** Publish a generation's validated opening page without issuing a second Remote call. */
+  private replaceFromOpening(page: Page, cursor: Cursor, entries: readonly Entry[]): void {
     const first = entries[0]
+    this.windowRevision++
     this.firstCursor = first === undefined ? undefined : this.options.first(first)
     this.lastCursor = cursor
     this.setResumeCursor(cursor)
@@ -324,7 +348,7 @@ export abstract class RemoteJournalStream<
         [entry],
         [],
       )
-      if (superseded !== undefined) {
+      if (superseded !== undefined && !superseded.signal.aborted) {
         this.replaceGeneration(superseded, true)
       }
       return
@@ -344,6 +368,7 @@ export abstract class RemoteJournalStream<
     queued: Entry[],
     notifications: Notification[],
   ): Promise<JournalStreamItem<Page, Entry, Cursor, Notification> | undefined> {
+    const cancelled = (): boolean => signal.aborted || this.generationSignal !== signal
     let read = await this.readPageWhileFollowing(
       request,
       requiredCursor,
@@ -354,6 +379,8 @@ export abstract class RemoteJournalStream<
       notifications,
     )
     if (read.type === 'superseded') return read.item
+    if (cancelled()) return undefined
+    if (read.type === 'page-error') throw read.error
     let page = read.page
     this.assertPageThrough(page, requiredCursor)
     let entries = this.mergeReplacement(page, queued)
@@ -369,6 +396,8 @@ export abstract class RemoteJournalStream<
         notifications,
       )
       if (read.type === 'superseded') return read.item
+      if (cancelled()) return undefined
+      if (read.type === 'page-error') throw read.error
       page = read.page
       this.assertPageThrough(page, target)
       entries = this.mergeReplacement(page, queued)
@@ -378,6 +407,7 @@ export abstract class RemoteJournalStream<
       throw protocolViolation(`${this.options.name} page did not reach its opening cursor`)
     }
     const first = entries[0]
+    this.windowRevision++
     /* v8 ignore next -- a successful positive-cursor replacement page cannot be empty. */
     this.firstCursor = first === undefined ? undefined : this.options.first(first)
     this.lastCursor = this.tailCursor(entries)
@@ -389,6 +419,7 @@ export abstract class RemoteJournalStream<
       hasMore: this.options.hasMore(page),
     })
     for (const notification of notifications) {
+      if (cancelled()) break
       this.publishNotification(notification)
     }
     return undefined
@@ -404,6 +435,7 @@ export abstract class RemoteJournalStream<
     notifications: Notification[],
   ): Promise<
     | { readonly type: 'page'; readonly page: Page }
+    | { readonly type: 'page-error'; readonly error: unknown }
     | { readonly type: 'superseded'; readonly item: JournalStreamItem<Page, Entry, Cursor, Notification> }
   > {
     const page = this.readPage(request, through, signal).then(
@@ -418,11 +450,12 @@ export abstract class RemoteJournalStream<
       )
       const result = await Promise.race([page, next])
       if (result.type === 'page') {
-        signal.throwIfAborted()
+        this.stream.signal.throwIfAborted()
+        if (signal.aborted) return this.awaitReplacementGeneration(generation, iterator, pending)
         return { type: 'page', page: result.value }
       }
       if (result.type === 'page-error') {
-        if (!signal.aborted || this.stream.signal.aborted) throw result.error
+        if (!signal.aborted || this.stream.signal.aborted) return result
         return this.awaitReplacementGeneration(generation, iterator, pending)
       }
       this.releaseNext()
@@ -432,6 +465,7 @@ export abstract class RemoteJournalStream<
         throw protocolViolation(`${this.options.name} ended while reading its replacement page`)
       }
       const item = result.value.value
+      if (item.signal.aborted) continue
       if (item.generation !== generation) return { type: 'superseded', item }
       if (item.value.type === 'opened') {
         throw protocolViolation(`${this.options.name} emitted more than one opening cursor`)
@@ -462,8 +496,9 @@ export abstract class RemoteJournalStream<
         throw protocolViolation(`${this.options.name} ended while replacing an aborted page generation`)
       }
       const item = next.value
-      if (item.generation !== generation) return { type: 'superseded', item }
-      if (item.value.type === 'opened') {
+      if (item.generation !== generation) {
+        if (!item.signal.aborted) return { type: 'superseded', item }
+      } else if (item.value.type === 'opened') {
         throw protocolViolation(`${this.options.name} emitted more than one opening cursor`)
       }
       pending = this.nextResult(iterator)

@@ -146,6 +146,7 @@ interface FakeStreamOptions {
 /** One controllable generation of `remoteAccess/follow`, standing in for the Gateway-owned carrier. */
 class FakeAccessStream {
   private readonly frames: RemoteAccessFrame[] = []
+  private readonly generation = new AbortController()
   private wake: (() => void) | undefined
   private done = false
   private failure: Error | undefined
@@ -166,19 +167,21 @@ class FakeAccessStream {
 
   async dispose(): Promise<void> {
     this.done = true
+    this.generation.abort()
     this.wake?.()
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<{
     readonly generation: number
     readonly value: RemoteAccessFrame
+    readonly signal: AbortSignal
     readonly accept: () => void
   }> {
     while (!this.done) {
       if (this.failure !== undefined) throw this.failure
       const frame = this.frames.shift()
       if (frame !== undefined) {
-        yield { generation: 1, value: frame, accept: () => {} }
+        yield { generation: 1, value: frame, signal: this.generation.signal, accept: () => {} }
         continue
       }
       await new Promise<void>((resolve) => { this.wake = resolve })

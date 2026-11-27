@@ -69,6 +69,7 @@ export class RemoteSnapshotStream<Snapshot, Delta> {
     let snapshotSeen = false
     try {
       for await (const item of this.stream) {
+        if (item.signal.aborted) continue
         if (item.generation !== generation) {
           generation = item.generation
           snapshotSeen = false
