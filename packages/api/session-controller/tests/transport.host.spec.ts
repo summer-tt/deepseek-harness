@@ -127,6 +127,98 @@ describe('Session history and Web follow', () => {
     expect(await iterator.next()).toMatchObject({ done: true })
   })
 
+  it('expands an opening from the same observation and uses the current log for a reused address', async () => {
+    const { ctx, web } = await setup()
+    const sessionId = SessionId('expanded-follow')
+    const address = { kind: 'session' as const, sessionId }
+    const session = ctx.sessions.prepare(sessionId, { meta: { cwd: '/workspace' } })
+    const detach = ctx.sessions.enter(session)
+    ctx.sessions.announce(session)
+    append(session, 'fixture/old', {})
+    append(session, 'fixture/retained', {})
+    append(session, 'user/message', { content: [], source: { kind: 'user' } }, { surfaceOp: 'append' })
+    const observe = vi.spyOn(ctx.sessionQuery, 'observeSession')
+    const request = { address, maxMessages: 1, verifiedHistoryWindow: true } as const
+    async function opening(historyWindowStart?: number) {
+      const spec = historyWindowStart === undefined ? request : { ...request, historyWindowStart }
+      const frames = web.follow(spec, signal())[Symbol.asyncIterator]()
+      try {
+        const frame = await frames.next()
+        if (frame.done || frame.value.type !== 'snapshot') throw new Error('expected an opening snapshot')
+        const { value } = frame
+        return value
+      } finally {
+        await frames.return?.()
+      }
+    }
+
+    expect((await opening()).records.map(record => record.event.seq)).toEqual([2])
+    observe.mockClear()
+    expect(await opening(1)).toMatchObject({ cursor: 2, hasMore: true, records: [
+      { event: { type: 'fixture/retained', seq: 1 } }, { event: { type: 'user/message', seq: 2 } },
+    ] })
+    expect(observe).toHaveBeenCalledOnce()
+    expect(await opening(0)).toMatchObject({ cursor: 2, hasMore: false })
+    expect(await opening(100)).toEqual(await opening())
+
+    detach()
+    const replacement = ctx.sessions.create(sessionId, { meta: { cwd: '/workspace' } })
+    append(replacement, 'fixture/replaced', {})
+    expect(await opening(1)).toMatchObject({ cursor: 0, hasMore: false, records: [
+      { event: { type: 'fixture/replaced', seq: 0 } },
+    ] })
+  })
+
+  it('admits 1500 expanded records and keeps the default page when one more is required', async () => {
+    const { ctx, web } = await setup()
+    const session = ctx.sessions.create(SessionId('count-limited-follow'), { meta: { cwd: '/workspace' } })
+    for (let i = 0; i < 1500; i++) append(session, 'fixture/record', {})
+    append(session, 'user/message', { content: [], source: { kind: 'user' } }, { surfaceOp: 'append' })
+    const address = { kind: 'session' as const, sessionId: session.id }
+    for (const [historyWindowStart, count] of [[1, 1500], [0, 1]] as const) {
+      const frames = web.follow({ address, maxMessages: 1, historyWindowStart }, signal())[Symbol.asyncIterator]()
+      try {
+        const frame = await frames.next()
+        if (frame.done || frame.value.type !== 'snapshot') throw new Error('expected an opening snapshot')
+        const { value } = frame
+        expect(value).toMatchObject({ cursor: 1500, hasMore: true })
+        expect(value.records).toHaveLength(count)
+      } finally {
+        await frames.return?.()
+      }
+    }
+  })
+
+  it.each([['界', 700_000], ['x', 2 * 1024 * 1024]] as const)(
+    'retains a default page when a %s record exceeds the UTF-8 budget',
+    async (character, length) => {
+      const { ctx, web } = await setup()
+      const session = ctx.sessions.create(SessionId('byte-limited-follow'), { meta: { cwd: '/workspace' } })
+      append(session, 'fixture/large', { text: character.repeat(length) })
+      append(session, 'user/message', { content: [], source: { kind: 'user' } }, { surfaceOp: 'append' })
+      const address = { kind: 'session' as const, sessionId: session.id }
+      const expanded = web.follow({ address, maxMessages: 1, historyWindowStart: 0 }, signal())[Symbol.asyncIterator]()
+      const ordinary = web.follow({ address, maxMessages: 2, historyWindowStart: 0 }, signal())[Symbol.asyncIterator]()
+      try {
+        const { value: limited } = await expanded.next()
+        expect(limited).toMatchObject({ cursor: 1, hasMore: true, records: [{ event: { seq: 1 } }] })
+        const frame = await ordinary.next()
+        if (frame.done || frame.value.type !== 'snapshot') throw new Error('expected an opening snapshot')
+        expect(frame.value.records.map(record => record.event.seq)).toEqual([0, 1])
+        expect(frame.value.hasMore).toBe(false)
+      } finally {
+        await expanded.return?.()
+        await ordinary.return?.()
+      }
+    },
+  )
+
+  it.each([-1, -0, 0.5, Number.MAX_SAFE_INTEGER + 1])('rejects an invalid historyWindowStart %s', async (historyWindowStart) => {
+    const { web } = await setup()
+    const frames = web.follow({ address: { kind: 'session', sessionId: SessionId('not-read') }, historyWindowStart }, signal())
+    await expect(frames[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: 'gateway/bad-request' })
+  })
+
   it('ends active followers when the owning Controller unloads', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)

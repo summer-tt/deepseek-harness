@@ -29,9 +29,14 @@ export type RpcStreamOpen = (
  * Create the browser-backed generic RPC caller.
  * @param doFetch - transport override; defaults to the page's global fetch.
  * @param openStream - optional worker-local Gateway stream carrier.
+ * @param observeAuthentication - capture a rejection reporter for the dispatch generation.
  * @returns caller that owns request correlation and response-envelope validation.
  */
-export function createWebConnectionRpc(doFetch?: RpcFetch, openStream?: RpcStreamOpen): ClientConnectionRpc {
+export function createWebConnectionRpc(
+  doFetch?: RpcFetch,
+  openStream?: RpcStreamOpen,
+  observeAuthentication?: () => (status: 401 | 403) => void,
+): ClientConnectionRpc {
   const send: RpcFetch = doFetch ?? ((input, init) => globalThis.fetch(input, init))
   return {
     async call(channel, endpoint, payload, signal) {
@@ -46,6 +51,7 @@ export function createWebConnectionRpc(doFetch?: RpcFetch, openStream?: RpcStrea
       // The channel key is absolute; a page posts the document-relative form, and
       // a carrier that resolves against the Host root accepts the same form.
       const route = `${channel}/${endpoint}`.slice(1)
+      const reportAuthenticationRejection = observeAuthentication?.()
       const response = await send(
         route,
         {
@@ -55,6 +61,9 @@ export function createWebConnectionRpc(doFetch?: RpcFetch, openStream?: RpcStrea
           ...signal === undefined ? {} : { signal },
         },
       )
+      if (response.status === 401 || response.status === 403) {
+        reportAuthenticationRejection?.(response.status)
+      }
       if (!response.ok) {
         throw new Error(`transport failure for ${channel}/${endpoint}: HTTP ${response.status}`)
       }

@@ -26,6 +26,22 @@ declare module '@deepseek-ai/cordis' {
      * @mode emit
      */
     'connection/reset'(): void
+    /**
+     * The Gateway stopped receiving history authorization on this event stream.
+     * @mode parallel
+     * @param ended - Generation of the event stream, before pending listener cleanup completes.
+     */
+    'connection/history-authorization-ended'(ended: { readonly generation: number }): void
+    /**
+     * An HTTP RPC request was rejected by the carrier with 401 or 403.
+     * Consumers compare the request generation with their current authorization before clearing state.
+     * @mode parallel
+     * @param rejection - HTTP status and active generation at request dispatch, if established.
+     */
+    'connection/authentication-rejected'(rejection: {
+      readonly generation: number | undefined
+      readonly status: 401 | 403
+    }): void
   }
 }
 
@@ -230,11 +246,17 @@ export function installConnection(ctx: Context, options: ConnectionInstallOption
   const transport = options.transport
   const recovery = options.recovery ?? {}
   const interactions = options.interactions ?? (pageLocation === undefined ? 'none' : 'answer')
-  const rpc = transport?.rpc ?? createWebConnectionRpc(transport?.fetch, transport?.openStream)
   let generationSource: ConnectionGenerationSource | undefined
   let owner: ConnectionOwner | undefined
   let generationId = 0
   let generation: ConnectionGeneration | undefined
+  const rpc = transport?.rpc ?? createWebConnectionRpc(transport?.fetch, transport?.openStream, () => {
+    const requestGeneration = generation?.id
+    return (status) => {
+      void ctx.parallel('connection/authentication-rejected', { generation: requestGeneration, status })
+        .catch((error: unknown) => { console.error('[connection] authentication rejection listener threw:', error) })
+    }
+  })
   let state: ConnectionState | undefined
   const generationListeners = new Set<() => void>()
   const stateListeners = new Set<() => void>()

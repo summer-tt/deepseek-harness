@@ -1100,6 +1100,38 @@ describe('Typert Remote streams', () => {
     await once(socket, 'close')
   })
 
+  it('preserves the relay interception point for physical stream calls', () => {
+    const open: unknown = Reflect.get(TypertGatewayService.prototype, 'openWireStream')
+    expect(typeof open === 'function' && open.length).toBe(7)
+    expect(String(TypertGatewayService)).toContain(
+      'this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window)',
+    )
+  })
+
+  it('announces the same anonymous history owner on authenticated browser reconnect', async () => {
+    const { ctx } = await setup(true)
+    ctx.provide('sessionController', { supportsHistoryWindowStart: true })
+    ctx.typertGateway.registerRemoteEvents(async function* (signal) {
+      if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => { resolve() }, { once: true }))
+    }, REMOTE_HOST)
+
+    for (const streamId of ['first', 'reconnect']) {
+      const client = await openEventClient(ctx, streamId)
+      try {
+        await vi.waitFor(() => { expect(client.frames).toEqual([
+          { streamId, type: 'item', value: { type: 'ready', clientId: client.clientId, host: REMOTE_HOST } },
+          { streamId, type: 'item', value: { type: 'emit', event: 'api-session/history-owner', args: [
+            { ownerEpoch: ctx.connection.browserPeer.id, supportsHistoryWindowStart: true },
+          ] } },
+        ]) })
+      } finally {
+        const closed = once(client.socket, 'close')
+        client.socket.close()
+        await closed
+      }
+    }
+  })
+
   it('carries the registered Remote event source and withdraws its active stream', async () => {
     const { ctx } = await setup(true)
     let sourceSignal: AbortSignal | undefined

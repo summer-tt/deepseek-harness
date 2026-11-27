@@ -76,6 +76,8 @@ Fork 将 `atSeq` 选定的含边界事件前缀（包括开放轮次内的截点
 
 Client 的首次 `follow`、重连首屏与 `loadOlder()` 至少请求 50 条以 append 方式追加的 `user/message` 和 `assistant/message` 事件，并向前跨过至少两个 `turn/start`，其中包含已加载窗口开头尚未补齐的轮次。Host 在首次同时满足两个下限的轮次开头停止；若先达到 500 条计数消息或历史已耗尽，则立即返回。Steering 不增加轮次分界。区间内的其他事件随页返回，但不计入消息预算。分页和 follow 请求可选的 `turnWindow` 在 `maxMessages` 上限内指定这两个下限。`loadThrough()` 复用相同规则，仅将每页消息数下限设为 200；500 条上限不限制整次跳转。不带 `turnWindow` 的请求保留按消息对齐的分页方式。
 
+调用方确认 `ctx.sessionController.supportsHistoryWindowStart` 或通过载体收到等效能力通告后，可以给 `follow` 传入 `historyWindowStart`。Host 通过同一份 observation 读取普通开场和扩展窗口，起点为请求指定的非负安全整数序号。只有完整候选窗口含至多 1,500 条记录，且 `records` 数组的 JSON UTF-8 编码至多为 2 MiB，Host 才扩展窗口。起点较晚或候选窗口超限时，Host 返回普通开场。通过已鉴权 relay 发起权威读取时，`follow` 和 `page` 可以携带 `verifiedHistoryWindow` 和 `historyRouteEpoch`。relay 检查该 epoch，并在转发前移除它。
+
 队列编辑仅允许用非空文本替换待处理内容。
 
 `session.attachment` 接收 `{ sessionId, attachment: ImageAttachmentRef }`，并把完整引用交给 `AttachmentStore.readImage()`，不读取或遍历 Session 历史。Client 通过 `session.readAttachment(ref)` 传入消息中的引用。连接身份认证和 Gateway 权限检查仍然适用；`sessionId` 为该接口的权限检查指定 Session 资源。授权通过后，处理函数不检查该 Session 是否存在，也不会仅因其不存在而返回 `session/not-found`。获准调用的身份可以读取同一存储中的任意图片，包括仅被其他 Session 引用或未被任何 Session 引用的图片。响应在把 ID、媒体类型、字节数、宽度和高度与存储字节校验后，保留传入的引用。可选的 `name` 和 `originalDimensions` 作为调用方提交的显示信息原样返回，不根据文件校验。对象缺失或无效时返回明确的附件失败。Client 的历史图片缓存按 Session 和附件 ID 保留一份结果与浏览器 URL。

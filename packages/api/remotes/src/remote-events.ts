@@ -1,7 +1,7 @@
 /**
  * The one home of this application's forwarded-Host-event allowlist. Both
  * compiler faces list this file, so the Host forwarding loop and the consumer
- * `ctx.remote.$on` key face read one declaration instead of two copies that
+ * `ctx.remote.$on` broadcast keys read one declaration instead of two copies that
  * could drift; `./types.ts` derives the type projection from it and stays
  * type-only.
  */
@@ -17,8 +17,8 @@ import type { TypertForwardableEventEntry } from '@deepseek-ai/dsh-typert-protoc
 import type {} from '@deepseek-ai/dsh-web/types'
 
 /**
- * Host events this application forwards without renaming. The explicit mode is
- * both the Host dispatch strategy and the legal key set of `ctx.remote.$on`.
+ * Host events this application forwards without renaming. Each mode selects the
+ * Host dispatch strategy, and each entry adds a `ctx.remote.$on` subscription key.
  * An `emit` entry declares readers of the resources its payload carries, or
  * none to touch the built-in `global` resource; it reaches a non-owner Peer
  * only when access control allows it. Each notification names one resource

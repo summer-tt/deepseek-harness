@@ -26,6 +26,8 @@ import type {
   TypertRemoteNamespace,
 } from '@deepseek-ai/dsh-typert-protocol'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
+import type {} from '../../session-controller/src/remote-events.ts'
+import type {} from '../../session-controller/src/types.ts'
 import type { ClientRemote } from '../src/client/index.ts'
 import { apply, inject, isRemoteFailure, RemoteStream } from '../src/client/index.ts'
 import {
@@ -34,6 +36,7 @@ import {
   RemoteStreamMuxClient,
 } from '../src/client/stream-client.ts'
 import { parseRemoteStreamClientMessage } from '../src/stream-protocol.ts'
+import { ClientRemoteEvents } from '../src/client/remote-events.ts'
 
 type FixtureApprovalOutcome = 'allowed' | 'unavailable'
 const fixtureContextTag = Symbol('fixture-context-tag')
@@ -583,6 +586,74 @@ function approvalFrame(eventId: string, agentId: string, prompt: string): object
 }
 
 describe('Client Remote transport readiness', () => {
+  it('delivers history authority after publishing the matching real Connection generation', async () => {
+    const ctx = new Context()
+    installConnection(ctx)
+    const connection = ctx.get('connection') as ConnectionHandle
+    const seen: (number | undefined)[] = []
+    const ownerFrame = { type: 'emit', event: 'api-session/history-owner', args: [
+      { ownerEpoch: 'owner', supportsHistoryWindowStart: true },
+    ] }
+    const events = new ClientRemoteEvents(ctx, connection, async function* (_endpoint, _payload, signal) {
+      yield { type: 'ready', clientId: 'fixture-client', host: { home: '/home/fixture' } }
+      yield ownerFrame
+      if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => { resolve() }, { once: true }))
+    })
+    const off = events.subscribe(ctx, 'api-session/history-owner', () => { seen.push(connection.generation.getSnapshot()?.id) })
+    const loop = connection.start({})
+    try {
+      await vi.waitFor(() => { expect(seen).toEqual([1]) })
+      connection.reconnect()
+      await vi.waitFor(() => { expect(seen).toEqual([1, 2]) })
+    } finally {
+      loop.stop()
+      off()
+      await events.dispose()
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('ends history authorization before waiting for a cancelled waterfall handler', async () => {
+    const ctx = new Context()
+    await ctx.plugin(TypertRegistry)
+    installConnection(ctx)
+    const connection = ctx.get('connection') as ConnectionHandle
+    const carrier = new RemoteEventCarrier()
+    const events = new ClientRemoteEvents(ctx, connection,
+      (endpoint, payload, signal) => carrier.open('/api', endpoint, payload, signal))
+    ctx.typert.contexts.registerClient('agent', { identity: () => undefined, resolve: () => ctx })
+    const owner = Promise.withResolvers<undefined>()
+    const entered = Promise.withResolvers<AbortSignal>()
+    const release = Promise.withResolvers<undefined>()
+    const ended = vi.fn()
+    ctx.on('connection/history-authorization-ended', ended)
+    events.subscribe(ctx, 'api-session/history-owner', () => { owner.resolve(undefined) })
+    events.subscribe(ctx, 'fixture/approval', async (request) => {
+      entered.resolve(request.signal as AbortSignal)
+      await release.promise
+      return 'allowed'
+    })
+    const loop = connection.start({})
+    try {
+      await vi.waitFor(() => { expect(connection.generation.getSnapshot()?.id).toBe(1) })
+      carrier.emit({ type: 'emit', event: 'api-session/history-owner', args: [
+        { ownerEpoch: 'owner', supportsHistoryWindowStart: true },
+      ] })
+      await owner.promise
+      carrier.emit(approvalFrame('held', 'agent-held', 'wait'))
+      const handlerSignal = await entered.promise
+      carrier.end()
+      await vi.waitFor(() => { expect(handlerSignal.aborted).toBe(true) })
+      expect(ended.mock.calls).toEqual([[{ generation: 1 }]])
+      expect(connection.generation.getSnapshot()?.id).toBe(1)
+    } finally {
+      release.resolve(undefined)
+      loop.stop()
+      await events.dispose()
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('creates logical stream supervisors against the installed Connection', async () => {
     const { ctx, client } = await benchFiber(vi.fn<ConnectionHandle['rpc']['call']>())
     const stream = ctx.remote.$stream({

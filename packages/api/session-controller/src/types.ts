@@ -10,7 +10,7 @@ import type { LlmAttemptId, MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { LlmModelBadge, TextBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId, SessionSeq, SessionSeqCursor } from '@deepseek-ai/dsh-session/types'
 import type { SessionProjectionMap, SessionProjectionSummaryExcluded, SessionProjectionSummaryValues } from '@deepseek-ai/dsh-session-projection/types'
-import type { Principal } from '@deepseek-ai/dsh-typert-protocol'
+import type { PeerId, Principal } from '@deepseek-ai/dsh-typert-protocol'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 
@@ -479,6 +479,10 @@ export interface SessionPageRequest {
   readonly throughSeq?: number
   readonly beforeSeq?: number
   readonly maxMessages?: number
+  /** Relay request for an authoritative Host read. Omit for the relay's ordinary pagination policy. */
+  readonly verifiedHistoryWindow?: true
+  /** Expected relay route epoch for a verified read. The relay checks and removes it before forwarding. */
+  readonly historyRouteEpoch?: string
   /** Stop at a Turn start after both minima, unless maxMessages or history exhaustion wins. */
   readonly turnWindow?: {
     /** Minimum append-origin user/assistant messages; must not exceed maxMessages. */
@@ -489,8 +493,11 @@ export interface SessionPageRequest {
 }
 
 /** One live event request for a durable Session address. */
-export interface SessionFollowRequest extends Pick<SessionPageRequest, 'maxMessages' | 'turnWindow'> {
+export interface SessionFollowRequest extends Pick<SessionPageRequest,
+  'maxMessages' | 'turnWindow' | 'verifiedHistoryWindow' | 'historyRouteEpoch'> {
   readonly address: SessionAddress
+  /** Extend the opening page to this non-negative safe integer seq if the whole expanded window fits. */
+  readonly historyWindowStart?: number
   /** Request background activation; omission leaves the read passive. */
   readonly activate?: boolean
   /** Include process-local assistant presentation frames for the Web client. */
@@ -674,8 +681,44 @@ export type SessionProjectionFrame =
   | { readonly type: 'ready' }
   | SessionProjectionChange
 
+/** Current authenticated Web browser Peer and its Host history-window capability. */
+export interface SessionHistoryOwner {
+  readonly ownerEpoch: PeerId
+  readonly supportsHistoryWindowStart: true
+}
+
+/** A relay route's current history authorization. */
+export interface SessionHistoryRoute {
+  readonly serverId: string
+  readonly routeEpoch: string
+  readonly available: boolean
+}
+
+/** One address dependency whose sharing grant ended on the given relay route. */
+export interface SessionHistoryInvalidation extends Pick<SessionHistoryRoute, 'serverId' | 'routeEpoch'> {
+  readonly sessionId: SessionId
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Events {
+    /**
+     * Announces history-window support to the authenticated Web browser Peer on each event stream opening.
+     * @mode emit
+     * @param owner - the current browser Peer's anonymous epoch and capability.
+     */
+    'api-session/history-owner'(owner: SessionHistoryOwner): void
+    /**
+     * Reports the availability of history authorization for a paired Host route.
+     * @mode emit
+     * @param route - virtual Host identity, authorization epoch, and availability.
+     */
+    'api-session/history-route'(route: SessionHistoryRoute): void
+    /**
+     * Revokes history access to a Session and its dependent addresses on one paired Host route.
+     * @mode emit
+     * @param invalidation - virtual Host identity, authorization epoch, and virtual Session identity.
+     */
+    'api-session/history-invalidated'(invalidation: SessionHistoryInvalidation): void
     /**
      * A Session became visible or its Agent was created or disposed.
      * Consumers upsert the summary and replace its current running and availability state.

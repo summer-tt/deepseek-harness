@@ -2902,6 +2902,11 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     description: 'Host service backing the generated `ctx.remote.session` namespace.',
     methods: [
       {
+        signature: 'readonly supportsHistoryWindowStart: true = true',
+        description: 'This Host can extend a follow opening\'s history window within the protocol budget.',
+        parameters: [],
+      },
+      {
         signature: 'resolveAgent(sessionId: SessionId): Promise<ApiSessionAgentResult>',
         description: 'Resolve or resume one ordinary Session for another Host API domain.',
         parameters: [{ name: 'sessionId', description: 'Session identity whose Agent owns the operation.' }],
@@ -3043,8 +3048,8 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
       },
       {
         signature: '@Remote({ mode: \'stream\' }) follow(request: SessionFollowRequest, signal: AbortSignal): AsyncIterable<SessionFollowFrame>',
-        description: 'Follow one Session log from its opening or resume cursor.',
-        parameters: [{ name: 'request', description: 'durable address and last committed sequence already held by the caller.' }, { name: 'signal', description: 'cancellation owned by the Remote stream carrier.' }],
+        description: 'Follow one Session log from its current opening cut.',
+        parameters: [{ name: 'request', description: 'durable address, history window, and optional live presentation and activation.' }, { name: 'signal', description: 'cancellation owned by the Remote stream carrier.' }],
         returns: 'a complete opening snapshot followed by gap-free durable event frames and optional cursorless assistant-stream frames.',
       },
       {
@@ -5103,6 +5108,30 @@ export const EVENT_API: readonly EventApiEntry[] = [
     summary: 'One Agent failed outside a durable turn position.',
     description: 'One Agent failed outside a durable turn position.',
     parameters: [{ name: 'sessionId', description: 'Agent and Session identity.' }, { name: 'message', description: 'user-safe failure chain.' }],
+  },
+  {
+    name: 'api-session/history-invalidated',
+    mode: 'emit',
+    signature: '\'api-session/history-invalidated\'(invalidation: SessionHistoryInvalidation): void',
+    summary: 'Revokes history access to a Session and its dependent addresses on one paired Host route.',
+    description: 'Revokes history access to a Session and its dependent addresses on one paired Host route.',
+    parameters: [{ name: 'invalidation', description: 'virtual Host identity, authorization epoch, and virtual Session identity.' }],
+  },
+  {
+    name: 'api-session/history-owner',
+    mode: 'emit',
+    signature: '\'api-session/history-owner\'(owner: SessionHistoryOwner): void',
+    summary: 'Announces history-window support to the authenticated Web browser Peer on each event stream opening.',
+    description: 'Announces history-window support to the authenticated Web browser Peer on each event stream opening.',
+    parameters: [{ name: 'owner', description: 'the current browser Peer\'s anonymous epoch and capability.' }],
+  },
+  {
+    name: 'api-session/history-route',
+    mode: 'emit',
+    signature: '\'api-session/history-route\'(route: SessionHistoryRoute): void',
+    summary: 'Reports the availability of history authorization for a paired Host route.',
+    description: 'Reports the availability of history authorization for a paired Host route.',
+    parameters: [{ name: 'route', description: 'virtual Host identity, authorization epoch, and availability.' }],
   },
   {
     name: 'api-session/removed',
@@ -8958,7 +8987,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'SessionFollowRequest',
-    declaration: 'export interface SessionFollowRequest extends Pick<SessionPageRequest, \'maxMessages\' | \'turnWindow\'> {\n    readonly address: SessionAddress;\n    readonly activate?: boolean;\n    readonly assistantStream?: true;\n}',
+    declaration: 'export interface SessionFollowRequest extends Pick<SessionPageRequest, \'maxMessages\' | \'turnWindow\' | \'verifiedHistoryWindow\' | \'historyRouteEpoch\'> {\n    readonly address: SessionAddress;\n    readonly historyWindowStart?: number;\n    readonly activate?: boolean;\n    readonly assistantStream?: true;\n}',
   },
   {
     name: 'SessionForkRequest',
@@ -8997,8 +9026,20 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface SessionHeader {\n    readonly version: typeof SESSION_FORMAT_VERSION;\n    readonly id: SessionId;\n    readonly createdAt: number;\n    readonly cwd?: string;\n    readonly parentSession?: SessionId;\n    readonly isSeeded: boolean;\n    readonly origin?: \'subagent\';\n    readonly delegationDepth?: number;\n    readonly agentPreset?: string;\n}',
   },
   {
+    name: 'SessionHistoryInvalidation',
+    declaration: 'export interface SessionHistoryInvalidation extends Pick<SessionHistoryRoute, \'serverId\' | \'routeEpoch\'> {\n    readonly sessionId: SessionId;\n}',
+  },
+  {
+    name: 'SessionHistoryOwner',
+    declaration: 'export interface SessionHistoryOwner {\n    readonly ownerEpoch: PeerId;\n    readonly supportsHistoryWindowStart: true;\n}',
+  },
+  {
     name: 'SessionHistoryRecord',
     declaration: 'export type SessionHistoryRecord = SessionEventEntry;',
+  },
+  {
+    name: 'SessionHistoryRoute',
+    declaration: 'export interface SessionHistoryRoute {\n    readonly serverId: string;\n    readonly routeEpoch: string;\n    readonly available: boolean;\n}',
   },
   {
     name: 'SessionId',
@@ -9098,7 +9139,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'SessionPageRequest',
-    declaration: 'export interface SessionPageRequest {\n    readonly address: SessionAddress;\n    readonly throughSeq?: number;\n    readonly beforeSeq?: number;\n    readonly maxMessages?: number;\n    readonly turnWindow?: {\n        readonly minMessages: number;\n        readonly minTurns: number;\n    };\n}',
+    declaration: 'export interface SessionPageRequest {\n    readonly address: SessionAddress;\n    readonly throughSeq?: number;\n    readonly beforeSeq?: number;\n    readonly maxMessages?: number;\n    readonly verifiedHistoryWindow?: true;\n    readonly historyRouteEpoch?: string;\n    readonly turnWindow?: {\n        readonly minMessages: number;\n        readonly minTurns: number;\n    };\n}',
   },
   {
     name: 'SessionPendingInput',

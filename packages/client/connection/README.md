@@ -61,6 +61,8 @@ An ended `$events` stream, a Remote stream error, a non-ready opening item, or a
 
 `ctx.connection.reconnect()` interrupts active work, resets the sequence, and starts retry 1 immediately. Browser `offline` aborts active work, publishes `disconnected`, and suspends automatic attempts; the next `online` transition resets the sequence and starts at the 500ms tier. Only a ready item publishes `connected`. Gateway mux owns no independent retry schedule.
 
+The HTTP RPC caller reports carrier responses with status 401 or 403 through `connection/authentication-rejected`. The notification carries the generation ID captured when the request was sent, or `undefined` if no generation was ready. Authorization consumers compare it with their current generation before clearing retained state. When the Gateway event stream ends after delivering a history authorization notification, it sends `connection/history-authorization-ended` for that generation before waiting for in-flight event handlers to settle.
+
 Set the Host Connection row's `config.recovery` to override retry caps, the growth factor, or handshake warning and cancellation times; the [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-client-connection) lists accepted fields. The Host validates these values and injects them into each served page. The Client validates the bootstrap data before providing Connection and uses those defaults when Gateway starts its loop; explicit `start()` timing overrides take precedence. The growth factor must be finite and at least one. Readiness, failure, cancellation, or a hard deadline that occurs before the warning cancels that warning. Reload the page after changing Host recovery configuration.
 
 

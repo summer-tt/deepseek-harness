@@ -6,6 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   apply,
+  installConnection,
   type ClientConnectionRpc,
   type ClientTransportHooks,
   type ConnectionGenerationSource,
@@ -73,6 +74,46 @@ async function mount(): Promise<ConnectionHandle> {
 }
 
 describe('connection client apply', () => {
+  it('reports HTTP auth rejections with the generation captured at dispatch', async () => {
+    const ctx = new Context()
+    const late = Promise.withResolvers<Response>()
+    const fetch = vi.fn<RpcFetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockImplementationOnce(() => late.promise)
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockRejectedValueOnce(new TypeError('offline'))
+    installConnection(ctx, { transport: { fetch } })
+    const handle = ctx.get('connection') as ConnectionHandle
+    const notify = vi.fn()
+    const off = ctx.on('connection/authentication-rejected', notify)
+    const call = () => handle.rpc.call('/api', 'session/page', { args: {} })
+    const generation = installGeneration(handle)
+    let loop: ReturnType<ConnectionHandle['start']> | undefined
+    try {
+      await expect(call()).rejects.toThrow('HTTP 401')
+      loop = handle.start({}, { backoffBaseMs: 10, backoffMaxMs: 10 })
+      await vi.waitFor(() => { expect(handle.generation.getSnapshot()?.id).toBe(1) })
+      const previous = call()
+      generation.end()
+      await vi.waitFor(() => { expect(handle.generation.getSnapshot()?.id).toBe(2) })
+      late.resolve(new Response(null, { status: 403 }))
+      await expect(previous).rejects.toThrow('HTTP 403')
+      await expect(call()).rejects.toThrow('HTTP 401')
+      await expect(call()).rejects.toThrow('HTTP 404')
+      await expect(call()).rejects.toThrow('offline')
+      expect(notify.mock.calls).toEqual([
+        [{ generation: undefined, status: 401 }],
+        [{ generation: 1, status: 403 }],
+        [{ generation: 2, status: 401 }],
+      ])
+    } finally {
+      loop?.stop()
+      off()
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('uses Host bootstrap timing when Gateway starts without overrides', async () => {
     vi.useFakeTimers()
     vi.stubGlobal('__DSH_CONNECTION_RECOVERY__', {

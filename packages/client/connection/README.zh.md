@@ -61,6 +61,8 @@ HTTPS cookie 名称与签名 audience 包含 `https:` scheme，因此即使 host
 
 `ctx.connection.reconnect()` 会中断活动工作、重置序列，并立即开始 retry 1。浏览器 `offline` 会中断活动工作、发布 `disconnected` 并暂停自动尝试；下一次 `online` 转换会重置序列并从 500ms 档开始。只有 ready 项会发布 `connected`。Gateway mux 不拥有独立重试调度。
 
+HTTP RPC 调用收到载体返回的 401 或 403 时，通过 `connection/authentication-rejected` 通告。通知携带发出请求时的 generation ID，当时尚无就绪 generation 则为 `undefined`。授权状态的消费者清除保留状态前，先将其与当前 generation 比较。转发过历史授权通知的 Gateway 事件流结束时，Gateway 会在等待进行中的事件处理器结束前，发出该 generation 的 `connection/history-authorization-ended`。
+
 可通过 Host Connection 行的 `config.recovery` 覆盖重试上限、增长因子或握手告警与取消时间；[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-client-connection)列出接受的字段。Host 校验这些值，并将其注入所提供的每个页面。Client 在提供 Connection 前校验启动数据，并在 Gateway 启动循环时采用这些默认值；显式传给 `start()` 的时序覆盖优先。增长因子必须是至少为一的有限数。若就绪、失败、取消或硬期限先于告警发生，该告警会被取消。修改 Host 恢复配置后需重新加载页面。
 
 

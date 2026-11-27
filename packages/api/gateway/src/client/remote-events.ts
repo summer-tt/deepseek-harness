@@ -3,6 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {
   ConnectionGenerationSource,
+  ConnectionGenerationState,
   ConnectionHostInfo,
   ConnectionHandle,
 } from '@deepseek-ai/dsh-client-connection/client'
@@ -58,6 +59,11 @@ type RemoteEventReplyOutcome =
 
 /** Private end-of-chain marker that cannot collide with a JSON listener result. */
 const REMOTE_EVENT_NEXT = Symbol('api-gateway.remote-event.next')
+const HISTORY_AUTHORIZATION_EVENTS = new Set([
+  'api-session/history-owner',
+  'api-session/history-route',
+  'api-session/history-invalidated',
+])
 
 /** Own Cordis registrations, generation pumping, waterfall dispatch, and HTTP replies. */
 export class ClientRemoteEvents {
@@ -125,6 +131,9 @@ export class ClientRemoteEvents {
     ready: (host: ConnectionHostInfo) => void,
   ): Promise<void> {
     let clientId: RemoteEventClientId | undefined
+    const connectionGeneration = this.connection.generation
+    const previousGeneration = connectionGeneration.getSnapshot()
+    let authorizationGeneration: ReturnType<ConnectionGenerationState['getSnapshot']>
     const failed = new AbortController()
     const generationSignal = AbortSignal.any([signal, failed.signal])
     const active = new Map<string, AbortController>()
@@ -150,6 +159,10 @@ export class ClientRemoteEvents {
           continue
         }
         if (frame.type === 'emit') {
+          if (HISTORY_AUTHORIZATION_EVENTS.has(frame.event)) {
+            authorizationGeneration ??= await waitForPublishedGeneration(connectionGeneration, previousGeneration, generationSignal)
+            if (generationSignal.aborted || connectionGeneration.getSnapshot() !== authorizationGeneration) return
+          }
           this.deliver(frame)
           continue
         }
@@ -170,6 +183,10 @@ export class ClientRemoteEvents {
       streamFailed = true
       streamError = error
     } finally {
+      if (authorizationGeneration !== undefined) {
+        void this.ownerCtx.parallel('connection/history-authorization-ended', { generation: authorizationGeneration.id })
+          .catch((error: unknown) => { this.reportError('connection/history-authorization-ended', error) })
+      }
       for (const controller of active.values()) {
         controller.abort(new Error('client api: Remote event generation ended'))
       }
@@ -259,6 +276,30 @@ export class ClientRemoteEvents {
   private reportError(event: string, error: unknown): void {
     console.error(`client api: Remote event ${JSON.stringify(event)} listener threw:`, error)
   }
+}
+
+/** Wait for the generation owner to publish readiness before delivering authorization. */
+function waitForPublishedGeneration(
+  source: ConnectionGenerationState,
+  previous: ReturnType<ConnectionGenerationState['getSnapshot']>,
+  signal: AbortSignal,
+): Promise<ReturnType<ConnectionGenerationState['getSnapshot']>> {
+  return new Promise((resolve) => {
+    const finish = (generation?: ReturnType<ConnectionGenerationState['getSnapshot']>): void => {
+      unsubscribe()
+      signal.removeEventListener('abort', abort)
+      resolve(generation)
+    }
+    const abort = (): void => { finish() }
+    const check = (): void => {
+      const current = source.getSnapshot()
+      if (signal.aborted) abort()
+      else if (current !== undefined && current !== previous) finish(current)
+    }
+    const unsubscribe = source.subscribe(check)
+    signal.addEventListener('abort', abort, { once: true })
+    check()
+  })
 }
 
 /** Validate and return one generation's Client identity and Host facts. */

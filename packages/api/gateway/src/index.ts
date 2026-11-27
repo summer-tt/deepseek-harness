@@ -229,6 +229,8 @@ export class TypertGatewayService extends Service implements TypertGateway {
 
   private srcClaims: ReadonlySet<string> | undefined
   private remoteEvents: RegisteredRemoteEventSource | undefined
+  // Authenticate the carrier without changing the dynamic stream entry used by relays.
+  private readonly browserEventStreams = new WeakSet<AbortController>()
   private readonly remoteEventClients = new Map<RemoteEventClientId, RemoteEventClient>()
   private readonly pendingRemoteEvents = new Map<RemoteEventId, PendingRemoteEvent>()
 
@@ -255,8 +257,12 @@ export class TypertGatewayService extends Service implements TypertGateway {
     ctx.inject(['connection', 'webServer'], (webCtx) => {
       const listen = (): void => {
         const mux = new RemoteStreamMuxServer(
-          (endpoint, payload, uplink, peer, control, window) =>
-            this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window),
+          (endpoint, payload, uplink, peer, control, window) => {
+            if (endpoint === REMOTE_EVENT_STREAM_ENDPOINT && peer === webCtx.connection.browserPeer) {
+              this.browserEventStreams.add(control)
+            }
+            return this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window)
+          },
           this.wireStream.failure,
           {
             heartbeatIntervalMs: resolved.websocketHeartbeatIntervalMs,
@@ -536,7 +542,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
       releaseUplink(uplink)
       assertPeerLive(peer, endpoint)
       requireInteractions(peer, endpoint)
-      return this.openRemoteEvents(payload, signal, peer)
+      return this.openRemoteEvents(payload, signal, peer, this.browserEventStreams.has(control))
     }
     return this.openStream({ ...remoteRequest(endpoint, payload, signal, peer), uplink, uplinkWindow }, control)
   }
@@ -545,6 +551,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
     payload: unknown,
     signal: AbortSignal,
     peer: PeerScope,
+    browser: boolean,
   ): AsyncGenerator<
     RemoteEventEmitFrame | RemoteEventInvocationFrame | RemoteEventCancellationFrame
     | RemoteEventReadyFrame
@@ -589,10 +596,22 @@ export class TypertGatewayService extends Service implements TypertGateway {
     }
     try {
       yield { ...REMOTE_EVENT_STREAM_READY, clientId, host: registration.host }
+      if (browser && !lifetime.aborted && this.supportsHistoryWindowStart()) {
+        yield {
+          type: 'emit',
+          event: 'api-session/history-owner',
+          args: [{ ownerEpoch: peer.id, supportsHistoryWindowStart: true }],
+        }
+      }
       yield* client.queue.iterate(lifetime)
     } finally {
       this.removeRemoteEventClient(client)
     }
+  }
+
+  private supportsHistoryWindowStart(): boolean {
+    const controller: unknown = this.ctx.get('sessionController')
+    return isObject(controller) && Reflect.get(controller, 'supportsHistoryWindowStart') === true
   }
 
   private async consumeRemoteEvents(

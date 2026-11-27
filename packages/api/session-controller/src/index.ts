@@ -154,6 +154,9 @@ export class SessionController extends TypertRemoteService {
     listWorkSliceMs: z.natural().min(1).default(16),
   })
 
+  /** This Host can extend a follow opening's history window within the protocol budget. */
+  readonly supportsHistoryWindowStart: true = true
+
   private historyController!: HistoryController
   private stateController!: StateController
   private webController!: WebController
@@ -600,8 +603,8 @@ export class SessionController extends TypertRemoteService {
   }
 
   /**
-   * Follow one Session log from its opening or resume cursor.
-   * @param request - durable address and last committed sequence already held by the caller.
+   * Follow one Session log from its current opening cut.
+   * @param request - durable address, history window, and optional live presentation and activation.
    * @param signal - cancellation owned by the Remote stream carrier.
    * @returns a complete opening snapshot followed by gap-free durable event
    *   frames and optional cursorless assistant-stream frames.

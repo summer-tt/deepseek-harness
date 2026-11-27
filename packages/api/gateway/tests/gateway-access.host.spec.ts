@@ -806,6 +806,38 @@ describe('Gateway forwarded events for non-owner Peers', () => {
     for (const events of streams) await events.return?.()
   })
 
+  it('keeps the history owner announcement off in-process and operator streams', async () => {
+    const { ctx } = await setup({ connection: true })
+    const push = eventSource(ctx)
+    const sessionController = { supportsHistoryWindowStart: true }
+    const abort = new AbortController()
+    const open = async (peer: PeerScope): Promise<AsyncIterator<unknown>> =>
+      (await ctx.typertGateway.wireStream.open('$events', { args: {} }, (async function* () {})(), peer, abort.signal))[Symbol.asyncIterator]()
+    const browser = ctx.connection.browserPeer
+    const unsupported = await open(browser)
+    const ready = { type: 'ready', clientId: expect.any(String), host: { home: '/fixture' } }
+    const notice = { type: 'emit', event: 'fixture/notice', args: ['marker'] }
+    try {
+      await expect(unsupported.next()).resolves.toEqual({ done: false, value: ready })
+      push(notice)
+      await expect(unsupported.next()).resolves.toEqual({ done: false, value: notice })
+      await unsupported.return?.()
+      ctx.provide('sessionController', sessionController)
+      const operator = await open(ctx.connection.createPeer({ principal: OWNER }))
+      const inProcessBrowser = await open(browser)
+      for (const stream of [operator, inProcessBrowser]) {
+        await expect(stream.next()).resolves.toEqual({ done: false, value: ready })
+      }
+      push(notice)
+      for (const stream of [operator, inProcessBrowser]) {
+        await expect(stream.next()).resolves.toEqual({ done: false, value: notice })
+        await stream.return?.()
+      }
+    } finally {
+      abort.abort()
+    }
+  })
+
   it('discards the events buffered for a revoked non-owner Peer and keeps other streams', async () => {
     const { ctx, hold } = await setup({ connection: true })
     hold(shelf('s1'))

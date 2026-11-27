@@ -1053,8 +1053,8 @@ workspaceDesktop(): { name: string; available: boolean; fileManager: 'finder' | 
 @Remote wait(request: SessionWaitRequest, signal: AbortSignal): Promise<SessionWaitValue>
 
 /**
- * Follow one Session log from its opening or resume cursor.
- * @param request - durable address and last committed sequence already held by the caller.
+ * Follow one Session log from its current opening cut.
+ * @param request - durable address, history window, and optional live presentation and activation.
  * @param signal - cancellation owned by the Remote stream carrier.
  * @returns a complete opening snapshot followed by gap-free durable event
  *   frames and optional cursorless assistant-stream frames.
@@ -1309,6 +1309,57 @@ One Agent failed outside a durable turn position.
 ```
 
 Types: [SessionId](core.md)
+
+Source: [`packages/api/session-controller/src/types.ts`](../../packages/api/session-controller/src/types.ts)
+
+<a id="api-sessionhistory-invalidated--emit"></a>
+
+#### `api-session/history-invalidated` — emit
+
+Revokes history access to a Session and its dependent addresses on one paired Host route.
+
+```ts cordis-catalog
+/**
+ * Revokes history access to a Session and its dependent addresses on one paired Host route.
+ * @mode emit
+ * @param invalidation - virtual Host identity, authorization epoch, and virtual Session identity.
+ */
+'api-session/history-invalidated'(invalidation: SessionHistoryInvalidation): void
+```
+
+Source: [`packages/api/session-controller/src/types.ts`](../../packages/api/session-controller/src/types.ts)
+
+<a id="api-sessionhistory-owner--emit"></a>
+
+#### `api-session/history-owner` — emit
+
+Announces history-window support to the authenticated Web browser Peer on each event stream opening.
+
+```ts cordis-catalog
+/**
+ * Announces history-window support to the authenticated Web browser Peer on each event stream opening.
+ * @mode emit
+ * @param owner - the current browser Peer's anonymous epoch and capability.
+ */
+'api-session/history-owner'(owner: SessionHistoryOwner): void
+```
+
+Source: [`packages/api/session-controller/src/types.ts`](../../packages/api/session-controller/src/types.ts)
+
+<a id="api-sessionhistory-route--emit"></a>
+
+#### `api-session/history-route` — emit
+
+Reports the availability of history authorization for a paired Host route.
+
+```ts cordis-catalog
+/**
+ * Reports the availability of history authorization for a paired Host route.
+ * @mode emit
+ * @param route - virtual Host identity, authorization epoch, and availability.
+ */
+'api-session/history-route'(route: SessionHistoryRoute): void
+```
 
 Source: [`packages/api/session-controller/src/types.ts`](../../packages/api/session-controller/src/types.ts)
 
