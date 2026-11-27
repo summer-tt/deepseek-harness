@@ -120,6 +120,7 @@ class BoundConversation implements ConversationBinding {
       case 'prepend':
         this.publish(this.assembler.prepend(window.change.entries, window.hasMore))
         return
+      case 'history-append':
       case 'append': {
         let publication: ConversationPublication = 'none'
         for (const event of window.change.entries) {
