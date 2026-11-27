@@ -121,7 +121,7 @@ it('returns only eligible winners, and uses the same project shadow as native fi
   await ctx.agentPresets.mount(scope.ctx)
   const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '/project-review /shadowed' }] })
   const result = await agentEvents(ctx, agent).waterfall('agent/pre-step', {
-    agent, messages: [message], signal, turn: 1, step: 1, modelSelection: { provider: 'test', model: 'test' },
+    messages: [message], signal, turn: 1, step: 1, modelSelection: { provider: 'test', model: 'test' },
   }, () => Promise.resolve({ kind: 'enter' as const, messages: [message] }))
   expect(result.kind).toBe('enter')
   if (result.kind !== 'enter') throw new Error('Expected the first prompt to enter')
@@ -226,7 +226,7 @@ it('cancels before starting or during a provider read without exposing the calle
   })
   ctx.skills.registerProvider((control) => {
     control.signal.addEventListener('abort', () => { pending.resolve([]) }, { once: true })
-    return { name: 'blocked-provider', list, get: () => undefined }
+    return { name: 'blocked-provider', list, get: () => Promise.resolve(undefined) }
   })
   const expected = { code: 'ABORTED', name: 'AbortError', message: 'Draft skill preview was cancelled' }
   await expect(catalog.previewDraft({}, AbortSignal.abort(new Error(root)))).rejects.toMatchObject(expected)
