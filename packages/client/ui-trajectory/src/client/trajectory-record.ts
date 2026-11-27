@@ -2,7 +2,7 @@
 
 import type { HTMLAttributes } from 'react'
 import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import type { ConversationPromptSnapshot } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { ConversationPromptSnapshot, ToolResultNode } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { TrajectoryTranslate } from './locales.ts'
 
 /** Closed set of trajectory record kinds. */
@@ -34,6 +34,19 @@ export interface TrajectorySourceBlock {
   file?: FileAttachmentRef
   callId?: string
   toolName?: string
+}
+
+/** Durable result identity survives re-layout and equivalent history confirmation. */
+export const trajectoryResultEvent = Symbol('trajectory result event')
+
+/**
+ * Identify a result across layout builds, including nodes supplied without a durable event.
+ * @param result - projected settled tool result.
+ * @returns the durable event identity when available, otherwise the projected result identity.
+ */
+export function toolResultIdentity(result: ToolResultNode): object {
+  const durable = result as ToolResultNode & { readonly [trajectoryResultEvent]?: object }
+  return durable[trajectoryResultEvent] ?? result
 }
 
 /** Data and optional presentation attributes for one trajectory record. */
@@ -68,6 +81,8 @@ export interface TrajectoryCellProps extends HTMLAttributes<HTMLDivElement> {
   outputDetail?: string
   /** Committed result event used to inspect a live-only value. */
   resultSeq?: number
+  /** Identity of the durable result associated with this sequence. */
+  resultIdentity?: object
   /** Full assistant reasoning content for the details panel. */
   thinkingDetail?: string
   /** Original message blocks in source order for the details panel. */

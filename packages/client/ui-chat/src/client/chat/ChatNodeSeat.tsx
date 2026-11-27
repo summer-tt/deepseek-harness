@@ -37,11 +37,6 @@ function turnDataOf(node: ChatNode | undefined): ConversationLocationDataStore<C
   return location?.kind === 'turn' || location?.kind === 'step' ? location.turn.data : undefined
 }
 
-function turnOf(node: ChatNode | undefined): number | undefined {
-  const location = node?.location
-  return location?.kind === 'turn' || location?.kind === 'step' ? location.turn.turn : undefined
-}
-
 /**
  * Subscribe, apply Turn-process visibility, and dispatch one stable Context key.
  * Policy reads select this seat's own conclusion, so a mode change re-renders
@@ -55,7 +50,12 @@ export const ChatNodeSeat = memo(function ChatNodeSeat({
   const bottom = useChatNodeBottom(nodeKey)
   const node = useChatNode(nodeKey)
   const routedNode = node as ChatNode | undefined
-  const turn = turnOf(routedNode)
+  const location = node?.location
+  const renderedTurn = location?.kind === 'turn' || location?.kind === 'step' ? location.turn : undefined
+  const turn = renderedTurn?.turn
+  const forkFromNode = useCallback<ChatNodeOwnerProps['forkAt']>((seq, boundary = renderedTurn) => {
+    if (boundary?.end?.seq === seq) forkAt(seq, boundary)
+  }, [forkAt, renderedTurn])
   const processPresentation = useChatNodeProcess(nodeKey)
   const processSpec = processPresentation?.spec
   const storedOpen = useStore(state => processSpec !== undefined
@@ -136,11 +136,11 @@ export const ChatNodeSeat = memo(function ChatNodeSeat({
       cwd,
       openFile,
       inspectCall,
-      forkAt,
+      forkAt: forkFromNode,
       loadImage,
       turnProcess,
     }, [
-    node, groupPart, cwd, openFile, inspectCall, forkAt,
+    node, groupPart, cwd, openFile, inspectCall, forkFromNode,
     loadImage, turnProcess,
   ])
   if (routedNode === undefined || owner === null) return null

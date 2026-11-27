@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { RemoteStream, RemoteStreamCarrierError } from '@deepseek-ai/dsh-api-gateway/client'
+import type { SessionToolResultValue } from '../src/types.ts'
 import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
 /**
  * View registration acceptance on the real framework stack: the plugin fiber
@@ -260,9 +262,9 @@ type ConversationTargetSources = {
 }
 
 /** Real-stack bench: root Context + real SlotRegistry ring + the plugin fiber. */
-async function bench(snapshot = historySnapshot(NODES)) {
+async function bench(snapshot = historySnapshot(NODES), remote = { toolResults: {} } as Readonly<Record<string, object>>) {
   const runtime = await SlotTestRuntime.create()
-  runtime.remote.provideNamespaces({ toolResults: {} })
+  runtime.remote.provideNamespaces(remote)
   runtimes.push(runtime)
   const ctx = runtime.ctx
   const slots = runtime.slots
@@ -511,6 +513,94 @@ describe('plugin registration', () => {
     expect(second.hooks.duration.getSnapshot()).toBe(true)
     expect(localStorage.getItem('dsh.trajectory.duration')).toBe('true')
     expect(localStorage.getItem(`dsh.trajectory.duration.${SID}`)).toBeNull()
+  })
+
+  it.each(['unchanged', 'replaced', 'disposed', 'drains'] as const)('owns the physical result watch (%s)', async (outcome) => {
+    const result = NODES.find(node => node.kind === 'tool-result')!
+    const frame = Promise.withResolvers<undefined>()
+    const loseCarrier = Promise.withResolvers<undefined>()
+    const secondOpen = Promise.withResolvers<undefined>()
+    const physicallyOpening = Promise.withResolvers<AbortSignal>()
+    const iteratorClosing = Promise.withResolvers<undefined>()
+    const finishIterator = Promise.withResolvers<undefined>()
+    const watch = vi.fn(async function* (_request: object, signal: AbortSignal): AsyncIterable<SessionToolResultValue> {
+      if (watch.mock.calls.length === 1) {
+        yield { available: true, value: 'first raw' }
+        if (outcome === 'drains') {
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) => {
+              signal.addEventListener('abort', () => { resolve() }, { once: true })
+            })
+          }
+          iteratorClosing.resolve(undefined)
+          await finishIterator.promise
+          return
+        }
+        await loseCarrier.promise
+        throw new RemoteStreamCarrierError('connection lost')
+      }
+      secondOpen.resolve(undefined)
+      yield { available: true, value: 'second raw' }
+      if (!signal.aborted) {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => { resolve() }, { once: true })
+        })
+      }
+    })
+    const b = await bench(historySnapshot([result]), { toolResults: { watch } })
+    const connection = { generation: { getSnapshot: () => ({ id: 1, host: { home: '/fixture' } }), subscribe: () => () => {} } }
+    let generations = 0
+    Object.assign(b.runtime.remote, {
+      $stream: <Item,>(options: ConstructorParameters<typeof RemoteStream<Item>>[1]) => new RemoteStream<Item>(connection, {
+        ...options,
+        open: (signal) => {
+          if (++generations === 2) physicallyOpening.resolve(signal)
+          return options.open(signal)
+        },
+      }),
+    })
+    await b.runtime.sessions.updateSessionSnapshot(SID, (state) => {
+      state.openState = 'open'
+      state.historyAvailability = 'confirmed'
+    })
+    const registration = b.slots.entries('conversation.view').find(entry => entry.options.id === 'trajectory')!
+    const injectEntry = registration.inject as ((sessionId: SessionId) => object)
+    const injected = injectEntry(SID) as TrajectoryViewInjected
+    const publish = vi.fn((value: unknown) => { if (value === 'first raw') frame.resolve(undefined) })
+    const dispose = injected.watchToolResult!(result.seq, publish, result)
+    try {
+      await frame.promise
+      if (outcome === 'drains') {
+        let disposed = false
+        const disposal = b.feature.dispose().then(() => { disposed = true })
+        await iteratorClosing.promise
+        await new Promise<void>((resolve) => { setImmediate(resolve) })
+        expect(disposed).toBe(false)
+        finishIterator.resolve(undefined)
+        await disposal
+        expect(disposed).toBe(true)
+        return
+      }
+      await b.runtime.sessions.updateSessionSnapshot(SID, (state) => { state.historyAvailability = 'cached' })
+      loseCarrier.resolve(undefined)
+      const openingSignal = await physicallyOpening.promise
+      expect(watch).toHaveBeenCalledOnce()
+      expect(publish).toHaveBeenLastCalledWith(undefined)
+      if (outcome === 'replaced') b.trajectoryStore.set(historySnapshot([{ ...result }]))
+      if (outcome === 'disposed') {
+        await b.feature.dispose()
+        expect(openingSignal.aborted).toBe(true)
+      }
+      await b.runtime.sessions.updateSessionSnapshot(SID, (state) => { state.historyAvailability = 'confirmed' })
+      if (outcome === 'unchanged') {
+        await secondOpen.promise
+        expect(watch).toHaveBeenCalledTimes(2)
+      } else expect(watch).toHaveBeenCalledOnce()
+    } finally {
+      loseCarrier.resolve(undefined)
+      finishIterator.resolve(undefined)
+      dispose()
+    }
   })
 
   it('reports whether loading older history changed the Trajectory snapshot', async () => {
@@ -1668,6 +1758,133 @@ describe('TrajectoryView state', () => {
     fireEvent.click(older)
     await waitFor(() => { expect(table.getAttribute('aria-rowcount')).toBe('150') })
     expect(loadOlder).not.toHaveBeenCalled()
+  })
+
+  it('watches a selected result only when confirmed and retires raw data on same-sequence replacement', () => {
+    const result = (text: string) => ({
+      kind: 'tool-result' as const, seq: 3, time: 3_000, callId: 'same-call',
+      call: { name: 'fixture', argsRaw: '{}' }, name: 'fixture', args: PartialArguments.EMPTY,
+      callTime: 2_000, content: [{ type: 'text' as const, text }], isError: false, subCalls: [],
+    })
+    const cached = result('cached output')
+    const nodes = [cached]
+    const session = createSnapshotStore<SessionSnapshot>({
+      ...sessionSnapshot(nodes), openState: 'loading', historyAvailability: 'cached',
+    })
+    const trajectory = createSnapshotStore(historySnapshot(nodes))
+    const subscriptions: Array<{
+      publish: Parameters<NonNullable<ComponentProps<typeof TrajectoryView>['watchToolResult']>>[1]
+      dispose: ReturnType<typeof vi.fn>
+    }> = []
+    const watchToolResult = vi.fn<NonNullable<ComponentProps<typeof TrajectoryView>['watchToolResult']>>((_seq, publish) => {
+      const dispose = vi.fn()
+      subscriptions.push({ publish, dispose })
+      return dispose
+    })
+    render(<TrajectoryView {...standaloneProps(nodes)} t={tTrajectory} {...standaloneDuration()}
+      useTrajectory={bindSnapshotSelector(trajectory)} useSession={bindSnapshotSelector(session)}
+      loadOlder={vi.fn(async () => false)} watchToolResult={watchToolResult} />)
+    fireEvent.click(screen.getByRole('row', { name: /fixture/ }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Result' }))
+    expect(screen.getByRole('region', { name: 'Rendered result' }).textContent).toContain('cached output')
+    expect(watchToolResult).not.toHaveBeenCalled()
+
+    act(() => { session.set({ ...session.getSnapshot(), openState: 'open', historyAvailability: 'confirmed' }) })
+    expect(watchToolResult).toHaveBeenCalledExactlyOnceWith(3, expect.any(Function), cached)
+    act(() => { subscriptions[0]?.publish('old raw value') })
+    expect(screen.getByRole('region', { name: 'Raw result' }).textContent).toContain('old raw value')
+    act(() => { trajectory.set(historySnapshot([cached])) })
+    expect(watchToolResult).toHaveBeenCalledOnce()
+
+    act(() => { trajectory.set(historySnapshot([result('replacement output')])) })
+    expect(watchToolResult).toHaveBeenCalledTimes(2)
+    expect(subscriptions[0]?.dispose).toHaveBeenCalledOnce()
+    expect(screen.getByRole('region', { name: 'Rendered result' }).textContent).toContain('replacement output')
+    expect(screen.getByRole('region', { name: 'Raw result' }).textContent).not.toContain('old raw value')
+    act(() => {
+      subscriptions[1]?.publish('fresh raw value')
+      subscriptions[0]?.publish('late raw value')
+    })
+    expect(screen.getByRole('region', { name: 'Raw result' }).textContent).toContain('fresh raw value')
+  })
+
+  it.each([false, true])('retries the saved ledger anchor after paging fails (partial=%s)', async (partial) => {
+    const user = (seq: number) => ({
+      kind: 'user' as const, seq, time: seq,
+      content: [{ type: 'text' as const, text: `message ${seq}` }], source: null,
+    })
+    const trajectory = createSnapshotStore(historySnapshot([user(25)]))
+    const conversation = createSnapshotStore<ConversationSnapshot>({
+      ...conversationSnapshot(trajectory.getSnapshot()), history: { firstSeq: 10, reconciliation: 1 },
+    })
+    const state = createSnapshotStore<SessionSnapshot>({
+      ...sessionSnapshot([user(25)]), openState: 'loading', historyAvailability: 'cached', hasMore: true,
+    })
+    const saved = { key: encodeURIComponent('user\u0000seq\u00005'), seq: 5, offset: 24 }
+    const write = vi.fn()
+    const position = { read: () => saved, write }
+    const requests: { target: number; head: number | null | undefined }[] = []
+    const loadThrough = vi.fn(async (target: number) => { requests.push({ target, head: conversation.getSnapshot().history?.firstSeq }) })
+    const loadOlder = vi.fn(async () => false)
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return this.dataset.trajectoryReadingSeq === '5' ? new DOMRect(0, 24, 500, 20) : new DOMRect()
+    })
+    render(<TrajectoryView {...standaloneProps([user(25)])} t={tTrajectory} {...standaloneDuration()}
+      useTrajectory={bindSnapshotSelector(trajectory)} useSession={bindSnapshotSelector(state)}
+      useConversation={bindSnapshotSelector(conversation)} readingPosition={() => position}
+      loadOlder={loadOlder} loadThrough={loadThrough} />)
+    expect(loadThrough).not.toHaveBeenCalled()
+    act(() => {
+      conversation.set({ ...conversation.getSnapshot(), history: { firstSeq: 20, reconciliation: 2 } })
+      state.set({ ...state.getSnapshot(), openState: 'open', historyAvailability: 'confirmed' })
+    })
+    expect(requests).toEqual([{ target: 5, head: 20 }])
+    act(() => {
+      if (partial) {
+        trajectory.set(historySnapshot([user(15), user(25)]))
+        conversation.set({ ...conversation.getSnapshot(), history: { firstSeq: 12, reconciliation: 2 } })
+      }
+      state.set({ ...state.getSnapshot(), historyLoadStatus: 'error' })
+    })
+    expect(write).not.toHaveBeenCalled()
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    if (partial) fireEvent.keyDown(retry, { key: ' ' })
+    else fireEvent.pointerDown(retry)
+    await act(async () => { fireEvent.click(retry) })
+    expect(requests).toEqual([{ target: 5, head: 20 }, { target: 5, head: partial ? 12 : 20 }])
+    expect(loadOlder).not.toHaveBeenCalled()
+    act(() => {
+      trajectory.set(historySnapshot([user(5), user(25)]))
+      conversation.set({ ...conversation.getSnapshot(), history: { firstSeq: 2, reconciliation: 2 } })
+      state.set({ ...state.getSnapshot(), historyLoadStatus: 'idle', hasMore: false })
+    })
+    expect(write).toHaveBeenLastCalledWith(saved)
+  })
+
+  it('retains the saved ledger offset through a clamped cache preview', () => {
+    const node = NODES[0]!
+    const trajectory = historySnapshot([node])
+    const state = createSnapshotStore<SessionSnapshot>({
+      ...sessionSnapshot([node]), openState: 'loading', historyAvailability: 'cached',
+    })
+    const saved = { key: encodeURIComponent('user\u0000seq\u00001'), seq: 1, offset: 16 }
+    const write = vi.fn()
+    const position = { read: () => saved, write }
+    let maxTop = 20
+    let top = 0
+    vi.spyOn(HTMLElement.prototype, 'scrollTop', 'get').mockImplementation(() => top)
+    vi.spyOn(HTMLElement.prototype, 'scrollTop', 'set').mockImplementation((value: number) => { top = Math.min(maxTop, value) })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return this.dataset.trajectoryReadingSeq === '1' ? new DOMRect(0, 100 - top, 500, 20) : new DOMRect()
+    })
+    render(<TrajectoryView {...standaloneProps([node])} {...standaloneHistory(trajectory)} {...standaloneDuration()}
+      useSession={bindSnapshotSelector(state)} readingPosition={() => position} />)
+    expect(top).toBe(20)
+    expect(write).not.toHaveBeenCalled()
+    maxTop = 200
+    act(() => { state.set({ ...state.getSnapshot(), openState: 'open', historyAvailability: 'confirmed' }) })
+    expect(top).toBe(84)
+    expect(write).toHaveBeenLastCalledWith(saved)
   })
 
   it('persists the duration preference through the runtime snapshot-store seam', () => {

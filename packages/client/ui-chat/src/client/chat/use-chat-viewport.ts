@@ -1175,6 +1175,9 @@ export class ChatViewport {
   }
 
   private readonly onIntent = (event: Event): void => {
+    if ((event.type === 'pointerdown' || event.type === 'touchstart'
+      || (event.type === 'keydown' && event instanceof KeyboardEvent && event.key === ' '))
+      && event.target instanceof Element && this.historyEdge?.contains(event.target)) return
     if (event.type === 'keydown' || event.type === 'pointerdown') {
       if (event.target instanceof Element && event.target.closest('[data-composer-seat]') !== null) return
       if (event.type === 'keydown' && (!(event instanceof KeyboardEvent) || !SCROLL_KEYS.has(event.key))) return

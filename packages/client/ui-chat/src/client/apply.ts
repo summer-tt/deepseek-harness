@@ -304,9 +304,20 @@ export function apply(ctx: Context): void {
             positions.set(occurrence, { epoch, memory })
             return memory
           },
-          forkAt: (seq) => {
-            const turn = [...chat.getSnapshot().timeline.turns.values()].find(turn => turn.end?.seq === seq)
-            const messageId = turn?.data.get('turn-tail')?.closing?.finalNode.messageId
+          forkAt: (seq, renderedTurn) => {
+            const snapshot = session.getSnapshot()
+            if (ctx.sessions.binding(sessionId) !== binding || snapshot.openState !== 'open'
+              || (snapshot.historyAvailability ?? 'confirmed') !== 'confirmed') return
+            const turns = chat.getSnapshot().timeline.turns
+            let turn
+            if (renderedTurn === undefined) {
+              turn = [...turns.values()].find(candidate => candidate.end?.seq === seq)
+            } else {
+              turn = turns.get(renderedTurn.turn)
+              if (renderedTurn.end?.seq !== seq || turn?.end !== renderedTurn.end) return
+            }
+            if (turn === undefined) return
+            const messageId = turn.data.get('turn-tail')?.closing?.finalNode.messageId
             ctx.sessions.fork({ sessionId, atSeq: seq, increaseTitle: true, onCreated: (childId) => {
               ctx.get('productAnalytics')?.track('branch_session_click', { session_id: childId, parent_session_id: sessionId, ...messageId === undefined ? {} : { parent_message_id: messageId }, click_position: 'footer' })
             } })

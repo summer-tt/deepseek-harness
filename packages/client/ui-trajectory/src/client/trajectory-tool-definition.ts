@@ -4,6 +4,7 @@ import type {
   ToolResultNode,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-tool-executor-ptc/client'
+import { trajectoryResultEvent } from './trajectory-record.ts'
 import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { trajectoryNode } from './trajectory-definition-common.ts'
 
@@ -12,6 +13,7 @@ import { trajectoryNode } from './trajectory-definition-common.ts'
  * architecture/2026-08-09-client-conversation-node-assembly.md. */
 const MAX_DEPTH = 256
 
+type DurableToolResult = ToolResultNode & { readonly [trajectoryResultEvent]: object }
 type ToolCallBlock = StartedToolCall | ToolResultNode
 
 interface ToolState {
@@ -52,11 +54,12 @@ function rootCall(match: ConversationMatch): StartedToolCall {
 function rootResult(
   match: ConversationMatch,
   previous?: StartedToolCall,
-): ToolResultNode | undefined {
+): DurableToolResult | undefined {
   if (match.event.type !== 'tool/result') return undefined
   const message = match.event.data.message
   return {
     kind: 'tool-result',
+    [trajectoryResultEvent]: match.event,
     seq: match.event.seq,
     time: match.event.time,
     callId: String(message.source.callId),
@@ -101,9 +104,10 @@ function childResult(
   match: ConversationMatch,
   data: DispatchData,
   previous?: ToolCallBlock,
-): ToolResultNode {
+): DurableToolResult {
   return {
     kind: 'tool-result',
+    [trajectoryResultEvent]: match.event,
     seq: match.event.seq,
     time: match.event.time,
     callId: data.subCallId,

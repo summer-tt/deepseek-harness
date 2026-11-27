@@ -241,7 +241,8 @@ export interface ChatNodeOwnerProps {
   cwd?: string | undefined
   openFile: (path: string, options?: OpenFileOptions) => void
   inspectCall: ((callId: ToolCallId) => void) | undefined
-  forkAt: (seq: number) => void
+  /** Fork at a Turn end. The built-in provider checks the rendered boundary against current history. */
+  forkAt: (seq: number, turn?: TurnLocation) => void
   /** Session-authorized image loader supplied by the Chat view. */
   loadImage: MessageImageLoader
   /** Turn-process state when this Node belongs to a projected Turn. */
@@ -370,7 +371,8 @@ export interface ChatViewInjected {
   chatReadingPosition?: (epoch: number | undefined, occurrence: 'main' | 'embedded') => ChatScrollMemory
   /** Position access used when no generation resolver is supplied. */
   chatScroll: ChatScrollMemory
-  forkAt: (seq: number) => void
+  /** Fork at a Turn end. The built-in provider checks the rendered boundary against current history. */
+  forkAt: (seq: number, turn?: TurnLocation) => void
 }
 
 /** Session-owned node sources shared with the view, plus the flow's connection state. */

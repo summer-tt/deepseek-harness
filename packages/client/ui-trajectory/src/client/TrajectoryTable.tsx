@@ -465,6 +465,7 @@ export interface TrajectoryTableProps {
   historyLoading?: boolean
   /** Whether one older history page request is pending anywhere. */
   olderHistoryLoading?: boolean
+  olderHistoryFailed?: boolean
   /** First loaded raw event, used to preserve scroll position after prepending a page. */
   historyStartSeq?: number | undefined
   /** Show the earlier-history row while older records exist or may be loaded. */
@@ -2162,6 +2163,7 @@ export function TrajectoryTable({
   recordFocus = null,
   historyLoading = false,
   olderHistoryLoading = false,
+  olderHistoryFailed = false,
   historyStartSeq,
   hasOlderRecords = false,
   readingPosition,
@@ -2233,17 +2235,24 @@ export function TrajectoryTable({
     ? undefined
     : currentRecord(selectedTemplate)
   const resultSeq = activeTab === 'output' ? selected?.cell.resultSeq : undefined
-  const [liveResult, setLiveResult] = useState<{ seq: number; owner: WatchToolResult; value: JsonValue | undefined }>()
+  const resultIdentity = activeTab === 'output' ? selected?.cell.resultIdentity : undefined
+  const [liveResult, setLiveResult] = useState<{
+    seq: number
+    identity: object | undefined
+    owner: WatchToolResult
+    value: JsonValue | undefined
+  }>()
   useEffect(() => {
     setLiveResult(undefined)
     if (resultSeq === undefined || watchToolResult === undefined) return
     let active = true
     const dispose = watchToolResult(resultSeq, (value) => {
-      if (active) setLiveResult({ seq: resultSeq, owner: watchToolResult, value })
-    })
+      if (active) setLiveResult({ seq: resultSeq, identity: resultIdentity, owner: watchToolResult, value })
+    }, resultIdentity)
     return () => { active = false; dispose() }
-  }, [resultSeq, watchToolResult])
-  const resultValue = liveResult?.seq === resultSeq && liveResult?.owner === watchToolResult ? liveResult?.value : undefined
+  }, [resultSeq, resultIdentity, watchToolResult])
+  const resultValue = liveResult?.seq === resultSeq && liveResult?.identity === resultIdentity
+    && liveResult?.owner === watchToolResult ? liveResult?.value : undefined
   const selectedProgram = selected === undefined ? undefined : codeProgram(selected.cell)
   const thinkingExpanded = thinkingDisclosure?.recordId === selectedRecordId
     ? thinkingDisclosure.expanded
@@ -2698,6 +2707,7 @@ export function TrajectoryTable({
       || onLoadOlder === undefined
       || loadingOlder.current
       || olderHistoryLoading
+      || (requireTop && olderHistoryFailed)
       || (requireTop && pane.scrollTop > OLDER_LOAD_THRESHOLD_PX)
     ) return
     loadingOlder.current = true
@@ -2713,7 +2723,7 @@ export function TrajectoryTable({
       loadingOlder.current = false
       setOlderLoading(false)
     })
-  }, [hasOlderRecords, historyStartSeq, olderHistoryLoading, onLoadOlder])
+  }, [hasOlderRecords, historyStartSeq, olderHistoryLoading, olderHistoryFailed, onLoadOlder])
   useLayoutEffect(() => {
     const pane = tablePaneRef.current
     if (pane === null) return
@@ -2752,8 +2762,10 @@ export function TrajectoryTable({
         pane.scrollTop += currentOffset - target.offset
         reading.scrollTop = pane.scrollTop
         reading.position = { key, seq: readingSeq(candidate) ?? target.seq, offset: currentOffset + before - pane.scrollTop }
-        releaseRestoration()
-        readingPosition?.write(reading.position)
+        if (historyConfirmed) {
+          releaseRestoration()
+          readingPosition?.write(reading.position)
+        }
         olderLoadAnchor.current = null
       } else if (candidate !== undefined && virtualizationEnabled) {
         const index = virtualIndexByRecordId.get(trajectoryRecordId(candidate.cell))
@@ -2877,10 +2889,13 @@ export function TrajectoryTable({
                   <button
                     type="button"
                     className={css.historyLoadButton}
+                    onPointerDown={(event) => { event.stopPropagation() }}
+                    onTouchStart={(event) => { event.stopPropagation() }}
+                    onKeyDown={(event) => { if (event.key === ' ') event.stopPropagation() }}
                     disabled={olderBusy || onLoadOlder === undefined}
                     aria-label={olderBusy
                       ? t('history.loadingEarlierAria')
-                      : t('history.loadEarlier')}
+                      : olderHistoryFailed ? t('history.retryEarlier') : t('history.loadEarlier')}
                     onClick={() => {
                       const pane = tablePaneRef.current
                       if (pane !== null) requestOlder(pane, false)
@@ -2890,10 +2905,10 @@ export function TrajectoryTable({
                       <StateDot state="ongoing" />
                     )}
                     <span aria-hidden="true">
-                      {olderBusy ? t('history.loadingEarlier') : t('history.loadEarlier')}
+                      {olderBusy ? t('history.loadingEarlier') : olderHistoryFailed ? t('history.retryEarlier') : t('history.loadEarlier')}
                     </span>
                     <span className={css.visuallyHidden} role="status" aria-live="polite">
-                      {olderBusy ? t('history.loadingEarlier') : ''}
+                      {olderBusy ? t('history.loadingEarlier') : olderHistoryFailed ? t('history.earlierFailed') : ''}
                     </span>
                   </button>
                 </td>

@@ -6,7 +6,7 @@ import { apply as applyMenus, inject as injectMenus } from '@deepseek-ai/dsh-cli
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { describe, expect, it, vi } from 'vitest'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
-import type { ISession, SessionReference } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { ISession, SessionEventLikeEntry, SessionReference } from '@deepseek-ai/dsh-api-session-controller/client'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import {
   SlotTestRuntime, stubConfigForm, usePinnedBrowserLanguages,
@@ -15,7 +15,7 @@ import type { SessionBehaviorOverrides } from '@deepseek-ai/dsh-client-test-runt
 import type { ClientRemote } from '@deepseek-ai/dsh-api-remotes/client'
 import {
   apply as applyConversation, inject as injectConversation,
-  type GroupKey,
+  type GroupKey, type TurnLocation,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
   apply as applyChat, inject as injectChat, type ChatFlowDataInjected, type ChatViewInjected,
@@ -266,20 +266,44 @@ describe('Chat inject API', () => {
     const track = vi.fn()
     b.runtime.ctx.provide('productAnalytics', { track } as never)
     const forkCreated = vi.spyOn(b.runtime.sessions, 'fork').mockImplementation(async (input) => { input.onCreated?.(ROOT); return ROOT })
-    injected.forkAt(17)
-    expect(track).toHaveBeenCalledWith('branch_session_click', { session_id: ROOT, parent_session_id: ROOT, click_position: 'footer' })
-    await b.runtime.sessions.replaceEvents(ROOT, [
+    const entries: SessionEventLikeEntry[] = [
       { type: 'event', event: { type: 'turn/start', seq: SessionSeq(10), time: 10, data: { turn: 1 } } },
       { type: 'event', event: { type: 'step/start', seq: SessionSeq(11), time: 11, data: { turn: 1, step: 1 } } },
       { type: 'event', event: { type: 'assistant/message', seq: SessionSeq(12), time: 12, surfaceOp: 'append', data: {
         turn: 1, step: 1, stream: [], message: { id: MessageId('reply'), role: 'assistant', content: [{ type: 'text', text: 'answer' }], source: { kind: 'model', provider: 'fixture', model: 'fixture' } },
       } } },
-      { type: 'event', event: { type: 'turn/end', seq: SessionSeq(17), time: 17, data: { turn: 1, reason: { kind: 'completed' } } } },
-    ])
+    ]
+    const replace = async (time: number) => {
+      await b.runtime.sessions.replaceEvents(ROOT, [
+        ...entries,
+        { type: 'event', event: { type: 'turn/end', seq: SessionSeq(17), time, data: { turn: 1, reason: { kind: 'completed' } } } },
+      ])
+      const binding = b.runtime.sessions.binding(ROOT)!
+      const snapshot = b.runtime.ctx.uiConversation.binding(binding).target('chat').getSnapshot()!
+      const turn: TurnLocation = snapshot.timeline.turns.get(1)!
+      return turn
+    }
+    const rendered = await replace(17)
+    await b.runtime.sessions.updateSessionSnapshot(ROOT, (state) => { state.historyAvailability = 'cached' })
+    injected.forkAt(17, rendered)
+    expect(forkCreated).not.toHaveBeenCalled()
+    await b.runtime.sessions.updateSessionSnapshot(ROOT, (state) => {
+      state.openState = 'open'
+      state.historyAvailability = 'confirmed'
+    })
+    injected.forkAt(17, rendered)
+    expect(track).toHaveBeenCalledExactlyOnceWith('branch_session_click', { session_id: ROOT, parent_session_id: ROOT, parent_message_id: 'reply', click_position: 'footer' })
     injected.forkAt(17)
-    expect(track).toHaveBeenLastCalledWith('branch_session_click', { session_id: ROOT, parent_session_id: ROOT, parent_message_id: 'reply', click_position: 'footer' })
+    expect(forkCreated).toHaveBeenCalledTimes(2)
+    const replacement = await replace(18)
+    expect(replacement.end).not.toBe(rendered.end)
+    const staleClick = () => { injected.forkAt(17, rendered) }
+    staleClick()
+    expect(forkCreated).toHaveBeenCalledTimes(2)
+    injected.forkAt(17)
+    expect(forkCreated).toHaveBeenCalledTimes(3)
     forkCreated.mockRestore()
-    injected.forkAt(17)
+    injected.forkAt(17, replacement)
     await vi.waitFor(() => {
       expect(b.openSession).toHaveBeenCalledWith(ROOT)
     })
@@ -288,12 +312,11 @@ describe('Chat inject API', () => {
     })
 
     const fork = vi.spyOn(b.runtime.sessions, 'fork').mockRejectedValueOnce(new Error('fork failed'))
-    injected.forkAt(18)
-    await vi.waitFor(() => {
-      expect(fork).toHaveBeenCalledWith({
-        sessionId: ROOT, atSeq: 18, increaseTitle: true, onCreated: expect.any(Function) as (childId: SessionId) => void,
-      })
-    })
+    injected.forkAt(17, replacement)
+    expect(fork).toHaveBeenCalledOnce()
+    b.rootReference.release()
+    injected.forkAt(17, replacement)
+    expect(fork).toHaveBeenCalledOnce()
     await b.runtime.dispose()
   })
 

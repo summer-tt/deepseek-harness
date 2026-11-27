@@ -52,6 +52,7 @@ export class ChatNavigation {
   setInput(input: ChatNavigationInput): void {
     this.input = input
     this.historyRequested = false
+    if (!input.isOpen && this.restoration !== null) delete this.restoration.requestedHead
     if (!input.isOpen || input.historyLoadStatus === 'error' || !input.hasMore) this.setHistoryIntent('none')
   }
 
@@ -73,6 +74,9 @@ export class ChatNavigation {
     this.clearTask()
     this.onBusyTurn(null)
   }
+
+  /** Whether a saved reading anchor is awaiting authoritative coverage or geometry. */
+  get restoring(): boolean { return this.restoration !== null }
 
   /** Release a jump after reader input without cancelling an accepted history click. */
   readerInteracted(): void {
@@ -120,6 +124,14 @@ export class ChatNavigation {
   /** Request and consume one page, retaining the click until success, exhaustion, or failure. */
   readonly loadEarlier = (): void => {
     if (!this.input.isOpen) return
+    if (this.input.historyLoadStatus === 'error' && this.restoration !== null) {
+      if (!this.input.loadingOlder) {
+        const { durableFirstSeq, firstSeq } = this.input
+        this.requestRestoration(this.restoration, durableFirstSeq === undefined ? firstSeq : durableFirstSeq)
+      }
+      return
+    }
+    if (this.restoration !== null) return
     this.cancel()
     this.setHistoryIntent('manual')
     this.reading.pauseFollowing()
@@ -271,8 +283,10 @@ export class ChatNavigation {
       return
     }
     if (landing !== null) {
-      this.restoration = null
-      this.reading.preservePosition(landing, true)
+      if (isOpen) {
+        this.restoration = null
+        this.reading.preservePosition(landing, true)
+      }
       this.reading.refreshActiveTurn()
       return
     }
@@ -283,9 +297,13 @@ export class ChatNavigation {
       return
     }
     if (loadingOlder || historyLoadStatus === 'error' || restoration.requestedHead === head) return
+    this.requestRestoration(restoration, head)
+  }
+
+  private requestRestoration(restoration: NonNullable<ChatNavigation['restoration']>, head: number | null): void {
     restoration.requestedHead = head
     // loadThrough may consume a prepared page synchronously. The next committed window owns the landing.
-    void this.input.loadThrough(SessionSeq(seq)).catch(() => {
+    void this.input.loadThrough(SessionSeq(restoration.seq)).catch(() => {
       // Session paging owns the error state; keep the original anchor available for retry.
     })
   }

@@ -174,7 +174,11 @@ export function TrajectoryView({
   const positionHandle = useMemo(() => historyVisible ? readingPosition?.(historyEpoch) : undefined,
     [readingPosition, historyEpoch, historyVisible])
   const [restoring, setRestoring] = useState<{ epoch: number | undefined; seq: number }>()
-  const requestedPosition = useRef<{ anchor: TrajectoryReadingAnchor; head: number | null } | undefined>(undefined)
+  const requestedPosition = useRef<{
+    epoch: number | undefined
+    anchor: TrajectoryReadingAnchor
+    head?: number | null
+  } | undefined>(undefined)
   const latestNodeSeq = completeInspection.eventNodes.at(-1)?.seq
   const [historyTailSeq, setHistoryTailSeq] = useState(latestNodeSeq)
   const [historyNodeLimit, setHistoryNodeLimit] = useState(HISTORY_PAGE_NODES)
@@ -556,33 +560,47 @@ export function TrajectoryView({
     })
   }
 
+  const historyLoadStatus = useSession(snapshot => snapshot.historyLoadStatus)
+  const restorePage = useCallback((anchor: TrajectoryReadingAnchor, retry = false) => {
+    setRestoring(previous => previous !== undefined && previous.epoch === historyEpoch && previous.seq === anchor.seq
+      ? previous : { epoch: historyEpoch, seq: anchor.seq })
+    let requested = requestedPosition.current
+    if (requested?.anchor !== anchor || requested.epoch !== historyEpoch) {
+      requested = { epoch: historyEpoch, anchor }
+      requestedPosition.current = requested
+    }
+    if (!canPage) {
+      delete requested.head
+      return
+    }
+    if (!sessionHasOlderHistory || (firstDurableSeq !== null && firstDurableSeq <= anchor.seq)) return
+    if (olderHistoryLoading || loadThrough === undefined) return
+    if (!retry && (historyLoadStatus === 'error' || requested.head === firstDurableSeq)) return
+    requested.head = firstDurableSeq
+    return loadThrough(SessionSeq(anchor.seq)).catch(() => {
+      // Session paging owns the error state and keeps the selected position available.
+    })
+  }, [historyEpoch, canPage, sessionHasOlderHistory, firstDurableSeq, olderHistoryLoading, historyLoadStatus, loadThrough])
+  const requestRestorePage = useCallback((anchor: TrajectoryReadingAnchor) => { void restorePage(anchor) }, [restorePage])
   const loadEarlierHistory = useCallback(async () => {
+    const requested = requestedPosition.current
+    if (canPage && historyLoadStatus === 'error' && requested !== undefined && requested.epoch === historyEpoch) {
+      await restorePage(requested.anchor, true)
+      return false
+    }
     if (!hasResidentOlderHistory && (!canPage || !await loadOlder())) return false
     const count = historyEndIndex - historyStartIndex
     setHistoryNodeLimit(limit => Math.max(limit, count) + HISTORY_PAGE_NODES)
     return true
-  }, [hasResidentOlderHistory, canPage, loadOlder, historyEndIndex, historyStartIndex])
+  }, [hasResidentOlderHistory, canPage, loadOlder, historyEndIndex, historyStartIndex, historyEpoch, historyLoadStatus, restorePage])
   const canLoadEarlier = hasResidentOlderHistory || canPage
   const settleRestore = useCallback(() => {
+    requestedPosition.current = undefined
     if (restoreSeq === undefined) return
     const count = historyEndIndex - historyStartIndex
     setHistoryNodeLimit(limit => Math.max(limit, count))
     setRestoring(undefined)
-    requestedPosition.current = undefined
   }, [restoreSeq, historyEndIndex, historyStartIndex])
-  const historyLoadStatus = useSession(snapshot => snapshot.historyLoadStatus)
-  const restorePage = useCallback((anchor: TrajectoryReadingAnchor) => {
-    setRestoring(previous => previous !== undefined && previous.epoch === historyEpoch && previous.seq === anchor.seq
-      ? previous : { epoch: historyEpoch, seq: anchor.seq })
-    if (!canPage || !sessionHasOlderHistory || (firstDurableSeq !== null && firstDurableSeq <= anchor.seq)) return
-    if (olderHistoryLoading || historyLoadStatus === 'error' || loadThrough === undefined) return
-    const requested = requestedPosition.current
-    if (requested?.anchor === anchor && requested.head === firstDurableSeq) return
-    requestedPosition.current = { anchor, head: firstDurableSeq }
-    void loadThrough(SessionSeq(anchor.seq)).catch(() => {
-      // Session paging owns the error state and keeps the selected position available.
-    })
-  }, [historyEpoch, canPage, sessionHasOlderHistory, firstDurableSeq, olderHistoryLoading, historyLoadStatus, loadThrough])
 
   return (
     <div className={css.root} data-conversation-composer-overlay="">
@@ -623,7 +641,8 @@ export function TrajectoryView({
       <div className={css.ledger}>
         <TrajectoryTable
           t={t}
-          watchToolResult={watchToolResult}
+          watchToolResult={canPage ? watchToolResult : undefined}
+          olderHistoryFailed={historyLoadStatus === 'error'}
           stringWrapping={jsonStringWrapping === undefined ? undefined : {
             ...jsonStringWrapping,
             label: t('record.wrapLines'),
@@ -650,7 +669,7 @@ export function TrajectoryView({
           historyConfirmed={canPage}
           missingBefore={sessionHasOlderHistory ? firstDurableSeq ?? Number.POSITIVE_INFINITY : null}
           residentBefore={hasResidentOlderHistory && restoreSeq === undefined ? historyBaseSeq : null}
-          restorePage={restorePage}
+          restorePage={requestRestorePage}
           settleRestore={settleRestore}
           onClearSelection={() => { setTimelineSelection(null) }}
           collapsedTurns={collapsedTurns}

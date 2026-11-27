@@ -450,7 +450,7 @@ function makeHarness(
     save: (position) => { savedScroll = position },
     read: () => savedScroll,
   }
-  const forkAt = vi.fn()
+  const forkAt = vi.fn<ChatViewSlotProps['forkAt']>()
   // Rows and the harness must observe the same chat-store instance.
   const chat = createChatStore().create()
   const transcriptView = createSnapshotStore<TranscriptViewMode>('compact')
@@ -2117,7 +2117,9 @@ describe('ChatView', () => {
     fireEvent.click(branchButtons[0]!)
     // The branch action sends the real turn/end seq (the exact inclusive
     // Host boundary), not the assistant node seq.
-    expect(h.forkAt).toHaveBeenCalledWith(3)
+    expect(h.forkAt).toHaveBeenCalledOnce()
+    const [seq, turn] = h.forkAt.mock.calls[0]!
+    expect([seq, turn?.end?.seq]).toEqual([3, 3])
   }))
 
   it('keeps pending file mentions non-interactive until admission enables the reference injector', () => {
@@ -3706,7 +3708,20 @@ describe('ChatView', () => {
     expect(buttons).toHaveLength(1)
     expect(buttons[0]!.getAttribute('aria-disabled')).toBeNull()
     fireEvent.click(buttons[0]!)
-    expect(h.forkAt.mock.calls).toEqual([[3]])
+    expect(h.forkAt).toHaveBeenCalledOnce()
+    const [seq, turn] = h.forkAt.mock.calls[0]!
+    expect([seq, turn?.end?.seq]).toEqual([3, 3])
+  })
+
+  it('supplies the rendered Turn to a keyed renderer calling forkAt with only a sequence', () => {
+    const h = makeHarness({ nodes: [user(1, 'prompt'), assistant(2, 'answer')], turnEnds: new Map([[1, 3]]) })
+    h.setNodeRenderer((_name, owner) => owner.node.kind === 'turn-tail'
+      ? <button type="button" onClick={() => { owner.forkAt(3) }}>Legacy fork</button> : null)
+    render(<h.ChatView {...h.props} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Legacy fork' }))
+    expect(h.forkAt).toHaveBeenCalledOnce()
+    const [seq, turn] = h.forkAt.mock.calls[0]!
+    expect([seq, turn?.end?.seq]).toEqual([3, 3])
   })
 
   it('disables fork when the indexed Turn has a later steering Node', () => {
@@ -4188,6 +4203,90 @@ describe('ChatView', () => {
       expect(view.getByText('offline prompt')).toBeTruthy()
       expect(commits).toHaveBeenCalledTimes(2)
       expect(host.scrollTop).toBe(216)
+    } finally {
+      host.remove()
+    }
+  })
+
+  it('keeps the saved offset when cached Chat cannot scroll far enough', () => {
+    const host = document.createElement('div')
+    host.dataset.conversationScroll = ''
+    document.body.append(host)
+    let height = 240
+    Object.defineProperties(host, { clientHeight: { value: 200 }, scrollHeight: { get: () => height } })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this === host) return new DOMRect(0, 0, 500, 200)
+      return new DOMRect(0, 100 - host.scrollTop, 500, 40)
+    })
+    try {
+      const h = makeHarness({ nodes: [user(5, 'question'), assistant(6, 'answer')], turnEnds: new Map([[1, 7]]) }, {
+        historyAvailability: 'cached', openState: 'loading',
+      })
+      h.setHistory({ firstSeq: 1, reconciliation: 1 })
+      const saved = { anchorKey: 'fixture:user:5', seq: 5, anchorTop: 20, scrollTop: 20 }
+      h.chatScroll.save(saved)
+      const view = render(<h.ChatView {...h.props} />, { container: host })
+      expect(host.scrollTop).toBe(40)
+      fireEvent.scroll(host)
+      expect(h.chatScroll.read()).toEqual(saved)
+      expect(view.queryByRole('button', { name: '在新对话中分支' })).toBeNull()
+      act(() => {
+        height = 500
+        h.setHistory({ firstSeq: 0, reconciliation: 2 })
+        h.setSession({ openState: 'open', historyAvailability: 'confirmed' })
+      })
+      expect(host.scrollTop).toBe(80)
+      expect(h.chatScroll.read()).toMatchObject({ anchorKey: saved.anchorKey, anchorTop: 20 })
+      expect(view.getByRole('button', { name: '在新对话中分支' })).toBeTruthy()
+    } finally {
+      host.remove()
+    }
+  })
+
+  it.each([false, true])('retries the saved Chat anchor after paging fails (partial=%s)', (partial) => {
+    const host = document.createElement('div')
+    host.dataset.conversationScroll = ''
+    document.body.append(host)
+    Object.defineProperties(host, { clientHeight: { value: 200 }, scrollHeight: { value: 2000 } })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this === host) return new DOMRect(0, 0, 500, 200)
+      return new DOMRect(0, 180 - host.scrollTop, 500, 40)
+    })
+    try {
+      const h = makeHarness({ nodes: [user(25, 'present')] }, {
+        historyAvailability: 'cached', openState: 'loading', hasMore: true,
+      })
+      const saved = { anchorKey: 'fixture:user:5', seq: 5, anchorTop: 30, scrollTop: 100 }
+      h.chatScroll.save(saved)
+      h.setHistory({ firstSeq: 10, reconciliation: 1 })
+      const view = render(<h.ChatView {...h.props} />, { container: host })
+      expect(h.loadThrough).not.toHaveBeenCalled()
+      act(() => {
+        h.setHistory({ firstSeq: 20, reconciliation: 2 })
+        h.setSession({ openState: 'open', historyAvailability: 'confirmed' })
+      })
+      expect(h.loadThrough).toHaveBeenCalledExactlyOnceWith(5)
+      act(() => {
+        if (partial) {
+          h.setHistory({ firstSeq: 12, reconciliation: 2 })
+          h.setChat({ nodes: [user(15, 'partial page'), user(25, 'present')] })
+        }
+        h.setSession({ historyLoadStatus: 'error' })
+      })
+      expect(h.chatScroll.read()).toEqual(saved)
+      const retry = view.getByRole('button', { name: '重新加载' })
+      if (partial) fireEvent.keyDown(retry, { key: ' ' })
+      else fireEvent.pointerDown(retry)
+      fireEvent.click(retry)
+      expect(h.loadThrough.mock.calls).toEqual([[5], [5]])
+      expect(h.loadOlder).not.toHaveBeenCalled()
+      act(() => {
+        h.setHistory({ firstSeq: 2, reconciliation: 2 })
+        h.setChat({ nodes: [user(5, 'saved target'), user(25, 'present')] })
+        h.setSession({ historyLoadStatus: 'idle', hasMore: false })
+      })
+      expect(host.scrollTop).toBe(150)
+      expect(h.chatScroll.read()).toMatchObject({ anchorKey: saved.anchorKey, anchorTop: 30 })
     } finally {
       host.remove()
     }

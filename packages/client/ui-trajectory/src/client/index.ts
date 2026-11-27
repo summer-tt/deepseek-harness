@@ -4,7 +4,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import type { SessionBinding } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionBinding, SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
@@ -25,6 +25,8 @@ import { registerTrajectoryRequestHeaderDefinition } from './trajectory-request-
 import {
   EMPTY_TRAJECTORY_SNAPSHOT, registerTrajectoryConversationView,
 } from './trajectory-snapshot-builder.ts'
+import type { ToolCallBlock } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { toolResultIdentity } from './trajectory-record.ts'
 import type { TrajectorySnapshot } from './trajectory-contract.ts'
 import { registerTrajectoryToolDefinition } from './trajectory-tool-definition.ts'
 import { TrajectoryView, type TrajectoryViewInjected } from './TrajectoryView.tsx'
@@ -38,6 +40,35 @@ export type {
   UseTrajectory,
 } from './trajectory-contract.ts'
 
+function containsResult(calls: readonly ToolCallBlock[], identity: object): boolean {
+  return calls.some(call => ('kind' in call && toolResultIdentity(call) === identity)
+    || containsResult(call.subCalls, identity))
+}
+
+function historyAvailability(snapshot: SessionSnapshot) {
+  return snapshot.historyAvailability ?? (snapshot.openState === 'open' ? 'confirmed' : 'unavailable')
+}
+
+function waitForConfirmedHistory(session: SessionBinding['session'], signal: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    const finish = (ready: boolean) => {
+      stop()
+      signal.removeEventListener('abort', abort)
+      resolve(ready)
+    }
+    const abort = () => { finish(false) }
+    const check = () => {
+      const snapshot = session.getSnapshot()
+      const state = historyAvailability(snapshot)
+      if (signal.aborted || state === 'unavailable' || snapshot.openState === 'error' || snapshot.removed) finish(false)
+      else if (state === 'confirmed' && snapshot.openState === 'open') finish(true)
+    }
+    const stop = session.subscribe(check)
+    signal.addEventListener('abort', abort, { once: true })
+    check()
+  })
+}
+
 /** Required services: the conversation slot, registries, ordinary Session paging, and the locale service. */
 export const inject = ['slots', 'sessions', 'uiSession', 'uiConversation', 'locale', 'remote', 'remote.toolResults']
 
@@ -47,6 +78,20 @@ export const inject = ['slots', 'sessions', 'uiSession', 'uiConversation', 'loca
  * @param ctx - client root context.
  */
 export function apply(ctx: Context): void {
+  const watcherLifetime = new AbortController()
+  const closingWatches = new Set<Promise<void>>()
+  const watcherOwner = {
+    signal: watcherLifetime.signal,
+    trackClosing: (task: Promise<void>) => {
+      closingWatches.add(task)
+      const forget = () => { closingWatches.delete(task) }
+      void task.then(forget, forget)
+    },
+  }
+  ctx.effect(() => async () => {
+    watcherLifetime.abort()
+    await Promise.allSettled(closingWatches)
+  })
   const trajectorySources = new WeakMap<SessionBinding, ObservableSnapshot<TrajectorySnapshot>>()
   const trajectorySource = (binding: SessionBinding): ObservableSnapshot<TrajectorySnapshot> => {
     let source = trajectorySources.get(binding)
@@ -95,7 +140,18 @@ export function apply(ctx: Context): void {
         hooks: { duration },
         watchToolResult: createToolResultWatcher(ctx.remote, sessionId, (error) => {
           ctx.logger.warn('live tool result unavailable: %s', error)
-        }),
+        }, {
+          waitUntilConfirmed: signal => waitForConfirmedHistory(session, signal),
+          isCurrent: (identity) => {
+            const current = session.getSnapshot()
+            if (ctx.sessions.binding(sessionId) !== binding || current.openState !== 'open'
+              || historyAvailability(current) !== 'confirmed' || identity === undefined) return false
+            const snapshot = trajectory.getSnapshot()
+            return snapshot !== undefined
+              && (snapshot.eventNodes.some(node => node.kind === 'tool-result' && containsResult([node], identity))
+                || containsResult(snapshot.runningCalls, identity))
+          },
+        }, watcherOwner),
         jsonStringWrapping: {
           getDefault: () => stringWrapping.getSnapshot(),
           setDefault: (value) => { stringWrapping.set(value) },

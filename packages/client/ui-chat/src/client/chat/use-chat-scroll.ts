@@ -100,7 +100,8 @@ export function useChatScroll(input: ChatScrollInput): ChatScrollState {
       if (reading.pending) return
       content.current.applied = current
       const position = reading.currentPosition
-      if (position?.seq !== undefined) navigation.restorePosition(position)
+      if (navigation.restoring) navigation.reconcile()
+      else if (position?.seq !== undefined) navigation.restorePosition(position)
       else if (reading.followingTail && !reading.pendingReconciliationInterruption) reading.followTail()
       else navigation.reconcile()
       return
@@ -138,6 +139,7 @@ export function useChatScroll(input: ChatScrollInput): ChatScrollState {
         if (!content.current.opened) return
         if (!event.movedByReader && viewport.motion.foldActive()) return
         if (event.movedByReader) navigation.cancelRestoration()
+        else if (navigation.restoring) return
         reading.onScroll(event)
       },
       beforeDetach: () => { reading.savePendingPosition() },

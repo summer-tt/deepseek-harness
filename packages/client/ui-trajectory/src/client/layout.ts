@@ -18,7 +18,7 @@ import type {
   TrajectorySourceBlock,
 } from './trajectory-record.ts'
 import type { TrajectoryPartialAssistant, TrajectorySnapshot } from './trajectory-contract.ts'
-import { formatElapsedSeconds } from './trajectory-record.ts'
+import { formatElapsedSeconds, toolResultIdentity } from './trajectory-record.ts'
 import type { TrajectoryTranslate } from './locales.ts'
 import { COMPACTION_INTERRUPTED_ERROR } from './copy-codes.ts'
 
@@ -466,6 +466,7 @@ export function deriveTrajectoryLayout(
             ...(node.call !== null ? { inputDetail: node.call.argsRaw } : {}),
             outputDetail: detailResult(node, t),
             resultSeq: node.seq,
+            resultIdentity: toolResultIdentity(node),
             outputBlocks: node.content.map(block => sourceBlock(block)),
             ...resultPreview,
             callId: node.callId,
@@ -787,6 +788,7 @@ function expandAssistant(
           ? {
             outputDetail: detailResult(result, t),
             resultSeq: result.seq,
+            resultIdentity: toolResultIdentity(result),
             outputBlocks: result.content.map(block => sourceBlock(block)),
             ...resultPreview,
             isError: result.isError,
@@ -1035,6 +1037,7 @@ function expandSubCalls(
           ? {
             outputDetail: detailResult(sub, t),
             resultSeq: sub.seq,
+            resultIdentity: toolResultIdentity(sub),
             outputBlocks: sub.content.map(block => sourceBlock(block)),
             ...resultPreview,
             isError: sub.isError,
