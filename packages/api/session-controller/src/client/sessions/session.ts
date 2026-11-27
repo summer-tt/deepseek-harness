@@ -1,6 +1,7 @@
 // Sessions remain resident after creation so their open Remote sources keep running off-screen.
 
 import type { Context } from '@deepseek-ai/cordis'
+import { notifySubscribers } from '@deepseek-ai/dsh-client-store'
 import type { InboxState, InboxTarget } from '@deepseek-ai/dsh-agent/types'
 import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
 import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -714,6 +715,7 @@ export class Session implements SessionFace {
    * @returns when the Remote iterator has completed teardown.
    */
   async dispose(): Promise<void> {
+    this.readingPositionFlushers.clear()
     this.cancelHistoryFallback()
     this.stopObservingInbox()
     // Unsettled echoes retire as failed so their owners can restore or
@@ -728,6 +730,20 @@ export class Session implements SessionFace {
     const events = this.events
     this.events = undefined
     await events?.dispose()
+  }
+
+  private readonly readingPositionFlushers = new Set<() => void>()
+
+  /** @inheritdoc */
+  registerReadingPositionFlush(flush: () => void): () => void {
+    this.readingPositionFlushers.add(flush)
+    return () => { this.readingPositionFlushers.delete(flush) }
+  }
+
+  /** Finish pending reading samples before the Manager withdraws this binding. */
+  flushReadingPositions(): void {
+    notifySubscribers(this.readingPositionFlushers, '[session-controller] reading position')
+    this.readingPositionFlushers.clear()
   }
 
   /** @inheritdoc */

@@ -8,7 +8,7 @@ import { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { GlobalStandardProps, PropsRenderFactories, PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { useEffect, useMemo } from 'react'
+import { Profiler, useEffect, useMemo } from 'react'
 import { useMarkdownDelegate, type MarkdownDelegateFenceInfo, type MarkdownMenuTarget } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
   AssistantMessageNode, ChatFlowHookContext, ChatFlowOwnerProps, ChatFlowSlotProps,
@@ -444,7 +444,7 @@ function makeHarness(
   // Mutable outline holder: tests swap the value and drive a re-render via set().
   let outlineValue: unknown
   const openView = vi.fn<(view: string, focus: string) => void>()
-  // In-memory scroll memory matching the apply.ts per-session map contract.
+  // Standalone position access for the currently mounted test Session.
   let savedScroll: ReturnType<ChatViewSlotProps['chatScroll']['read']> = null
   const chatScroll: ChatViewSlotProps['chatScroll'] = {
     save: (position) => { savedScroll = position },
@@ -605,6 +605,9 @@ function makeHarness(
     setConnection: (state: ConnectionState) => { connection.set(state) },
     openFile, openUserFile, loadOlder, consumeOlder, prepareOlder, loadThrough, openView,
     setOutline: (value: unknown) => { outlineValue = value },
+    setHistory: (value: NonNullable<ConversationSnapshot['history']>) => {
+      conversation.set({ ...conversation.getSnapshot(), history: value })
+    },
     chatScroll, forkAt, toolOwners, fenceCalls,
     setPerformanceUsage: (mode: 'compact' | 'detailed') => { performanceUsage.set(mode) },
     setGrouped: (value: ConversationGroupedView<ProcessGroupData> | undefined) => {
@@ -4143,6 +4146,126 @@ describe('ChatView', () => {
       })
     })
     expect(scroller.scrollTop).toBe(1200)
+  })
+
+  it('restores seeded history before opening and preserves the reader offset across a catch-up suffix', () => {
+    const host = document.createElement('div')
+    host.dataset.conversationScroll = ''
+    document.body.append(host)
+    let anchorOffset = 160
+    Object.defineProperties(host, { clientHeight: { value: 200 }, scrollHeight: { value: 2000 } })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this === host) return new DOMRect(0, 0, 500, 200)
+      if (this.dataset.chatAnchorKey === 'fixture:user:5') return new DOMRect(0, anchorOffset - host.scrollTop, 500, 40)
+      return new DOMRect()
+    })
+    try {
+      const h = makeHarness({ nodes: [user(5, 'previous prompt'), assistant(6, 'previous answer')] }, {
+        historyAvailability: 'cached', historyEpoch: 1, openState: 'loading', hasMore: true,
+      })
+      h.setHistory({ firstSeq: 1, reconciliation: 1 })
+      h.chatScroll.save({ anchorKey: 'fixture:user:5', seq: 5, anchorTop: 24, scrollTop: 5 })
+      const commits = vi.fn()
+      const view = render(<Profiler id="seeded-chat" onRender={commits}><h.ChatView {...h.props} /></Profiler>, { container: host })
+      expect(view.getByText('previous prompt')).toBeTruthy()
+      expect(host.scrollTop).toBe(136)
+      const older = view.getByRole('button', { name: '加载更早' })
+      expect(older.hasAttribute('disabled')).toBe(true)
+      expect(h.loadThrough).not.toHaveBeenCalled()
+      const previousPrompt = view.getByText('previous prompt')
+      commits.mockClear()
+      act(() => { h.setSession({ openState: 'open', historyAvailability: 'confirmed' }) })
+      expect(commits).toHaveBeenCalledOnce()
+      expect(view.getByText('previous prompt')).toBe(previousPrompt)
+      expect(host.scrollTop).toBe(136)
+      commits.mockClear()
+      act(() => {
+        h.setHistory({ firstSeq: 1, reconciliation: 2 })
+        anchorOffset = 240
+        h.setChat({ nodes: [user(5, 'previous prompt'), assistant(6, 'previous answer'), user(10, 'offline prompt')] })
+      })
+      expect(older.hasAttribute('disabled')).toBe(false)
+      expect(view.getByText('offline prompt')).toBeTruthy()
+      expect(commits).toHaveBeenCalledTimes(2)
+      expect(host.scrollTop).toBe(216)
+    } finally {
+      host.remove()
+    }
+  })
+
+  it('flushes the latest delivered reader scroll before the authorized binding is released', () => {
+    const host = document.createElement('div')
+    host.dataset.conversationScroll = ''
+    document.body.append(host)
+    Object.defineProperties(host, { clientHeight: { value: 200 }, scrollHeight: { value: 2000 } })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this === host) return new DOMRect(0, 0, 500, 200)
+      const offset = this.dataset.chatAnchorKey === 'fixture:user:5' ? 150 : 250
+      return new DOMRect(0, offset - host.scrollTop, 500, 80)
+    })
+    try {
+      const h = makeHarness({ nodes: [user(5, 'earlier'), user(8, 'later')] })
+      let flush: (() => void) | undefined
+      const memory = {
+        ...h.chatScroll,
+        registerFlush: (callback: () => void) => {
+          flush = callback
+          return () => { flush = undefined }
+        },
+      }
+      const view = render(<h.ChatView {...h.props} chatScroll={memory} />, { container: host })
+      fireEvent.wheel(host, { deltaY: -20 })
+      host.scrollTop = 100
+      fireEvent.scroll(host)
+      host.scrollTop = 240
+      fireEvent.scroll(host)
+      expect(memory.read()).toBeNull()
+      flush?.()
+      expect(memory.read()).toMatchObject({ anchorKey: 'fixture:user:8', seq: 8, anchorTop: 10 })
+      view.unmount()
+      expect(flush).toBeUndefined()
+    } finally {
+      host.remove()
+    }
+  })
+
+  it.each([false, true])('waits for authoritative coverage before replacing an absent anchor (interrupt=%s)', async (interrupt) => {
+    const host = document.createElement('div')
+    host.dataset.conversationScroll = ''
+    document.body.append(host)
+    Object.defineProperties(host, { clientHeight: { value: 200 }, scrollHeight: { value: 2000 } })
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this === host) return new DOMRect(0, 0, 500, 200)
+      const offset = this.dataset.chatAnchorKey === 'fixture:user:8' ? 180 : 380
+      return new DOMRect(0, offset - host.scrollTop, 500, 40)
+    })
+    try {
+      const h = makeHarness({ nodes: [user(12, 'later visible prompt')] }, {
+        openState: 'loading', historyAvailability: 'cached', hasMore: true,
+      })
+      h.setHistory({ firstSeq: 11, reconciliation: 1 })
+      const saved = { anchorKey: 'deleted', seq: 10, anchorTop: 30, scrollTop: 100 }
+      h.chatScroll.save(saved)
+      render(<h.ChatView {...h.props} />, { container: host })
+      expect(h.chatScroll.read()).toEqual(saved)
+      expect(h.loadThrough).not.toHaveBeenCalled()
+      act(() => { h.setSession({ openState: 'open', historyAvailability: 'confirmed' }) })
+      expect(h.loadThrough).toHaveBeenCalledExactlyOnceWith(10)
+      if (interrupt) fireEvent.wheel(host, { deltaY: 20 })
+      act(() => {
+        h.setHistory({ firstSeq: 2, reconciliation: 1 })
+        h.setChat({ nodes: [user(8, 'earlier neighbor'), user(12, 'later visible prompt')] })
+        h.setSession({ hasMore: false })
+      })
+      if (interrupt) expect(host.scrollTop).toBe(0)
+      else {
+        expect(host.scrollTop).toBe(150)
+        expect(h.chatScroll.read()).toMatchObject({ anchorKey: 'fixture:user:8', seq: 8, anchorTop: 30 })
+      }
+      await historyFrame()
+    } finally {
+      host.remove()
+    }
   })
 
   it('restores a one-shot prepend landing after immediate remount before scroll delivery', async () => {

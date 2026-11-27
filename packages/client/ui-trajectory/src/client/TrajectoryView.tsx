@@ -1,6 +1,8 @@
 /** Trajectory view: compact summary over a turn-aware event ledger. */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { SessionReadingPosition } from '@deepseek-ai/dsh-api-session-controller/client'
+import { SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type {
   AssistantBlock, AssistantMessageNode, ConvViewProps, MessageImageLoader,
   ToolCallBlock,
@@ -10,7 +12,7 @@ import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { JsonTreeProps } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   TrajectoryTable,
-  type TrajectoryRequestNumber,
+  type TrajectoryReadingAnchor, type TrajectoryRequestNumber,
   type TrajectoryUsage,
 } from './TrajectoryTable.tsx'
 import type { WatchToolResult } from './watch-tool-result.ts'
@@ -82,6 +84,10 @@ export interface TrajectoryViewInjected {
     duration: SnapshotStore<boolean>
   }
   loadOlder: () => Promise<boolean>
+  /** Fetch authorized durable history back through the requested sequence. */
+  loadThrough?: (seq: SessionSeq) => Promise<void>
+  /** Obtain the ledger's reading-position handle for the specified history generation. */
+  readingPosition?: (epoch: number | undefined) => SessionReadingPosition | undefined
   loadImage: MessageImageLoader
   setActualDuration: (actualDuration: boolean) => void
   watchToolResult?: WatchToolResult
@@ -133,7 +139,7 @@ function addUsage(
 
 export function TrajectoryView({
   useSession, useTrajectory, useDuration, watchToolResult, loadOlder, loadImage, setActualDuration,
-  viewRequest, completeViewRequest, renderSlot, t, jsonStringWrapping,
+  viewRequest, completeViewRequest, renderSlot, t, jsonStringWrapping, useConversation, readingPosition, loadThrough,
 }: ConvViewProps
   & Pick<PropsRenderSlots<'conversation.trajectory.images'>, 'renderSlot'>
   & InjectFace<TrajectoryViewInjected>
@@ -158,6 +164,17 @@ export function TrajectoryView({
     readonly index: number
   } | null>(null)
   const completeInspection = useTrajectory(snapshot => snapshot)
+  const historyWindow = useConversation(snapshot => snapshot.history)
+  const historyEpoch = useSession(snapshot => snapshot.historyEpoch)
+  const openState = useSession(snapshot => snapshot.openState)
+  const availability = useSession(snapshot => snapshot.historyAvailability
+    ?? (snapshot.openState === 'open' ? 'confirmed' : 'unavailable'))
+  const canPage = openState === 'open' && availability === 'confirmed'
+  const historyVisible = availability !== 'unavailable'
+  const positionHandle = useMemo(() => historyVisible ? readingPosition?.(historyEpoch) : undefined,
+    [readingPosition, historyEpoch, historyVisible])
+  const [restoring, setRestoring] = useState<{ epoch: number | undefined; seq: number }>()
+  const requestedPosition = useRef<{ anchor: TrajectoryReadingAnchor; head: number | null } | undefined>(undefined)
   const latestNodeSeq = completeInspection.eventNodes.at(-1)?.seq
   const [historyTailSeq, setHistoryTailSeq] = useState(latestNodeSeq)
   const [historyNodeLimit, setHistoryNodeLimit] = useState(HISTORY_PAGE_NODES)
@@ -168,7 +185,10 @@ export function TrajectoryView({
   const historyEndIndex = historyTailIndex < 0 && latestNodeSeq !== undefined
     ? completeInspection.eventNodes.length
     : historyTailIndex + 1
-  const historyStartIndex = Math.max(0, historyEndIndex - historyNodeLimit)
+  const pageStartIndex = Math.max(0, historyEndIndex - historyNodeLimit)
+  const restoreSeq = restoring !== undefined && restoring.epoch === historyEpoch ? restoring.seq : undefined
+  const restoreIndex = restoreSeq === undefined ? -1 : completeInspection.eventNodes.findIndex(node => node.seq >= restoreSeq)
+  const historyStartIndex = restoreIndex < 0 ? pageStartIndex : Math.min(pageStartIndex, Math.max(0, restoreIndex - 1))
   useEffect(() => {
     if (latestNodeSeq !== undefined && (historyTailSeq === undefined || historyTailIndex < 0)) {
       setHistoryTailSeq(latestNodeSeq)
@@ -185,7 +205,8 @@ export function TrajectoryView({
         request.startSeq >= firstSeq || (request.resultSeq ?? -1) >= firstSeq),
     }
   }, [completeInspection, historyStartIndex])
-  const historyLoading = useSession(snapshot => snapshot.openState === 'loading')
+  const historyLoading = availability === 'unavailable' && openState === 'loading'
+  const firstDurableSeq = historyWindow === undefined ? completeInspection.eventNodes[0]?.seq ?? null : historyWindow.firstSeq
   const olderHistoryLoading = useSession(snapshot => snapshot.loadingOlder)
   const sessionHasOlderHistory = useSession(snapshot => snapshot.hasMore)
   const hasResidentOlderHistory = historyStartIndex > 0
@@ -536,10 +557,32 @@ export function TrajectoryView({
   }
 
   const loadEarlierHistory = useCallback(async () => {
-    if (!hasResidentOlderHistory && !await loadOlder()) return false
-    setHistoryNodeLimit(limit => limit + HISTORY_PAGE_NODES)
+    if (!hasResidentOlderHistory && (!canPage || !await loadOlder())) return false
+    const count = historyEndIndex - historyStartIndex
+    setHistoryNodeLimit(limit => Math.max(limit, count) + HISTORY_PAGE_NODES)
     return true
-  }, [hasResidentOlderHistory, loadOlder])
+  }, [hasResidentOlderHistory, canPage, loadOlder, historyEndIndex, historyStartIndex])
+  const canLoadEarlier = hasResidentOlderHistory || canPage
+  const settleRestore = useCallback(() => {
+    if (restoreSeq === undefined) return
+    const count = historyEndIndex - historyStartIndex
+    setHistoryNodeLimit(limit => Math.max(limit, count))
+    setRestoring(undefined)
+    requestedPosition.current = undefined
+  }, [restoreSeq, historyEndIndex, historyStartIndex])
+  const historyLoadStatus = useSession(snapshot => snapshot.historyLoadStatus)
+  const restorePage = useCallback((anchor: TrajectoryReadingAnchor) => {
+    setRestoring(previous => previous !== undefined && previous.epoch === historyEpoch && previous.seq === anchor.seq
+      ? previous : { epoch: historyEpoch, seq: anchor.seq })
+    if (!canPage || !sessionHasOlderHistory || (firstDurableSeq !== null && firstDurableSeq <= anchor.seq)) return
+    if (olderHistoryLoading || historyLoadStatus === 'error' || loadThrough === undefined) return
+    const requested = requestedPosition.current
+    if (requested?.anchor === anchor && requested.head === firstDurableSeq) return
+    requestedPosition.current = { anchor, head: firstDurableSeq }
+    void loadThrough(SessionSeq(anchor.seq)).catch(() => {
+      // Session paging owns the error state and keeps the selected position available.
+    })
+  }, [historyEpoch, canPage, sessionHasOlderHistory, firstDurableSeq, olderHistoryLoading, historyLoadStatus, loadThrough])
 
   return (
     <div className={css.root} data-conversation-composer-overlay="">
@@ -569,7 +612,7 @@ export function TrajectoryView({
         turns={timelineTurns}
         mode={timelineMode}
         range={timelineRange}
-        hasEarlierRecords={hasOlderHistory}
+        hasEarlierRecords={hasOlderHistory && canLoadEarlier}
         onLoadEarlier={loadEarlierHistory}
         selectedIndex={selectedTimelineIndex}
         searchMatchIndexes={searchMatchIndexes}
@@ -600,7 +643,15 @@ export function TrajectoryView({
           olderHistoryLoading={olderHistoryLoading}
           historyStartSeq={historyBaseSeq}
           hasOlderRecords={hasOlderHistory}
-          onLoadOlder={loadEarlierHistory}
+          {...(canLoadEarlier ? { onLoadOlder: loadEarlierHistory } : {})}
+          readingPosition={positionHandle}
+          historyEpoch={historyEpoch}
+          historyReconciliation={historyWindow?.reconciliation}
+          historyConfirmed={canPage}
+          missingBefore={sessionHasOlderHistory ? firstDurableSeq ?? Number.POSITIVE_INFINITY : null}
+          residentBefore={hasResidentOlderHistory && restoreSeq === undefined ? historyBaseSeq : null}
+          restorePage={restorePage}
+          settleRestore={settleRestore}
           onClearSelection={() => { setTimelineSelection(null) }}
           collapsedTurns={collapsedTurns}
           onToggleTurn={toggleTurn}

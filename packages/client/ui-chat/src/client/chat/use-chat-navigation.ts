@@ -1,9 +1,9 @@
 /** Turn jumps and history-prepend anchoring, independent of DOM measurement. */
 import { useLayoutEffect, useState } from 'react'
 import type { SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
-import type { SessionSeq } from '@deepseek-ai/dsh-session/types'
+import { SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { ChatNode } from '../contract/chat-nodes.ts'
-import type { ChatViewSlotProps } from '../contract/slots.ts'
+import type { ChatScrollPosition, ChatViewSlotProps } from '../contract/slots.ts'
 import type { TurnRailItem } from './turn-rail-items.ts'
 import type { ChatReading, ReadingSample } from './use-chat-reading.ts'
 import type { ChatViewport } from './use-chat-viewport.ts'
@@ -15,6 +15,7 @@ export interface ChatNavigationInput extends Pick<ChatViewSlotProps, 'loadOlder'
   readonly loadingOlder: boolean
   readonly historyLoadStatus: SessionSnapshot['historyLoadStatus']
   readonly isOpen: boolean
+  readonly durableFirstSeq?: number | null | undefined
 }
 
 interface TurnJump {
@@ -30,6 +31,7 @@ type HistoryIntent = 'none' | 'auto' | 'manual'
 /** Owns one replaceable turn jump and the anchor retained while history loads. */
 export class ChatNavigation {
   private jump: TurnJump | null = null
+  private restoration: { readonly position: ChatScrollPosition; readonly seq: number; requestedHead?: number | null } | null = null
   private settleFrame: number | null = null
   private historyFrame: number | null = null
   private historyIntent: HistoryIntent = 'none'
@@ -81,6 +83,7 @@ export class ChatNavigation {
   private clearTask(): void {
     this.cancelFrame()
     this.jump = null
+    this.restoration = null
     this.viewport.stopPreserving()
     this.viewport.cancelHistoryPrepend()
   }
@@ -98,6 +101,7 @@ export class ChatNavigation {
       if (this.input.loadingOlder) this.viewport.beginPreserving(landing.position)
       return
     }
+    if (!this.input.isOpen) return
     this.cancel()
     this.viewport.beginPreserving()
     this.reading.pauseFollowing()
@@ -115,6 +119,7 @@ export class ChatNavigation {
 
   /** Request and consume one page, retaining the click until success, exhaustion, or failure. */
   readonly loadEarlier = (): void => {
+    if (!this.input.isOpen) return
     this.cancel()
     this.setHistoryIntent('manual')
     this.reading.pauseFollowing()
@@ -144,7 +149,7 @@ export class ChatNavigation {
 
   private checkHistory(): void {
     const input = this.input
-    if (!input.isOpen || this.jump !== null || this.historyRequested || input.loadingOlder) return
+    if (!input.isOpen || this.jump !== null || this.restoration !== null || this.historyRequested || input.loadingOlder) return
     if (input.historyLoadStatus === 'error') return
     if (input.historyLoadStatus === 'pendingConsumption') {
       if (this.historyIntent === 'none') return
@@ -229,8 +234,65 @@ export class ChatNavigation {
     return true
   }
 
+  /**
+   * Start restoration without replacing the saved position if an older page is required.
+   * @param position - last known position of the reader.
+   */
+  restorePosition(position: ChatScrollPosition): void {
+    if (position.seq === undefined) return
+    this.cancel()
+    this.restoration = { position, seq: position.seq }
+    this.reading.waitForPosition()
+    this.reconcileRestoration()
+  }
+
+  /** Relinquish a pending automatic landing on new reader input. */
+  cancelRestoration(): void {
+    if (this.restoration === null) return
+    this.restoration = null
+    this.cancelFrame()
+  }
+
+  private reconcileRestoration(): void {
+    const restoration = this.restoration
+    if (restoration === null || this.reading.pending) return
+    const { position, seq } = restoration
+    const { isOpen, hasMore, loadingOlder, historyLoadStatus, firstSeq, durableFirstSeq } = this.input
+    const head = durableFirstSeq === undefined ? firstSeq : durableFirstSeq
+    const missingPrefix = hasMore && (head === null || head > seq)
+    const landing = missingPrefix ? null : this.viewport.restoreDurable(position, isOpen)
+    if (landing === 'revealing') {
+      if (this.settleFrame === null && typeof requestAnimationFrame === 'function') {
+        this.settleFrame = requestAnimationFrame(() => {
+          this.settleFrame = null
+          if (this.restoration === restoration) this.reconcileRestoration()
+        })
+      }
+      return
+    }
+    if (landing !== null) {
+      this.restoration = null
+      this.reading.preservePosition(landing, true)
+      this.reading.refreshActiveTurn()
+      return
+    }
+    if (!isOpen) return
+    if (!missingPrefix) {
+      this.restoration = null
+      this.reading.followTail()
+      return
+    }
+    if (loadingOlder || historyLoadStatus === 'error' || restoration.requestedHead === head) return
+    restoration.requestedHead = head
+    // loadThrough may consume a prepared page synchronously. The next committed window owns the landing.
+    void this.input.loadThrough(SessionSeq(seq)).catch(() => {
+      // Session paging owns the error state; keep the original anchor available for retry.
+    })
+  }
+
   /** Land, retry, or complete the current jump against the committed window. */
   reconcile(): void {
+    this.reconcileRestoration()
     const jump = this.jump
     if (jump === null || this.reading.pending) return
     if (jump.phase === 'loading') {

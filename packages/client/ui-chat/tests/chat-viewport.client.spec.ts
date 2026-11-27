@@ -3,6 +3,7 @@
 import { expect, it, onTestFinished, vi } from 'vitest'
 import { ChatViewport } from '../src/client/chat/use-chat-viewport.ts'
 import { ScrollFollow, scrollMetrics } from '../src/client/chat/use-scroll-follow.ts'
+import { CHAT_REVEAL_READING_ANCHOR } from '../src/client/chat/searchable-hidden.ts'
 
 function fixture() {
   const column = document.createElement('div')
@@ -102,6 +103,27 @@ it('uses the first paging anchor for one-shot history prepending without reading
   h.prepend(30)
   h.viewport.finishHistoryPrepend()
   expect(h.column.scrollTop).toBe(120)
+})
+
+it('reveals a folded durable member before restoring its inner and outer offsets', () => {
+  const h = fixture()
+  const body = document.createElement('div')
+  body.dataset.stepProcessBody = ''
+  body.setAttribute('hidden', 'until-found')
+  const content = document.createElement('div')
+  content.dataset.stepProcessContent = ''
+  h.column.append(body)
+  body.append(content)
+  const row = h.row(content, 'saved', 180)
+  row.dataset.chatReadingSeq = '12'
+  const impostor = h.row(h.column, 'saved', 400)
+  impostor.dataset.chatReadingSeq = '50'
+  const saved = { anchorKey: 'saved', seq: 12, anchorTop: 20, scrollTop: 20, groupTop: 10 }
+  const reveal = vi.fn((event: Event) => { event.preventDefault(); body.removeAttribute('hidden') })
+  body.addEventListener(CHAT_REVEAL_READING_ANCHOR, reveal)
+  expect(h.viewport.restoreDurable(saved, true)).toBe('revealing')
+  expect(reveal).toHaveBeenCalledOnce()
+  expect(h.viewport.restoreDurable(saved, true)).toMatchObject({ position: { anchorKey: 'saved', seq: 12, anchorTop: 20 } })
 })
 
 it('uses a collapsed group paging anchor when no ordinary content row is visible', () => {

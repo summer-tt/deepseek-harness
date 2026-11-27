@@ -2,7 +2,7 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type {
-  ISessions, SessionBinding, SessionEventSource, SessionEventWindow,
+  ISessions, SessionBinding, SessionEventLikeEntry, SessionEventSource, SessionEventWindow,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types'
 import { WeakMapWithValues } from '@deepseek-ai/dsh-util-values'
@@ -58,6 +58,7 @@ class BoundConversation implements ConversationBinding {
   private readonly viewStore: ConversationViewSnapshotStore
   private readonly targetSources = new Map<string, ObservableSnapshot<unknown>>()
   private revision = -1
+  private history: NonNullable<ConversationSnapshot['history']> = { firstSeq: null, reconciliation: 0 }
   private frame: number | undefined
   private disposeFeed: () => void = () => {}
 
@@ -106,7 +107,20 @@ class BoundConversation implements ConversationBinding {
 
   private replace(window: SessionEventWindow): void {
     this.revision = window.revision
+    this.history = {
+      firstSeq: window.entries.find(entry => entry.type === 'event')?.event.seq ?? null,
+      reconciliation: this.history.reconciliation + 1,
+    }
     this.publish(this.assembler.replaceWindow(window.entries, window.hasMore))
+  }
+
+  private extendHistory(entries: readonly SessionEventLikeEntry[], reconcile = false): void {
+    const first = entries.find(entry => entry.type === 'event')?.event.seq
+    const previous = this.history
+    const firstSeq = first === undefined ? previous.firstSeq : Math.min(previous.firstSeq ?? first, first)
+    if (firstSeq !== previous.firstSeq || reconcile) {
+      this.history = { firstSeq, reconciliation: previous.reconciliation + Number(reconcile) }
+    }
   }
 
   private accept(window: SessionEventWindow): void {
@@ -118,10 +132,12 @@ class BoundConversation implements ConversationBinding {
     this.revision = window.revision
     switch (window.change.kind) {
       case 'prepend':
+        this.extendHistory(window.change.entries)
         this.publish(this.assembler.prepend(window.change.entries, window.hasMore))
         return
       case 'history-append':
       case 'append': {
+        this.extendHistory(window.change.entries, window.change.kind === 'history-append')
         let publication: ConversationPublication = 'none'
         for (const event of window.change.entries) {
           const next = this.assembler.append(event)
@@ -131,6 +147,7 @@ class BoundConversation implements ConversationBinding {
         return
       }
       case 'settle-assistant':
+        if (window.change.entry !== undefined) this.extendHistory([window.change.entry])
         this.publish(this.assembler.settleAssistant(
           window.change.attemptId,
           window.change.entry,
@@ -140,7 +157,10 @@ class BoundConversation implements ConversationBinding {
   }
 
   private publish(publication: ConversationPublication): void {
-    if (publication === 'none') return
+    if (publication === 'none') {
+      if (this.snapshot.getSnapshot().history !== this.history) this.publishSnapshot(false)
+      return
+    }
     if (publication === 'animation-frame' && typeof requestAnimationFrame === 'function') {
       if (this.frame !== undefined) return
       // Cross three paint opportunities before publishing high-frequency stream updates.
@@ -182,7 +202,7 @@ class BoundConversation implements ConversationBinding {
   }
 
   private publishSnapshot(changed: boolean): void {
-    if (changed) this.snapshot.set(this.currentSnapshot())
+    if (changed || this.snapshot.getSnapshot().history !== this.history) this.snapshot.set(this.currentSnapshot())
     this.openTurn.set(this.assembler.openTurn())
   }
 
@@ -190,6 +210,7 @@ class BoundConversation implements ConversationBinding {
     return {
       views: this.viewStore,
       activeTargets: this.assembler.activityTargets(),
+      history: this.history,
     }
   }
 }

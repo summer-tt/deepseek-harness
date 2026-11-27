@@ -468,6 +468,8 @@ export interface InputZone {
 
 /** Conversation View entries obtain their data from registered standard hooks. */
 export interface ConvViewOwnerProps {
+  /** The embedded Sidebar and main view maintain independent reading positions. */
+  readonly occurrence?: 'main' | 'embedded'
   /** Open a tool call's inspector when an inspection target is available. */
   inspectCall: ((callId: string) => void) | undefined
   /** Focus request addressed to the selected View. */

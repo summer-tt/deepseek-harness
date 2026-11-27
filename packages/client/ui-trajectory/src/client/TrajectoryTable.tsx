@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
+import type { SessionReadingPosition } from '@deepseek-ai/dsh-api-session-controller/client'
 import { assertNever, type JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { WatchToolResult } from './watch-tool-result.ts'
 import { useVirtualizer } from '@tanstack/react-virtual'
@@ -133,6 +134,21 @@ const KIND_ICON: Record<TrajectoryCellKind, ReactNode> = {
   subtool: <ToolWrenchIcon />,
 }
 
+/** Durable ledger row and its offset from the scrollport's top edge. */
+export interface TrajectoryReadingAnchor {
+  readonly key: string
+  readonly seq: number
+  readonly offset: number
+}
+
+function readingAnchor(value: unknown): TrajectoryReadingAnchor | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const { key, seq, offset } = value as Partial<TrajectoryReadingAnchor>
+  if (typeof key !== 'string' || typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0
+    || typeof offset !== 'number' || !Number.isFinite(offset)) return undefined
+  return { key, seq, offset }
+}
+
 interface TableRecord {
   turn: number | null
   section: number
@@ -143,6 +159,27 @@ interface TableRecord {
   turnEnd: boolean
   collapsedSummary?: string
   collapsedSummaryKind?: 'turn' | 'assistant' | 'tool'
+}
+
+function readingSeq(record: TableRecord): number | undefined {
+  const seq = record.cell.sourceSeq ?? record.cell.resultSeq
+  return record.collapsedSummary !== undefined || record.cell.requestOnly === true
+    || seq === Number.MAX_SAFE_INTEGER || !Number.isSafeInteger(seq) ? undefined : seq
+}
+
+function nearestReadingRecord(records: readonly TableRecord[], seq: number): TableRecord | undefined {
+  let nearest: TableRecord | undefined
+  let nearestSeq = Number.POSITIVE_INFINITY
+  for (const record of records) {
+    const candidate = readingSeq(record)
+    if (candidate === undefined) continue
+    const distance = Math.abs(candidate - seq)
+    const previousDistance = Math.abs(nearestSeq - seq)
+    if (distance > previousDistance || (distance === previousDistance && candidate >= nearestSeq)) continue
+    nearest = record
+    nearestSeq = candidate
+  }
+  return nearest
 }
 
 const COLLAPSED_SUMMARY_LABEL_KEY: Record<NonNullable<TableRecord['collapsedSummaryKind']>, TrajectoryKey> = {
@@ -430,8 +467,24 @@ export interface TrajectoryTableProps {
   olderHistoryLoading?: boolean
   /** First loaded raw event, used to preserve scroll position after prepending a page. */
   historyStartSeq?: number | undefined
-  /** Whether one older history page can be requested. */
+  /** Show the earlier-history row while older records exist or may be loaded. */
   hasOlderRecords?: boolean
+  /** Authorization-bound ledger position. */
+  readingPosition?: SessionReadingPosition | undefined
+  /** Session generation of the current position handle. */
+  historyEpoch?: number | undefined
+  /** Changes when history is replaced or extended off the live stream. */
+  historyReconciliation?: number | undefined
+  /** Whether the loaded range is authoritative and may be paged. */
+  historyConfirmed?: boolean
+  /** An older page may contain anchors below this seq. */
+  missingBefore?: number | null
+  /** Include resident or remotely paged records near a pending anchor. */
+  restorePage?: (anchor: TrajectoryReadingAnchor) => void
+  /** Whether an earlier resident slice could still contain the target. */
+  residentBefore?: number | null
+  /** Retain the expanded resident extent when automatic restoration ends. */
+  settleRestore?: () => void
   /** Load one older history page. */
   onLoadOlder?: () => Promise<boolean>
   /** Clear selection state owned by the ledger host. */
@@ -2111,6 +2164,14 @@ export function TrajectoryTable({
   olderHistoryLoading = false,
   historyStartSeq,
   hasOlderRecords = false,
+  readingPosition,
+  historyEpoch,
+  historyReconciliation,
+  historyConfirmed = true,
+  missingBefore = null,
+  restorePage,
+  residentBefore = null,
+  settleRestore,
   onLoadOlder,
   onClearSelection,
   collapsedTurns,
@@ -2137,6 +2198,19 @@ export function TrajectoryTable({
   const tablePaneRef = useRef<HTMLDivElement>(null)
   const followsTableTail = useRef(false)
   const tableScrollInitialized = useRef(false)
+  const reader = useRef<{
+    handle: SessionReadingPosition | undefined
+    epoch: number | undefined
+    reconciliation: number | undefined
+    position: TrajectoryReadingAnchor | undefined
+    target: TrajectoryReadingAnchor | undefined
+    requestPage: typeof restorePage
+    scrollTop: number | undefined
+    interrupted: boolean
+  }>({
+    handle: readingPosition, epoch: historyEpoch, reconciliation: historyReconciliation,
+    position: undefined, target: undefined, requestPage: undefined, scrollTop: undefined, interrupted: false,
+  })
   const [tableScrollReady, setTableScrollReady] = useState(false)
   const pendingScrollRecordId = useRef<string | null>(null)
   const loadingOlder = useRef(false)
@@ -2248,6 +2322,27 @@ export function TrajectoryTable({
     }
     return indexes
   }, [projectedVirtualRows])
+  const releaseRestoration = useCallback(() => {
+    if (reader.current.target === undefined) return
+    reader.current.target = undefined
+    reader.current.requestPage = undefined
+    settleRestore?.()
+  }, [settleRestore])
+  const readerIntent = useCallback(() => {
+    reader.current.interrupted = true
+    reader.current.scrollTop = undefined
+    releaseRestoration()
+  }, [releaseRestoration])
+  const capturePosition = useCallback((pane: HTMLDivElement): TrajectoryReadingAnchor | undefined => {
+    const viewportTop = pane.getBoundingClientRect().top
+    const rows = pane.querySelectorAll<HTMLElement>('[data-trajectory-reading-seq]')
+    for (const row of rows) {
+      const { top, bottom } = row.getBoundingClientRect()
+      if (bottom <= viewportTop) continue
+      const key = row.dataset.trajectoryRowKey
+      if (key !== undefined) return { key, seq: Number(row.dataset.trajectoryReadingSeq), offset: top - viewportTop }
+    }
+  }, [])
   const virtualItems = virtualizationEnabled ? rowVirtualizer.getVirtualItems() : []
   const virtualTop = Math.max(0, (virtualItems[0]?.start ?? 0) - virtualScrollMargin)
   const virtualBottom = virtualItems.length === 0
@@ -2622,6 +2717,68 @@ export function TrajectoryTable({
   useLayoutEffect(() => {
     const pane = tablePaneRef.current
     if (pane === null) return
+    const reading = reader.current
+    if (reading.handle !== readingPosition || reading.epoch !== historyEpoch) {
+      reading.handle = readingPosition
+      reading.epoch = historyEpoch
+      reading.position = undefined
+      reading.target = undefined
+      reading.requestPage = undefined
+      reading.scrollTop = undefined
+      reading.interrupted = false
+      tableScrollInitialized.current = false
+      olderLoadAnchor.current = null
+    }
+    const reconciled = reading.reconciliation !== historyReconciliation
+    reading.reconciliation = historyReconciliation
+    if (!tableScrollInitialized.current && !historyLoading) reading.target ??= readingAnchor(readingPosition?.read())
+    else if (reconciled && !reading.interrupted) reading.target ??= reading.position
+    const target = reading.target
+    if (target !== undefined) {
+      followsTableTail.current = false
+      const prefixMissing = (missingBefore !== null && target.seq < missingBefore)
+        || (residentBefore !== null && target.seq < residentBefore)
+      const exact = prefixMissing ? undefined
+        : records.find(record => readingSeq(record) === target.seq && trajectoryVirtualRecordKey(record) === target.key)
+      const fallback = exact === undefined && historyConfirmed && !prefixMissing
+        ? nearestReadingRecord(records, target.seq) : undefined
+      const candidate = exact ?? fallback
+      const key = candidate === undefined ? undefined : trajectoryVirtualRecordKey(candidate)
+      const mounted = key === undefined ? undefined : [...pane.querySelectorAll<HTMLElement>('[data-trajectory-reading-seq]')]
+        .find(row => row.dataset.trajectoryRowKey === key)
+      if (mounted !== undefined && candidate !== undefined && key !== undefined) {
+        const currentOffset = mounted.getBoundingClientRect().top - pane.getBoundingClientRect().top
+        const before = pane.scrollTop
+        pane.scrollTop += currentOffset - target.offset
+        reading.scrollTop = pane.scrollTop
+        reading.position = { key, seq: readingSeq(candidate) ?? target.seq, offset: currentOffset + before - pane.scrollTop }
+        releaseRestoration()
+        readingPosition?.write(reading.position)
+        olderLoadAnchor.current = null
+      } else if (candidate !== undefined && virtualizationEnabled) {
+        const index = virtualIndexByRecordId.get(trajectoryRecordId(candidate.cell))
+        if (index !== undefined) {
+          const offset = rowVirtualizer.getOffsetForIndex(index, 'start')?.[0]
+          if (offset !== undefined) rowVirtualizer.scrollToOffset(offset - target.offset)
+          reading.scrollTop = pane.scrollTop
+        }
+      } else if (prefixMissing || !historyConfirmed) {
+        if (reading.requestPage !== restorePage) {
+          reading.requestPage = restorePage
+          restorePage?.(target)
+        }
+      } else {
+        reading.position = undefined
+        releaseRestoration()
+        readingPosition?.write(undefined)
+        tableScrollInitialized.current = false
+      }
+      if (candidate !== undefined || reading.target !== undefined) {
+        tableScrollInitialized.current = true
+        setTableScrollReady(true)
+        return
+      }
+    }
     const anchor = olderLoadAnchor.current
     if (anchor !== null && anchor.historyStartSeq !== historyStartSeq) {
       if (!virtualizationEnabled) {
@@ -2640,14 +2797,12 @@ export function TrajectoryTable({
       setTableScrollReady(true)
       return
     }
-    if (!followsTableTail.current) return
+    if (!followsTableTail.current || reading.interrupted) return
     if (!virtualizationEnabled) pane.scrollTop = pane.scrollHeight
   }, [
-    historyLoading,
-    historyStartSeq,
-    rowVirtualizer,
-    virtualRowStructure,
-    virtualizationEnabled,
+    historyLoading, historyStartSeq, historyEpoch, historyReconciliation, historyConfirmed, missingBefore, residentBefore,
+    readingPosition, records, restorePage, releaseRestoration, rowVirtualizer, virtualIndexByRecordId,
+    virtualItems[0]?.index, virtualItems.at(-1)?.index, virtualRowStructure, virtualizationEnabled,
   ])
 
   const olderBusy = olderHistoryLoading || olderLoading
@@ -2660,11 +2815,34 @@ export function TrajectoryTable({
         ref={tablePaneRef}
         className={css.tablePane}
         data-trajectory-scroll=""
+        onWheel={readerIntent}
+        onPointerDown={readerIntent}
+        onTouchStart={readerIntent}
+        onKeyDown={(event) => {
+          if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+            readerIntent()
+          }
+        }}
         onScroll={(event) => {
           const pane = event.currentTarget
+          const reading = reader.current
+          if (!tableScrollInitialized.current || reading.scrollTop === pane.scrollTop) return
+          if (reading.target !== undefined && !reading.interrupted) return
+          reading.scrollTop = undefined
+          reading.interrupted = false
           followsTableTail.current =
             pane.scrollHeight - pane.clientHeight - pane.scrollTop
               <= BOTTOM_FOLLOW_THRESHOLD_PX
+          if (followsTableTail.current) {
+            reading.position = undefined
+            reading.handle?.write(undefined)
+          } else {
+            const position = capturePosition(pane)
+            if (position !== undefined) {
+              reading.position = position
+              reading.handle?.write(position)
+            }
+          }
           requestOlder(pane, true)
         }}
         onClick={(event) => {
@@ -2790,6 +2968,7 @@ export function TrajectoryTable({
                       aria-selected={!isCollapsedSummary && !isRequestOnly && selectedIndex === record.cell.index}
                       data-kind={record.cell.kind}
                       data-trajectory-row-key={trajectoryVirtualRecordKey(record)}
+                      data-trajectory-reading-seq={readingSeq(record)}
                       data-virtual-position={virtualizationEnabled ? position : undefined}
                       data-record-index={!isCollapsedSummary && !isRequestOnly
                         ? record.cell.index

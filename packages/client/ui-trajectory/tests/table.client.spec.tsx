@@ -624,6 +624,46 @@ describe('TrajectoryTable', () => {
     expect(tablePane.scrollTop).toBe(20)
   })
 
+  it('restores seeded ledger history and retains the offset across authoritative replacements', () => {
+    const cells = (seqs: readonly number[]): readonly TrajectoryTurnModel[] => [{
+      turn: 1,
+      groups: [{ title: 'History', cells: seqs.map((seq, index) => ({
+        index, kind: 'user', sourceSeq: seq, text: `prompt-${seq}`, timeSeconds: 0,
+      })) }],
+    }]
+    const key = (seq: number) => encodeURIComponent(`user\u0000seq\u0000${seq}`)
+    let position: unknown = { key: key(10), seq: 10, offset: 24 }
+    const readingPosition = { read: () => position, write: (next: unknown) => { position = next } }
+    const restorePage = vi.fn()
+    const offsets = new Map([[8, 120], [10, 160], [12, 400]])
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const pane = this.closest<HTMLElement>('[data-trajectory-scroll]')
+      if (pane === this) return new DOMRect(0, 0, 500, 250)
+      const top = offsets.get(Number(this.dataset.trajectoryReadingSeq)) ?? 0
+      return new DOMRect(0, top - (pane?.scrollTop ?? 0), 500, 30)
+    })
+    const view = render(<TrajectoryTable turns={cells([8, 10, 12])} {...FOLD_PROPS}
+      historyConfirmed={false} historyReconciliation={1} readingPosition={readingPosition} restorePage={restorePage} />)
+    const pane = screen.getByRole('table').parentElement!
+    expect(screen.getByText('prompt-10')).toBeTruthy()
+    expect(pane.scrollTop).toBe(136)
+    expect(restorePage).not.toHaveBeenCalled()
+
+    offsets.set(10, 260)
+    view.rerender(<TrajectoryTable turns={cells([8, 10, 12])} {...FOLD_PROPS}
+      historyConfirmed historyReconciliation={2} readingPosition={readingPosition} restorePage={restorePage} />)
+    expect(pane.scrollTop).toBe(236)
+    view.rerender(<TrajectoryTable turns={cells([8, 12])} {...FOLD_PROPS}
+      historyConfirmed historyReconciliation={3} readingPosition={readingPosition} restorePage={restorePage} />)
+    expect(pane.scrollTop).toBe(96)
+    expect(position).toEqual({ key: key(8), seq: 8, offset: 24 })
+    fireEvent.wheel(pane, { deltaY: 20 })
+    offsets.set(8, 200)
+    view.rerender(<TrajectoryTable turns={cells([8, 12])} {...FOLD_PROPS}
+      historyConfirmed historyReconciliation={4} readingPosition={readingPosition} restorePage={restorePage} />)
+    expect(pane.scrollTop).toBe(96)
+  })
+
   it('preserves the visible anchor when the last older page disables virtualization', async () => {
     let resolveOlder: ((advanced: boolean) => void) | undefined
     const older = new Promise<boolean>((resolve) => { resolveOlder = resolve })

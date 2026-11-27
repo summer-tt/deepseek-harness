@@ -64,6 +64,178 @@ const SEED_ID = 'seeded-history-web-e2e'
 
 const PROMPT = 'Use the read tool twice in one assistant message: read a.txt and b.txt. Then reply with the single word DONE and stop.'
 
+it.skipIf(MODE === 'record')('displays visited history before a delayed follow and retains the reading anchor', async () => {
+  const scaffold = await launchWebScaffold()
+  const executablePath = process.env.DSH_PLAYWRIGHT_EXECUTABLE_PATH
+  try {
+    const source = await readFile(SEED, 'utf8')
+    const a = 'history-cache-a'
+    const b = 'history-cache-b'
+    const promptA = 'Recorded history from Session A'
+    const promptB = 'Recorded history from Session B'
+    const body = (prompt: string): string => source.replaceAll(PROMPT, `${prompt}\n${'\nReading position fixture.'.repeat(55)}`.replaceAll('\n', '\\n'))
+    await seedSession(scaffold, body(promptA), a)
+    await seedSession(scaffold, body(promptB), b)
+    const browser = await chromium.launch(executablePath === undefined ? {} : { executablePath })
+    try {
+      const page = await newEnglishPage(browser)
+      await page.setViewportSize({ width: 1100, height: 550 })
+      const delay = 500
+      let deferred = false
+      let delayedRequests = 0
+      let responseGate: Promise<void> | undefined
+      let lastRequest: { readonly started: number; readonly forwarded: Promise<number>; readonly opened: Promise<void> } | undefined
+      await page.routeWebSocket('**/api/remote.mux', (socket) => {
+        const server = socket.connectToServer()
+        const openings = new Map<string, { readonly release: () => void; readonly gate: Promise<void> | undefined }>()
+        server.onMessage((message) => {
+          const frame = JSON.parse(String(message)) as { type: string; streamId?: string; value?: { type: string } }
+          const opening = frame.streamId === undefined ? undefined : openings.get(frame.streamId)
+          const forward = (): void => {
+            socket.send(message)
+            if (frame.type === 'item' && frame.streamId !== undefined && frame.value?.type === 'snapshot') {
+              opening?.release()
+              openings.delete(frame.streamId)
+            }
+          }
+          if (opening?.gate === undefined) forward()
+          else void opening.gate.then(forward)
+        })
+        socket.onMessage((message) => {
+          const frame = JSON.parse(String(message)) as {
+            type: string
+            endpoint?: string
+            streamId?: string
+            payload?: { args?: { request?: { address?: { sessionId?: string } } } }
+          }
+          if (deferred && frame.type === 'open' && frame.endpoint === 'session/follow'
+            && frame.payload?.args?.request?.address?.sessionId === a && typeof frame.streamId === 'string') {
+            delayedRequests += 1
+            const started = performance.now()
+            const opening = Promise.withResolvers<undefined>()
+            openings.set(frame.streamId, { release: () => { opening.resolve(undefined) }, gate: responseGate })
+            const forwarded = new Promise<number>((resolve) => {
+              setTimeout(() => { server.send(message); resolve(performance.now()) }, delay)
+            })
+            lastRequest = { started, forwarded, opened: opening.promise }
+          } else server.send(message)
+        })
+      })
+      await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+      const row = (id: string) => page.locator(`[data-row-key="session:${id}"]`)
+      const group = page.locator('[data-row-key^="workspace:"]').first()
+      await group.waitFor({ timeout: 15_000 })
+      if (await group.getAttribute('aria-expanded') === 'false') await group.click()
+      const chat = page.locator('[data-conversation-scroll]')
+      const contentA = chat.getByText(promptA, { exact: false }).first()
+      const contentB = chat.getByText(promptB, { exact: false }).first()
+      const waitForRequest = async (): Promise<NonNullable<typeof lastRequest>> => {
+        await expect.poll(() => lastRequest).toBeDefined()
+        if (lastRequest === undefined) throw new Error('session follow was not opened')
+        return lastRequest
+      }
+
+      // Select B first to allow the browser owner announcement to reach the normal Client runtime.
+      await row(b).click()
+      await contentB.waitFor({ state: 'visible' })
+      deferred = true
+      const coldReply = Promise.withResolvers<undefined>()
+      responseGate = coldReply.promise
+      await row(a).click()
+      const cold = await waitForRequest()
+      expect(await contentA.count()).toBe(0)
+      coldReply.resolve(undefined)
+      await contentA.waitFor({ state: 'visible' })
+      const coldVisibleMs = performance.now() - cold.started
+      expect(coldVisibleMs).toBeGreaterThanOrEqual(delay)
+
+      const readAnchor = async () => contentA.evaluate((element) => {
+        const row = element.closest('[data-chat-anchor-key]')
+        const scroller = element.closest('[data-conversation-scroll]')
+        if (row === null || scroller === null) throw new Error('missing transcript reading anchor')
+        const bounds = row.getBoundingClientRect()
+        const viewport = scroller.getBoundingClientRect()
+        return {
+          key: row.getAttribute('data-chat-anchor-key'), offset: bounds.top - viewport.top,
+          inViewport: bounds.bottom > viewport.top && bounds.top < viewport.bottom,
+        }
+      })
+      // The two samples and the selector click share one browser turn, before scrollend or the 500 ms sampler.
+      const anchor = await contentA.evaluate((element) => {
+        const scroller = element.closest('[data-conversation-scroll]')
+        const anchorRow = element.closest('[data-chat-anchor-key]')
+        const target = document.querySelector<HTMLElement>('[data-row-key="session:history-cache-b"]')
+        if (scroller === null || anchorRow === null || target === null) throw new Error('missing reading fixture elements')
+        for (const top of [80, 120]) {
+          scroller.scrollTop = top
+          scroller.dispatchEvent(new Event('scroll'))
+        }
+        const saved = {
+          key: anchorRow.getAttribute('data-chat-anchor-key'),
+          offset: anchorRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+          position: scroller.scrollTop,
+        }
+        target.click()
+        return saved
+      })
+      const { position } = anchor
+      expect(position).toBe(120)
+      await contentB.waitFor({ state: 'visible' })
+      lastRequest = undefined
+      const reply = Promise.withResolvers<undefined>()
+      responseGate = reply.promise
+      await row(a).click()
+      const warm = await waitForRequest()
+      await contentA.waitFor({ state: 'visible' })
+      const warmVisibleMs = performance.now() - warm.started
+      await expect.poll(() => chat.evaluate(element => element.scrollTop), { interval: 10 }).toBeCloseTo(position, 0)
+      const warmPositionMs = performance.now() - warm.started
+      const forwardedAfterMs = await warm.forwarded - warm.started
+      expect(warmVisibleMs).toBeLessThan(forwardedAfterMs)
+      expect(warmPositionMs).toBeLessThan(forwardedAfterMs)
+      const restored = await readAnchor()
+      expect(restored.key).toBe(anchor.key)
+      expect(restored.inViewport).toBe(true)
+      expect(restored.offset).toBeCloseTo(anchor.offset, 0)
+      // A fresh follow actually reached the Host and its equal opening preserved the mounted content.
+      const nodeBeforeVerification = await contentA.elementHandle()
+      if (nodeBeforeVerification === null) throw new Error('cached transcript was not mounted before verification')
+      const transcript = await nodeBeforeVerification.evaluateHandle((node) => {
+        const counts = { batches: 0, mutations: 0 }
+        const observer = new MutationObserver((records) => {
+          counts.batches += 1
+          counts.mutations += records.length
+        })
+        observer.observe(node, { childList: true, characterData: true, subtree: true })
+        return { counts, observer }
+      })
+      reply.resolve(undefined)
+      await warm.opened
+      await page.evaluate(() => new Promise<void>((resolve) => {
+        requestAnimationFrame(() => { requestAnimationFrame(() => { resolve() }) })
+      }))
+      expect(await chat.evaluate(element => element.scrollTop)).toBeCloseTo(position, 0)
+      expect(await contentA.evaluate((element, before) => element === before, nodeBeforeVerification)).toBe(true)
+      const transcriptMutations = await transcript.evaluate(({ counts, observer }) => {
+        observer.disconnect()
+        return counts
+      })
+      expect(transcriptMutations.mutations).toBe(0)
+      await transcript.dispose()
+      await nodeBeforeVerification.dispose()
+      expect(delayedRequests).toBe(2)
+      console.info('[history-cache] Chromium switch', JSON.stringify({
+        browser: browser.version(), delay, coldVisibleMs, warmVisibleMs, warmPositionMs, position,
+        anchorOffset: anchor.offset, restoredOffset: restored.offset, delayedRequests, transcriptMutations,
+      }))
+    } finally {
+      await browser.close()
+    }
+  } finally {
+    await scaffold.close()
+  }
+}, 60_000)
+
 /** Trajectory visibility confirms Client receipt; Host persistence alone does not. */
 async function waitForContextInClient(page: Page, seq: number): Promise<void> {
   await page.getByRole('tab', { name: 'Trajectory', exact: true }).click()
@@ -268,7 +440,8 @@ describe('web e2e: seeded history renders through cold resume', () => {
       seededThroughSeq = parseSeedFixture(realizedWithCompaction).events.at(-1)?.seq ?? -1
       await seedSession(scaffold, realizedWithCompaction, SEED_ID, undefined, { createdAt: WEB_FIXTURE_TIME })
     }
-    browser = await chromium.launch()
+    const executablePath = process.env.DSH_PLAYWRIGHT_EXECUTABLE_PATH
+    browser = await chromium.launch(executablePath === undefined ? {} : { executablePath })
     page = await newEnglishPage(browser)
     if (MODE !== 'record') await pinBrowserClock(page)
     tripwire = watchConsole(page)

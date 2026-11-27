@@ -42,7 +42,12 @@ type ChatInstance = ReturnType<ReturnType<typeof createChatStore>['create']>
 type ChatActions = ChatInstance['actions']
 
 function sessionFakeFor() {
+  const positions = new Map<string, unknown>()
   return {
+    readingPosition: (key: string) => ({
+      read: () => positions.get(key),
+      write: (value: unknown) => { positions.set(key, value) },
+    }),
     loadOlder: vi.fn<ISession['loadOlder']>(() => Promise.resolve()),
     loadThrough: vi.fn<ISession['loadThrough']>(() => Promise.resolve()),
     readAttachment: vi.fn<ISession['readAttachment']>(() => Promise.resolve({
@@ -536,12 +541,19 @@ describe('Chat inject API', () => {
     expect(fileMentions(owner, getFileTriggerProps)).toBe(mentions)
     expect(forClosing).toHaveBeenCalledWith(owner, ROOT, getFileTriggerProps)
 
-    expect(injected.chatScroll.read()).toBeNull()
-    const position = { anchorKey: 'node-1', anchorTop: 4, scrollTop: 12 }
-    injected.chatScroll.save(position)
-    expect(injected.chatScroll.read()).toEqual(position)
-    injected.chatScroll.save(null)
-    expect(injected.chatScroll.read()).toBeNull()
+    const main = injected.chatReadingPosition!(undefined, 'main')
+    const embedded = injected.chatReadingPosition!(undefined, 'embedded')
+    expect(main.read()).toBeNull()
+    const position = { anchorKey: 'node-1', anchorTop: 4, scrollTop: 12, seq: 1 }
+    main.save(position)
+    expect(main.read()).toEqual(position)
+    expect(embedded.read()).toBeNull()
+    const stale = injected.chatReadingPosition!(42, 'main')
+    expect(stale.read()).toBeNull()
+    stale.save({ ...position, seq: 42 })
+    expect(main.read()).toEqual(position)
+    main.save(null)
+    expect(main.read()).toBeNull()
 
     const loaded = await injected.loadImage(ATTACHMENT)
     expect(loaded).toEqual(expect.any(String))

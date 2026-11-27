@@ -1,6 +1,7 @@
 /** Composes viewport operations, reading policy, and history navigation for Chat. */
 import { useCallback, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import type { TranscriptViewMode } from '../../chat-settings.ts'
+import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { ChatSnapshot } from '../contract/snapshot.ts'
 import type { ChatViewSlotProps } from '../contract/slots.ts'
 import { useChatNavigation, type ChatNavigation, type ChatNavigationInput } from './use-chat-navigation.ts'
@@ -11,6 +12,9 @@ import type { FlowMotionRows } from './flow-motion.ts'
 /** Committed content and Session operations used to reconcile scroll ownership. */
 export interface ChatScrollInput extends ChatNavigationInput {
   readonly chatScroll: ChatViewSlotProps['chatScroll']
+  readonly historyEpoch?: number | undefined
+  readonly historyVisible?: boolean
+  readonly historyWindow?: ConversationSnapshot['history']
   readonly order: readonly string[]
   readonly lastKey: string | null
   readonly lastIsUser: boolean
@@ -51,14 +55,15 @@ export function useChatScroll(input: ChatScrollInput): ChatScrollState {
   const {
     isOpen, order, firstSeq, lastKey, lastIsUser, steeringId, submissionId, submissionSteers, running,
     deferCompletedTurns, loadedTurns, chatScroll, hasMore, loadingOlder, historyLoadStatus,
-    loadOlder, consumeOlder, loadThrough, transcriptView,
+    loadOlder, consumeOlder, loadThrough, transcriptView, historyVisible = isOpen, historyWindow, historyEpoch,
   } = input
   const { viewport, listRef, columnRef } = useChatViewport()
   const [historyInputHeld, setHistoryInputHeld] = useState(false)
   const { reading, state } = useChatReading(viewport, chatScroll, loadedTurns.at(-1)?.turn ?? null)
+  const durableFirstSeq = historyWindow?.firstSeq
   const navigationInput = useMemo(() => ({
-    firstSeq, loadingOlder, hasMore, historyLoadStatus, isOpen, loadOlder, consumeOlder, loadThrough,
-  }), [firstSeq, loadingOlder, hasMore, historyLoadStatus, isOpen, loadOlder, consumeOlder, loadThrough])
+    firstSeq, durableFirstSeq, loadingOlder, hasMore, historyLoadStatus, isOpen, loadOlder, consumeOlder, loadThrough,
+  }), [firstSeq, durableFirstSeq, loadingOlder, hasMore, historyLoadStatus, isOpen, loadOlder, consumeOlder, loadThrough])
   const { navigation, busyTurn, historyPending, historyProcessing } = useChatNavigation(viewport, reading, navigationInput)
   const content = useRef<{ input: ChatScrollInput; applied: ChatScrollInput | null; opened: boolean }>({
     input, applied: null, opened: false,
@@ -69,21 +74,40 @@ export function useChatScroll(input: ChatScrollInput): ChatScrollState {
 
   const processContent = useCallback(() => {
     const current = content.current.input
-    if (!current.isOpen && !content.current.opened) return
     const previous = content.current.applied
+    const visible = current.historyVisible ?? current.isOpen
+    if (previous !== null && (previous.chatScroll !== current.chatScroll || previous.historyEpoch !== current.historyEpoch)) {
+      navigation.reset()
+      content.current.opened = false
+      content.current.applied = null
+    }
+    if (!content.current.opened) {
+      if (!visible) return
+      content.current.opened = true
+      content.current.applied = current
+      navigation.reset()
+      const position = current.chatScroll.read()
+      if (position?.seq !== undefined) navigation.restorePosition(position)
+      else reading.restore(position)
+      return
+    }
+    const reconciled = (current.historyWindow?.reconciliation !== previous?.historyWindow?.reconciliation)
     const steeringInput = current.steeringId !== null && current.steeringId !== previous?.steeringId
       && current.steeringId !== previous?.submissionId
     const submissionInput = current.submissionId !== null && current.submissionId !== previous?.submissionId
       && current.submissionId !== previous?.steeringId
+    if (reconciled && !steeringInput && !submissionInput) {
+      if (reading.pending) return
+      content.current.applied = current
+      const position = reading.currentPosition
+      if (position?.seq !== undefined) navigation.restorePosition(position)
+      else if (reading.followingTail && !reading.pendingReconciliationInterruption) reading.followTail()
+      else navigation.reconcile()
+      return
+    }
     const ownInput = (current.lastIsUser && current.lastKey !== previous?.lastKey) || steeringInput || submissionInput
     if (reading.pending && !ownInput) return
     content.current.applied = current
-    if (current.isOpen && !content.current.opened) {
-      content.current.opened = true
-      navigation.reset()
-      reading.restore()
-      return
-    }
     if (ownInput) {
       navigation.cancel()
       if (current.deferCompletedTurns && reading.followInputFold(true)) return
@@ -113,7 +137,14 @@ export function useChatScroll(input: ChatScrollInput): ChatScrollState {
       scroll: (event) => {
         if (!content.current.opened) return
         if (!event.movedByReader && viewport.motion.foldActive()) return
+        if (event.movedByReader) navigation.cancelRestoration()
         reading.onScroll(event)
+      },
+      beforeDetach: () => { reading.savePendingPosition() },
+      innerScroll: (capture) => {
+        if (!content.current.opened) return
+        navigation.cancelRestoration()
+        reading.onInnerScroll(capture)
       },
       scrollEnd: (outer) => {
         reading.onScrollEnd(outer)
@@ -124,7 +155,12 @@ export function useChatScroll(input: ChatScrollInput): ChatScrollState {
         setHistoryInputHeld(viewport.historyInputHeld)
         if (content.current.opened) navigation.requestHistoryCheck()
       },
-      intent: () => { cancelPendingFollow(); reading.interruptFollow() },
+      intent: () => {
+        navigation.cancelRestoration()
+        reading.interruptReconciliation()
+        cancelPendingFollow()
+        reading.interruptFollow()
+      },
       resize: () => {
         if (!content.current.opened) return
         navigation.requestHistoryCheck()
@@ -153,7 +189,7 @@ export function useChatScroll(input: ChatScrollInput): ChatScrollState {
     const previous = content.current.input
     content.current.input = {
       order, lastKey, lastIsUser, steeringId, submissionId, submissionSteers, running, loadedTurns,
-      chatScroll, deferCompletedTurns, transcriptView, ...navigationInput,
+      chatScroll, deferCompletedTurns, transcriptView, historyVisible, historyWindow, historyEpoch, ...navigationInput,
     }
     if (!deferCompletedTurns) {
       cancelPendingFollow()
@@ -175,7 +211,7 @@ export function useChatScroll(input: ChatScrollInput): ChatScrollState {
   }, [
     viewport, reading, processContent, navigationInput, isOpen, order, lastKey, lastIsUser,
     steeringId, submissionId, submissionSteers, running, loadedTurns, chatScroll, deferCompletedTurns, transcriptView,
-    cancelPendingFollow,
+    cancelPendingFollow, historyVisible, historyWindow, historyEpoch,
   ])
 
   const previousView = useRef(transcriptView)

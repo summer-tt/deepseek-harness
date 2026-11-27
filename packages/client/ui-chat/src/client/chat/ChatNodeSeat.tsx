@@ -157,6 +157,8 @@ export const ChatNodeSeat = memo(function ChatNodeSeat({
       data-chat-flow-key={flowKey}
       data-chat-paging-anchor={routedNode.kind !== 'turn-process' || undefined}
       data-chat-node-key={routedNode.key}
+      data-chat-reading-seq={routedNode.readingSeq === undefined && Number.isSafeInteger(routedNode.anchorSeq)
+        ? routedNode.anchorSeq : routedNode.readingSeq ?? undefined}
       data-chat-group-part={groupPart}
       data-chat-flow-kind={routedNode.kind}
       data-chat-turn={turn}

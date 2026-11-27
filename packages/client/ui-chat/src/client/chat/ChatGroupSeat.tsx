@@ -137,6 +137,7 @@ export const ChatGroupSeat = memo(function ChatGroupSeat({ groupKey, useChatGrou
   const foldCompleted = props.usePresentation(policy => policy.foldCompletedTurns)
   const { expanded: open, setExpanded: setOpen } = useDisclosure()
   const firstKey = members?.[0]?.key ?? ''
+  const readingSeq = props.useChatNode(firstKey, node => node?.readingSeq === undefined ? node?.anchorSeq : node.readingSeq)
   const bottom = props.useChatNodeBottom(firstKey)
   const deferCollapse = bottom === true && props.deferCollapse
   const presentation = props.useChatNodeProcess(firstKey)
@@ -191,6 +192,7 @@ export const ChatGroupSeat = memo(function ChatGroupSeat({ groupKey, useChatGrou
     <div ref={rootRef} className={css.root} data-chat-group-key={groupKey}
       data-chat-flow-key={groupKey} data-chat-anchor-key={`group:${groupKey}`} data-chat-turn={turn}
       data-chat-paging-anchor={grouped && !open || undefined}
+      data-chat-reading-seq={readingSeq !== null && Number.isSafeInteger(readingSeq) ? readingSeq : undefined}
       data-step-process data-group-expanded-mode={!grouped || undefined}>
       <div ref={headerRef}>
         <ProcessGroupHeader groupKey={groupKey} useChatGroup={useChatGroup}

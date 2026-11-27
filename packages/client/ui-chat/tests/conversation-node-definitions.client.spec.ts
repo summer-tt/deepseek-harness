@@ -1274,6 +1274,7 @@ describe('built-in conversation node Definitions', () => {
     const runningSnapshot = snapshot(value)
     const running = node(runningSnapshot, 'assistant-step')
     expect(running?.data).toMatchObject({ status: 'running', blocks: [{ kind: 'text', text: 'streaming' }] })
+    expect(running?.readingSeq).toBeNull()
     expect(running?.location.kind === 'step'
       ? running.location.step.data.get('assistant-step')
       : undefined).toBe(running?.data)
@@ -1291,6 +1292,7 @@ describe('built-in conversation node Definitions', () => {
     expect(settled?.key).toBe(running?.key)
     expect(settledSnapshot.order).toBe(order)
     expect(settled?.data).toMatchObject({ status: 'settled', blocks: [{ kind: 'text', text: 'settled' }] })
+    expect(settled?.readingSeq).toBe(4)
     expect(settled?.location.kind === 'step'
       ? settled.location.step.data.get('assistant-step')
       : undefined).toBe(settled?.data)
@@ -1307,6 +1309,7 @@ describe('built-in conversation node Definitions', () => {
     ])
     const interrupted = node(snapshot(interruptedValue), 'assistant-step')
     expect(interrupted?.data).toMatchObject({ status: 'interrupted' })
+    expect(interrupted?.readingSeq).toBe(13)
     expect((interrupted?.data as AssistantChatData).finalNode?.interrupted).toBe(true)
 
     const markedValue = assembler([

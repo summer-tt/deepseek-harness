@@ -310,6 +310,18 @@ export interface ChatScrollPosition {
   readonly anchorKey: string
   readonly anchorTop: number
   readonly scrollTop: number
+  /** Durable position used for paging and for choosing a surviving row. */
+  readonly seq?: number
+  /** Offset inside a capped process group when the anchor was in its body. */
+  readonly groupTop?: number
+}
+
+/** Read and update this view's current semantic position. */
+export interface ChatScrollMemory {
+  /** Register the viewport's final capture before the Session reference releases. */
+  readonly registerFlush?: (flush: () => void) => () => void
+  save: (position: ChatScrollPosition | null) => void
+  read: () => ChatScrollPosition | null
 }
 
 /** Shared settings source for the performance row, composer, and turn tail. */
@@ -354,10 +366,10 @@ export interface ChatViewInjected {
   /** Jump loader: page history back through seq; resolves when the window covers it. */
   loadThrough: (seq: SessionSeq) => Promise<void>
   loadImage: MessageImageLoader
-  chatScroll: {
-    save: (position: ChatScrollPosition | null) => void
-    read: () => ChatScrollPosition | null
-  }
+  /** Resolve position access for one committed authorization generation. */
+  chatReadingPosition?: (epoch: number | undefined, occurrence: 'main' | 'embedded') => ChatScrollMemory
+  /** Position access used when no generation resolver is supplied. */
+  chatScroll: ChatScrollMemory
   forkAt: (seq: number) => void
 }
 

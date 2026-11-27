@@ -25,7 +25,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import type {
-  ChatFlowDataInjected, ChatFlowInjected, ChatNodeInjected, ChatScrollPosition, ChatViewInjected,
+  ChatFlowDataInjected, ChatFlowInjected, ChatNodeInjected, ChatViewInjected,
   QuotaNoticeInjected, QuotaNoticeState,
 } from './contract/slots.ts'
 import type { ChatSnapshot } from './contract/snapshot.ts'
@@ -34,6 +34,7 @@ import { ApprovalCommand } from './chat/ApprovalCommand.tsx'
 import { sessionFilePath } from './file-path.ts'
 import { ChatView } from './chat/ChatView.tsx'
 import { ChatFlow } from './chat/ChatFlow.tsx'
+import { chatReadingPosition, EMPTY_CHAT_SCROLL } from './chat/reading-position.ts'
 import { registerChatNodeRenderers } from './chat/register-node-renderers.ts'
 import { UserContent } from './chat/UserContent.tsx'
 import { ActivityPill, UsagePill } from './chat/StatsPills.tsx'
@@ -140,7 +141,6 @@ export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en, ja, es, fr, de, ru, pt }), 'ui-chat: dictionaries')
   const t = ctx.locale.bind(NS)
   const chatStore = createChatStore()
-  const chatScrollPositions = new Map<SessionId, ChatScrollPosition>()
   const chatSettings = ctx.configForms.get<ChatSettings>(CHAT_SETTINGS_NAMESPACE)
   const linkOpening = createSnapshotStore(chatSettings.getSnapshot().value?.linkOpening ?? DEFAULT_LINK_OPENING)
   ctx.effect(() => chatSettings.subscribe(() => {
@@ -252,6 +252,7 @@ export function apply(ctx: Context): void {
         if (binding === undefined) throw new Error(`ui-chat: unknown session "${sessionId}"`)
         const session = binding.session
         const chat = chatSource(binding)
+        const positions = new Map<'main' | 'embedded', { epoch: number | undefined; memory: ReturnType<typeof chatReadingPosition> }>()
         return {
           ...nodeSources(binding),
           fileDrag: ctx.fileDrag.actions,
@@ -294,12 +295,14 @@ export function apply(ctx: Context): void {
             (attachment: ImageAttachmentRef) => ctx.uiConversation.imageUrl(sessionId, attachment),
             { peek: (attachment: ImageAttachmentRef) => ctx.uiConversation.peekImageUrl(sessionId, attachment) },
           ),
-          chatScroll: {
-            save: (position) => {
-              if (position === null) chatScrollPositions.delete(sessionId)
-              else chatScrollPositions.set(sessionId, position)
-            },
-            read: () => chatScrollPositions.get(sessionId) ?? null,
+          chatScroll: EMPTY_CHAT_SCROLL,
+          chatReadingPosition: (epoch, occurrence) => {
+            if (session.getSnapshot().historyEpoch !== epoch) return EMPTY_CHAT_SCROLL
+            const existing = positions.get(occurrence)
+            if (existing !== undefined && existing.epoch === epoch) return existing.memory
+            const memory = chatReadingPosition(session, epoch, occurrence)
+            positions.set(occurrence, { epoch, memory })
+            return memory
           },
           forkAt: (seq) => {
             const turn = [...chat.getSnapshot().timeline.turns.values()].find(turn => turn.end?.seq === seq)

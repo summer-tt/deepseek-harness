@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { act, screen } from '@testing-library/react'
 import { SlotTestRuntime, stubConfigForm, usePinnedBrowserLanguages } from '@deepseek-ai/dsh-client-test-runtime'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
-import type { SessionLiveEventEntry, SessionReference } from '@deepseek-ai/dsh-api-session-controller/client'
+import { MutableSessionEventSource, type SessionLiveEventEntry, type SessionReference } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId, SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import {
@@ -125,9 +125,11 @@ describe('frame-wide quota notices', () => {
     expect(notice.getSnapshot()?.seq).not.toBe(first)
   })
 
-  it('never publishes for history replacement or paging, or for other failures', async () => {
+  it('never publishes for history replacement, paging, catch-up suffixes, or other failures', async () => {
     const b = await bench()
-    await attach(b.runtime, b.sourceDescriptor)
+    const reference = await attach(b.runtime, b.sourceDescriptor)
+    const source = reference.binding.eventSource
+    if (!(source instanceof MutableSessionEventSource)) throw new Error('Missing mutable fixture event source')
     const notice = noticeFace(b.runtime).hooks.notice
     await b.runtime.sessions.appendEvent(SID, quotaEntry(0, 'QUOTA'))
     const published = notice.getSnapshot()
@@ -136,10 +138,12 @@ describe('frame-wide quota notices', () => {
     expect(notice.getSnapshot()).toBe(published)
     await b.runtime.sessions.prependEvents(SID, [quotaEntry(2, 'ACCOUNT_QUOTA')])
     expect(notice.getSnapshot()).toBe(published)
-    await b.runtime.sessions.appendEvent(SID, quotaEntry(3, 'AUTH'))
+    source.appendHistory([quotaEntry(3, 'ACCOUNT_QUOTA')])
+    expect(notice.getSnapshot()).toBe(published)
+    await b.runtime.sessions.appendEvent(SID, quotaEntry(4, 'AUTH'))
     expect(notice.getSnapshot()).toBe(published)
     await b.runtime.sessions.appendEvent(SID, { type: 'event', event: {
-      type: 'turn/end', seq: 4 as SessionSeq, time: 4, data: { turn: 0, reason: { kind: 'completed' } },
+      type: 'turn/end', seq: 5 as SessionSeq, time: 5, data: { turn: 0, reason: { kind: 'completed' } },
     } })
     expect(notice.getSnapshot()).toBe(published)
   })

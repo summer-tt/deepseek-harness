@@ -9,6 +9,8 @@ import type { ChatGroupTree } from './group-tree.ts'
 export interface ChatConversationViewNode extends ConversationViewNode {
   readonly target: 'chat'
   readonly anchorSeq: number
+  /** Durable log position of the row, independent of its render ordering. */
+  readonly readingSeq?: number | null
   readonly location: ConversationLocation
   readonly visibility: 'visible' | 'hidden'
   /**

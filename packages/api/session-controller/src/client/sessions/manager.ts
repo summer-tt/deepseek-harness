@@ -215,6 +215,7 @@ export class SessionManager {
   drop(sessionId: SessionId, expected: Session): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (session !== expected) return Promise.resolve()
+    session.flushReadingPositions()
     const released = session.releasedHistory()
     if (released !== undefined) this.history.retain(session.historyAddress(), released.grant, released.window)
     this.sessions.delete(sessionId)

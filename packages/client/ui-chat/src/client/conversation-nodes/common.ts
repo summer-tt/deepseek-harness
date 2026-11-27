@@ -5,6 +5,11 @@ import type {
   ChatNode, ChatNodeDataMap, ChatNodeKind,
 } from '../contract/chat-nodes.ts'
 import type { ChatGroupTree } from '../contract/group-tree.ts'
+import type { SessionEventLike } from '@deepseek-ai/dsh-api-session-controller/client'
+
+function durableSeq(event: SessionEventLike | undefined): number | undefined {
+  return event?.type === 'assistant/live-chunk' ? undefined : event?.seq
+}
 
 /**
  * Relative positions in one durable event's seq neighborhood: interrupted
@@ -58,6 +63,7 @@ export function chatNode<Kind extends ChatNodeKind>(
     readonly location?: ConversationLocation
     readonly visibility?: 'visible' | 'hidden'
     readonly groupTree?: ChatGroupTree | undefined
+    readonly readingSeq?: number | null
   } = {},
 ): ChatNode<Kind> {
   return {
@@ -66,6 +72,9 @@ export function chatNode<Kind extends ChatNodeKind>(
     id: context.id,
     target: 'chat',
     anchorSeq,
+    readingSeq: options.readingSeq === undefined
+      ? durableSeq(context.start?.event ?? context.matches[0]?.event) ?? null
+      : options.readingSeq,
     location: options.location ?? contextLocation(context),
     visibility: options.visibility ?? 'visible',
     groupTree: options.groupTree,

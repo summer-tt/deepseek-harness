@@ -1,4 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, type RefObject } from 'react'
+import { useLayoutEffect, useRef, type RefObject } from 'react'
+
+/** Reveal a saved row without dispatching a browser Find event or moving focus. */
+export const CHAT_REVEAL_READING_ANCHOR = 'dsh-chat-reveal-reading-anchor'
 
 /**
  * Optional visibility operation; its caller owns cancellation and eventually commits the attribute.
@@ -35,11 +38,19 @@ export function useSearchableHidden(
     if (transition === undefined) commit()
     else transition(element, hidden, commit)
   }, [hidden, reveal, transition])
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = ref.current
     if (element === null) return
+    const revealReading = (event: Event): void => {
+      event.preventDefault()
+      reveal()
+    }
     element.addEventListener('beforematch', reveal)
-    return () => { element.removeEventListener('beforematch', reveal) }
-  }, [reveal])
+    if (hidden) element.addEventListener(CHAT_REVEAL_READING_ANCHOR, revealReading)
+    return () => {
+      element.removeEventListener('beforematch', reveal)
+      element.removeEventListener(CHAT_REVEAL_READING_ANCHOR, revealReading)
+    }
+  }, [hidden, reveal])
   return ref
 }

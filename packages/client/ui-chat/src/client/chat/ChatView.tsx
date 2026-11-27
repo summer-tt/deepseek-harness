@@ -63,7 +63,7 @@ const MOTION_TAIL_MS = 800
 export function ChatView({
   useSession, useChat, useConversation, useSessions, renderSlot,
   sessionId, openFile, openExternalLink, resolveFilePath, useContextMenu,
-  loadOlder, consumeOlder, loadThrough, loadImage, inspectCall, chatScroll, forkAt,
+  loadOlder, consumeOlder, loadThrough, loadImage, inspectCall, chatScroll, chatReadingPosition, occurrence = 'main', forkAt,
   usePresentation, useProjection, useInteractionIds, dispatchInteraction, t, fileDrag,
 }: ChatViewSlotProps) {
   const { getTriggerProps } = useContextMenu()
@@ -133,6 +133,13 @@ export function ChatView({
     return () => { clearTimeout(timer) }
   }, [running, deferCompletedTurns])
   const openState = useSession(s => s.openState)
+  const availability = useSession(s => s.historyAvailability ?? (s.openState === 'open' ? 'confirmed' : 'unavailable'))
+  const historyEpoch = useSession(s => s.historyEpoch)
+  const historyWindow = useConversation(s => s.history)
+  const historyVisible = availability !== 'unavailable'
+  const position = useMemo(() => historyVisible ? chatReadingPosition?.(historyEpoch, occurrence) ?? chatScroll : chatScroll,
+    [chatReadingPosition, historyEpoch, occurrence, chatScroll, historyVisible])
+  const canPage = openState === 'open' && availability === 'confirmed'
   const openError = useSession(s => s.openError)
   const hasMore = useSession(s => s.hasMore)
   const loadingOlder = useSession(s => s.loadingOlder)
@@ -213,8 +220,9 @@ export function ChatView({
   const steeringId = latestSteering?.source.kind === 'user' && 'rpcId' in latestSteering.source
     ? latestSteering.source.rpcId : latestSteering?.id ?? null
   const scroll = useChatScroll({
-    isOpen: openState === 'open',
-    order, firstSeq, lastKey, running, loadingOlder, historyLoadStatus, hasMore, chatScroll,
+    isOpen: canPage,
+    historyVisible: availability !== 'unavailable', historyWindow, historyEpoch,
+    order, firstSeq, lastKey, running, loadingOlder, historyLoadStatus, hasMore, chatScroll: position,
     loadOlder, consumeOlder, loadThrough, deferCompletedTurns,
     lastIsUser: lastKey !== null && nodeStore.get(lastKey)?.kind === 'user',
     steeringId,
@@ -244,7 +252,7 @@ export function ChatView({
           <div ref={scroll.columnRef} className={css.column} data-chat-flow=""
             data-chat-motion={deferCompletedTurns && scroll.initialized
               && (running || motionTail || pendingInputs.length > 0) ? '' : undefined}>
-            {openState === 'loading' && <div className={css.hint}>{t('chat.loadingHistory')}</div>}
+            {openState === 'loading' && availability === 'unavailable' && <div className={css.hint}>{t('chat.loadingHistory')}</div>}
             {openState === 'error' && openError !== null && (
               <div className={css.openError}>
                 {t('chat.loadError', { message: openError.message, code: openError.code })}
@@ -252,7 +260,7 @@ export function ChatView({
             )}
             {(hasMore || historyWasPartial) && (
               <div className={css.older} ref={scroll.historyEdgeRef} data-chat-history={historyLoadStatus}>
-                <button type="button" disabled={!hasMore}
+                <button type="button" disabled={!hasMore || !canPage}
                   onClick={scroll.loadEarlier}>
                   {([
                     ['more', t('chat.loadOlder')],

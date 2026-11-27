@@ -1652,6 +1652,24 @@ describe('TrajectoryView state', () => {
     expect(completeViewRequest).toHaveBeenCalledOnce()
   })
 
+  it('loads the next resident page immediately after restoring a long virtual ledger', async () => {
+    const nodes: LegacyConversationSlice['nodes'] = Array.from({ length: 150 }, (_, index) => ({
+      kind: 'user' as const, seq: index + 1, time: index + 1,
+      content: [{ type: 'text' as const, text: `resident ${index + 1}` }], source: null,
+    }))
+    const position = { key: encodeURIComponent('user\u0000seq\u000040'), seq: 40, offset: 0 }
+    const loadOlder = vi.fn(async () => false)
+    render(<TrajectoryView {...standaloneProps(nodes)} {...standaloneHistory(historySnapshot(nodes))}
+      {...standaloneDuration()} loadOlder={loadOlder}
+      readingPosition={() => ({ read: () => position, write: () => {} })} />)
+    const table = screen.getByRole('table')
+    await waitFor(() => { expect(table.getAttribute('aria-rowcount')).toBe('113') })
+    const older = table.querySelector<HTMLButtonElement>('[data-history-load] button')!
+    fireEvent.click(older)
+    await waitFor(() => { expect(table.getAttribute('aria-rowcount')).toBe('150') })
+    expect(loadOlder).not.toHaveBeenCalled()
+  })
+
   it('persists the duration preference through the runtime snapshot-store seam', () => {
     const firstDuration = createTrajectoryDurationStore()
     const commonProps = {

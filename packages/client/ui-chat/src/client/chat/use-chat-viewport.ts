@@ -3,6 +3,7 @@ import { useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import type { ChatScrollPosition } from '../contract/slots.ts'
 import type { ChatSnapshot } from '../contract/snapshot.ts'
 import { createFlowMotion, type InputFoldBox, type InputFoldDriver } from './flow-motion.ts'
+import { CHAT_REVEAL_READING_ANCHOR } from './searchable-hidden.ts'
 import { scrollMetrics, ScrollFollow, type ViewportMetrics } from './use-scroll-follow.ts'
 export type { ViewportMetrics } from './use-scroll-follow.ts'
 
@@ -22,6 +23,8 @@ export interface ViewportLanding {
 interface ViewportEvents {
   scroll: (event: ViewportScroll) => void
   scrollEnd: (outer: boolean) => void
+  innerScroll?: (capture: () => ChatScrollPosition | null) => void
+  beforeDetach?: () => void
   resize: () => void
   interact: () => void
   /** Any reading gesture, before paging ownership is consulted. */
@@ -70,6 +73,13 @@ interface PagingPosition {
   readonly group: { readonly body: HTMLElement; readonly content: HTMLElement; readonly top: number } | null
 }
 
+const VISIBLE_DURABLE_ROWS = '[data-chat-anchor-key][data-chat-reading-seq]:not(:empty):not([hidden]):not([hidden] *)'
+
+function readingSeq(row: HTMLElement): number | undefined {
+  const seq = row.dataset.chatReadingSeq
+  return seq === undefined ? undefined : Number(seq)
+}
+
 const READING_INTENTS = ['wheel', 'touchstart', 'pointerdown', 'keydown', 'beforematch'] as const
 const SCROLL_KEYS = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '])
 
@@ -86,6 +96,7 @@ export class ChatViewport {
   private historyEdge: HTMLElement | null = null
   private historyHeight = 0
   private historyScrolling = new Set<EventTarget>()
+  private innerIntent: HTMLElement | null = null
   private historyPointer = false
   private historyTouch = false
   /** Rows measured before an instant close; see {@link ChatViewport.keepAboveClosing}. */
@@ -152,6 +163,7 @@ export class ChatViewport {
 
   /** Disconnect DOM resources and clear observations for the detached view. */
   detach(): void {
+    if (this.elements !== null) this.events?.beforeDetach?.()
     this.historyPrepend = null
     this.stopPreserving()
     this.motion.clear()
@@ -166,6 +178,7 @@ export class ChatViewport {
     }
     this.historyHeight = 0
     this.historyScrolling.clear()
+    this.innerIntent = null
     this.historyPointer = false
     this.historyTouch = false
     this.elements?.scroller.removeEventListener('scroll', this.onScroll)
@@ -718,10 +731,19 @@ export class ChatViewport {
       anchor = row !== undefined && row.getBoundingClientRect().top < bottom ? row : rows[0] ?? null
     }
     const key = anchor?.dataset.chatAnchorKey
-    return anchor === null || key === undefined ? null : {
-      anchorKey: key,
-      anchorTop: anchor.getBoundingClientRect().top - viewport.top,
-      scrollTop: scroller.scrollTop,
+    return anchor === null || key === undefined ? null : this.position(anchor, key,
+      anchor.getBoundingClientRect().top - viewport.top, scroller.scrollTop)
+  }
+
+  private position(row: HTMLElement, key: string, top: number, scrollTop: number, measuredGroupTop?: number): ChatScrollPosition {
+    const seq = readingSeq(row)
+    const body = row.closest<HTMLElement>('[data-step-process-body]')
+    return {
+      anchorKey: key, anchorTop: top, scrollTop,
+      ...(seq === undefined ? {} : { seq }),
+      ...(body === null || seq === undefined ? {} : {
+        groupTop: measuredGroupTop ?? row.getBoundingClientRect().top - body.getBoundingClientRect().top,
+      }),
     }
   }
 
@@ -792,9 +814,53 @@ export class ChatViewport {
    */
   restore(position: ChatScrollPosition): ViewportLanding | null {
     const row = this.anchor(position.anchorKey)
-    if (row !== null) return this.align(row, position.anchorTop, null)
+    if (row !== null) {
+      const paging = position.groupTop === undefined ? null : this.measurePaging(row, position)
+      return paging === null ? this.align(row, position.anchorTop, null) : this.applyPaging(paging)
+    }
     const metrics = this.metrics()
     return metrics === null ? null : this.write(position.scrollTop, metrics, null)
+  }
+
+  /**
+   * Restore a durable row or, after coverage is confirmed, the nearest surviving row.
+   * @param position - last semantic reader position.
+   * @param allowFallback - whether older history can no longer contain the missing row.
+   * @returns landing, a pending disclosure, or null when no eligible row is available.
+   */
+  restoreDurable(position: ChatScrollPosition, allowFallback: boolean): ViewportLanding | 'revealing' | null {
+    const list = this.elements?.list
+    const seq = position.seq
+    if (list === undefined || seq === undefined) return null
+    const saved = [...list.querySelectorAll<HTMLElement>('[data-chat-anchor-key][data-chat-reading-seq]:not(:empty)')]
+      .find(row => row.dataset.chatAnchorKey === position.anchorKey && readingSeq(row) === seq)
+    if (saved !== undefined) {
+      if (saved.closest('[hidden]') === null) {
+        const paging = position.groupTop === undefined ? null : this.measurePaging(saved, position)
+        return paging === null ? this.align(saved, position.anchorTop, null) : this.applyPaging(paging)
+      }
+      let ancestor = saved.closest<HTMLElement>('[hidden="until-found"]')
+      let requested = false
+      while (ancestor !== null && list.contains(ancestor)) {
+        requested = !ancestor.dispatchEvent(new Event(CHAT_REVEAL_READING_ANCHOR, { cancelable: true })) || requested
+        ancestor = ancestor.parentElement?.closest<HTMLElement>('[hidden="until-found"]') ?? null
+      }
+      if (requested) return 'revealing'
+    }
+    if (!allowFallback) return null
+    let nearest: HTMLElement | undefined
+    let nearestSeq = Number.POSITIVE_INFINITY
+    for (const row of list.querySelectorAll<HTMLElement>(VISIBLE_DURABLE_ROWS)) {
+      if (row.dataset.chatFlowKind === 'turn-process'
+        || (row.dataset.chatGroupKey !== undefined && row.dataset.chatPagingAnchor === undefined)) continue
+      const candidate = Number(row.dataset.chatReadingSeq)
+      const distance = Math.abs(candidate - seq)
+      const previousDistance = Math.abs(nearestSeq - seq)
+      if (distance > previousDistance || (distance === previousDistance && candidate >= nearestSeq)) continue
+      nearest = row
+      nearestSeq = candidate
+    }
+    return nearest === undefined ? null : this.align(nearest, position.anchorTop, null)
   }
 
   /** Capture a manual paging anchor without consulting automatic-consumption blockers. */
@@ -840,14 +906,11 @@ export class ChatViewport {
     const body = row.closest<HTMLElement>('[data-step-process-body]')
     const content = body?.querySelector<HTMLElement>('[data-step-process-content]')
     const group = body === null || content == null ? null
-      : { body, content, top: previousGroup?.top ?? top - body.getBoundingClientRect().top }
+      : { body, content, top: previousGroup?.top ?? position?.groupTop ?? top - body.getBoundingClientRect().top }
     return {
       row, group,
-      position: position ?? {
-        anchorKey: key,
-        anchorTop: top - elements.scroller.getBoundingClientRect().top,
-        scrollTop: elements.scroller.scrollTop,
-      },
+      position: position ?? this.position(row, key,
+        top - elements.scroller.getBoundingClientRect().top, elements.scroller.scrollTop, group?.top),
     }
   }
 
@@ -927,7 +990,7 @@ export class ChatViewport {
     if (metrics === null) return null
     const top = row.getBoundingClientRect().top - elements.scroller.getBoundingClientRect().top
     const target = metrics.top + top - position.anchorTop
-    return this.write(target, metrics, null, { key: position.anchorKey, top })
+    return this.write(target, metrics, null, { row, top })
   }
 
   /**
@@ -955,25 +1018,23 @@ export class ChatViewport {
     const metrics = this.metrics()
     if (metrics === null || this.elements === null) return null
     const top = row.getBoundingClientRect().top - this.elements.scroller.getBoundingClientRect().top
-    return this.write(metrics.top + top - offset, metrics, turn, { key: row.dataset.chatAnchorKey, top })
+    return this.write(metrics.top + top - offset, metrics, turn, { row, top })
   }
 
   private write(
     target: number, metrics: ViewportMetrics, turn: number | null,
-    anchor?: { key: string | undefined; top: number },
+    anchor?: { row: HTMLElement; top: number },
   ): ViewportLanding | null {
     if (this.elements === null) return null
     const top = Math.max(0, Math.min(metrics.floor, target))
     if (top !== metrics.top) this.elements.scroller.scrollTop = top
     const actual = this.elements.scroller.scrollTop
+    const key = anchor?.row.dataset.chatAnchorKey
     const landing: ViewportLanding = {
       metrics: { ...metrics, top: actual },
       turn,
-      position: anchor?.key === undefined ? null : {
-        anchorKey: anchor.key,
-        anchorTop: anchor.top - (actual - metrics.top),
-        scrollTop: actual,
-      },
+      position: anchor === undefined || key === undefined ? null
+        : this.position(anchor.row, key, anchor.top - (actual - metrics.top), actual),
     }
     this.observation = { top: actual, landing }
     return landing
@@ -1054,10 +1115,25 @@ export class ChatViewport {
   }
 
   private readonly onHistoryScroll = (event: Event): void => {
-    if (event.target === this.elements?.scroller || event.target instanceof HTMLElement
-      && event.target.hasAttribute('data-step-process-body')) {
-      this.historyScrolling.add(event.target)
+    const target = event.target
+    const elements = this.elements
+    if (elements === null || !(target instanceof HTMLElement)) return
+    if (target === elements.scroller || target.hasAttribute('data-step-process-body')) this.historyScrolling.add(target)
+    if (target === this.innerIntent) this.events?.innerScroll?.(() => this.captureInnerPosition(target, elements))
+  }
+
+  private captureInnerPosition(target: HTMLElement, elements: ViewportElements): ChatScrollPosition | null {
+    const { top, bottom } = target.getBoundingClientRect()
+    const screen = elements.scroller.getBoundingClientRect()
+    const line = Math.max(top, screen.top)
+    for (const row of target.querySelectorAll<HTMLElement>(VISIBLE_DURABLE_ROWS)) {
+      const rect = row.getBoundingClientRect()
+      const key = row.dataset.chatAnchorKey
+      if (key !== undefined && rect.bottom > line && rect.top < Math.min(bottom, screen.bottom)) {
+        return this.position(row, key, rect.top - screen.top, elements.scroller.scrollTop, rect.top - top)
+      }
     }
+    return null
   }
 
   private readonly onHistoryPointerDown = (): void => {
@@ -1090,6 +1166,7 @@ export class ChatViewport {
 
   private readonly onScrollEnd = (event: Event): void => {
     if (event.target !== null) this.historyScrolling.delete(event.target)
+    if (event.target === this.innerIntent) this.innerIntent = null
     this.events?.history?.()
     if (event.target === this.elements?.scroller) {
       this.events?.scrollEnd(true)
@@ -1102,6 +1179,8 @@ export class ChatViewport {
       if (event.target instanceof Element && event.target.closest('[data-composer-seat]') !== null) return
       if (event.type === 'keydown' && (!(event instanceof KeyboardEvent) || !SCROLL_KEYS.has(event.key))) return
     }
+    this.innerIntent = event.target instanceof Element
+      ? event.target.closest<HTMLElement>('[data-step-process-body]') : null
     this.events?.intent?.()
     if (this.paging === null) return
     this.stopPreserving()

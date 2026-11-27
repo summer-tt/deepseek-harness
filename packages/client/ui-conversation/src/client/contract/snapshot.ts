@@ -2,10 +2,20 @@
 import type { SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { ConversationViewSnapshotStore } from './conversation.ts'
 
+/** Durable coverage and reconciliation of the loaded Session log. */
+export interface ConversationHistoryWindow {
+  /** First durable sequence in the window, or null for an empty log. */
+  readonly firstSeq: number | null
+  /** Changes on a full window replacement or a non-live suffix. */
+  readonly reconciliation: number
+}
+
 /** Latest registered target snapshots and their shell-level activity. */
 export interface ConversationSnapshot {
   readonly views: ConversationViewSnapshotStore
   readonly activeTargets: ReadonlySet<string>
+  /** Loaded log coverage. Older Conversation sources may omit this metadata. */
+  readonly history?: ConversationHistoryWindow
 }
 
 /** Empty Conversation value used before a Session binding is available. */
@@ -28,6 +38,7 @@ export function conversationPhase(
   conversation: ConversationSnapshot,
 ): ConversationPhase {
   const active = conversation.activeTargets.size > 0
+    || (session.historyAvailability === 'cached' && conversation.history?.firstSeq != null)
     || (!session.blank && !session.awaitingFirstTurn)
     || session.running
   return active ? 'active' : session.promptAttempted ? 'engaging' : 'blank'

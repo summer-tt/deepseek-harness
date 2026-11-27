@@ -77,6 +77,12 @@ export interface SessionReadingPosition {
 
 /** Identity plus the behavior verbs features may invoke on a session. */
 export interface ISession {
+  /**
+   * Register a synchronous reading-position sample before this binding is released.
+   * @param flush - saves pending reading state while the view still owns its position handle.
+   * @returns unregisters this callback.
+   */
+  registerReadingPositionFlush?(flush: () => void): () => void
   /** The session's host identity (agent id — same axis). */
   readonly sessionId: SessionId
   /** Host-computed projection values by key (the useProjection seat). */

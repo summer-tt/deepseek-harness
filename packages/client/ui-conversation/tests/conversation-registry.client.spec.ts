@@ -221,6 +221,37 @@ describe('Conversation registries', () => {
     expect(openTurn.getSnapshot()).toBe(8)
   })
 
+  it('publishes cached coverage and applies a historical suffix without replaying the seed', async () => {
+    const { uiConversation, binding, events, views } = await bootRegistries()
+    const match = vi.fn((event: Parameters<ConversationNodeDefinition<null>['match']>[0]) => event.type === 'turn/start'
+      ? { id: String(event.data.turn), role: 'start' as const } : null)
+    events.register({ ...eventDefinition('history-probe'), match,
+      buildViewNode: context => ({ key: context.key, id: context.id, kind: 'history-probe', target: 'chat', data: null }),
+    })
+    const replace = vi.fn(({ nodes }: { nodes: readonly ConversationViewNode[] }) => nodes.map(node => node.id))
+    let keys: readonly string[] = []
+    views.register({ target: 'chat', create: () => ({
+      empty: keys,
+      replace: input => (keys = replace(input)),
+      apply: ({ upserts }) => (keys = [...keys, ...upserts.map(node => node.id)]),
+    }) } satisfies ConversationViewDefinition<ConversationViewNode, readonly string[]>)
+    await Promise.resolve()
+    const source = binding.eventSource as MutableSessionEventSource
+    source.replace([{ type: 'event', event: { type: 'turn/start', seq: SessionSeq(5), time: 5, data: { turn: 1 } } }], true)
+    const conversation = uiConversation.binding(binding)
+    conversation.activate('chat')
+    const before = conversation.snapshot.getSnapshot().history
+    expect(before?.firstSeq).toBe(5)
+    expect(conversation.target('chat').getSnapshot()).toEqual(['1'])
+    match.mockClear()
+    replace.mockClear()
+    source.appendHistory([{ type: 'event', event: { type: 'turn/start', seq: SessionSeq(6), time: 6, data: { turn: 2 } } }])
+    expect(conversation.target('chat').getSnapshot()).toEqual(['1', '2'])
+    expect(conversation.snapshot.getSnapshot().history).toEqual({ firstSeq: 5, reconciliation: (before?.reconciliation ?? 0) + 1 })
+    expect(match).toHaveBeenCalledOnce()
+    expect(replace).not.toHaveBeenCalled()
+  })
+
   it('publishes the rebuilt window after an incremental update throws and keeps applying later events', async () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
     onTestFinished(() => { errors.mockRestore() })

@@ -28,6 +28,9 @@ export class ChatReading {
   private sampleTimer: number | null = null
   private probeFrame: number | null = null
   private sampled: ((sample: ReadingSample) => void) | null = null
+  private position: ChatScrollPosition | null = null
+  private reconciliationInterrupted = false
+  private innerCapture: (() => ChatScrollPosition | null) | null = null
 
   constructor(
     private readonly viewport: ChatViewport,
@@ -52,7 +55,28 @@ export class ChatReading {
    * Adopt the committed Session's scroll memory.
    * @param store - scroll memory for the current Session.
    */
-  setStore(store: PositionStore): void { this.store = store }
+  setStore(store: PositionStore): void {
+    if (store === this.store) return
+    this.cancelPending()
+    this.store = store
+    this.position = null
+    this.reconciliationInterrupted = false
+  }
+
+  /**
+   * Expose the position used for history reconciliation.
+   * @returns Last position unless a new reader gesture has superseded it.
+   */
+  get currentPosition(): ChatScrollPosition | null { return this.reconciliationInterrupted ? null : this.position }
+
+  /**
+   * Read whether reconciliation is suspended pending the browser's scroll delivery.
+   * @returns Whether a reader gesture is newer than the last measured position.
+   */
+  get pendingReconciliationInterruption(): boolean { return this.reconciliationInterrupted }
+
+  /** Reader input before a scroll delivery supersedes the previous automatic target. */
+  interruptReconciliation(): void { this.reconciliationInterrupted = true }
 
   /**
    * Connect history policy to settled reading observations.
@@ -64,13 +88,28 @@ export class ChatReading {
     return () => { if (this.sampled === sampled) this.sampled = null }
   }
 
+  /** Keep the latest delivered reader position while the viewport and handle are still valid. */
+  savePendingPosition(): void {
+    if (!this.pending) return
+    if (this.innerCapture !== null) {
+      const position = this.innerCapture()
+      if (position !== null) this.remember(position)
+      return
+    }
+    const scroll = this.viewport.readScroll()
+    if (scroll?.movedByReader !== true) return
+    if (this.follow.nearBottom(scroll.metrics)) { this.remember(null); return }
+    const position = this.viewport.capturePosition()
+    if (position !== null) this.remember(position)
+  }
+
   /** Cancel timers and animation frames and detach the sample listener. */
   dispose(): void {
     this.cancelPending()
     this.sampled = null
   }
 
-  /** Release bottom follow and pending sampling for an explicit navigation. */
+  /** Release bottom follow and pending sampling for navigation or paging. */
   pauseFollowing(): void {
     this.cancelPending()
     this.publish({ ...this.state, followingTail: false })
@@ -117,9 +156,11 @@ export class ChatReading {
     this.viewport.interruptFollow(this.follow)
   }
 
-  /** Restore the Session's semantic position, or follow the tail when none is saved. */
-  restore(): void {
-    const saved = this.store.read()
+  /**
+   * Restore legacy position geometry, or follow the tail when none is saved.
+   * @param saved - position to restore, defaulting to stored reader intent.
+   */
+  restore(saved = this.store.read()): void {
     if (saved === null) { this.followTail(); return }
     const landing = this.viewport.restore(saved)
     if (landing === null) return
@@ -128,7 +169,7 @@ export class ChatReading {
     this.commit(landing, following, following ? this.viewport.latestTurn : this.state.activeTurn, following)
     if (!this.state.followingTail && landing.position === null) {
       const position = this.viewport.capturePosition()
-      if (position !== null) this.store.save(position)
+      if (position !== null) this.remember(position)
     }
     this.refreshActiveTurn()
   }
@@ -146,10 +187,23 @@ export class ChatReading {
   /**
    * Retain reading policy while history changes the anchor's geometry.
    * @param landing - compensated position that retains the current reading policy.
+   * @param providedAnchor - durable restoration keeps explicit reading intent even when it clamps to a short window.
    */
-  preservePosition(landing: ViewportLanding): void {
+  preservePosition(landing: ViewportLanding, providedAnchor = false): void {
     this.cancelPending()
-    this.commit(landing, this.state.followingTail, this.state.activeTurn)
+    const { floor, height } = landing.metrics
+    const following = this.state.followingTail || (!providedAnchor && height > 0 && floor <= 0.5)
+    this.commit(landing, following, following ? this.viewport.latestTurn : this.state.activeTurn)
+  }
+
+  /**
+   * Save reader input inside a process group independently of outer scroll position.
+   * @param capture - measures its visible member relative to both scroll containers.
+   */
+  onInnerScroll(capture: () => ChatScrollPosition | null): void {
+    this.innerCapture = capture
+    this.sampleTimer ??= window.setTimeout(this.flushSample, SCROLL_SAMPLE_INTERVAL_MS)
+    this.publish({ ...this.state, initialized: true, followingTail: false })
   }
 
   /**
@@ -159,6 +213,7 @@ export class ChatReading {
   readonly onScroll = (scroll: ViewportScroll): void => {
     // Native follow animation progress is not reader movement; scrollend settles it.
     if (this.follow.animating) return
+    if (scroll.movedByReader) this.innerCapture = null
     if ((!scroll.movedByReader && this.state.followingTail)
       || (scroll.movedByReader && Math.abs(scroll.metrics.top - scroll.metrics.floor) < 1)) {
       this.followTail()
@@ -211,9 +266,21 @@ export class ChatReading {
   private commit(
     landing: ViewportLanding, followingTail: boolean, activeTurn: number | null, initialized = true,
   ): void {
-    if (followingTail) this.store.save(null)
-    else if (landing.position !== null) this.store.save(landing.position)
+    if (followingTail) this.remember(null)
+    else if (landing.position !== null) this.remember(landing.position)
     this.publish({ initialized, followingTail, activeTurn })
+  }
+
+  /** Keep a missing anchor pending while showing the currently available history. */
+  waitForPosition(): void {
+    this.cancelPending()
+    this.publish({ initialized: true, followingTail: false, activeTurn: this.viewport.latestTurn })
+  }
+
+  private remember(position: ChatScrollPosition | null): void {
+    this.position = position
+    this.reconciliationInterrupted = false
+    this.store.save(position)
   }
 
   private publish(state: ChatReadingState): void {
@@ -229,6 +296,7 @@ export class ChatReading {
     if (this.probeFrame !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.probeFrame)
     this.sampleTimer = null
     this.probeFrame = null
+    this.innerCapture = null
   }
 
   private readonly probe = (): void => {
@@ -242,7 +310,15 @@ export class ChatReading {
 
   private readonly flushSample = (): void => {
     if (!this.pending) return
+    const capture = this.innerCapture
     this.cancelPending()
+    if (capture !== null) {
+      const position = capture()
+      if (position !== null) this.remember(position)
+      this.refreshActiveTurn()
+      this.sampled?.({ position, movedByReader: true, followingTail: false })
+      return
+    }
     const scroll = this.viewport.readScroll()
     if (scroll === null) return
     const followingTail = this.follow.sample(scroll.metrics, scroll.movedByReader)
@@ -251,7 +327,7 @@ export class ChatReading {
     else {
       position = followingTail ? null : this.viewport.capturePosition()
       this.viewport.acknowledge(scroll.metrics)
-      if (followingTail || position !== null) this.store.save(position)
+      if (followingTail || position !== null) this.remember(position)
       const activeTurn = this.follow.nearBottom(scroll.metrics) ? this.viewport.latestTurn : this.viewport.readVisibleTurn(scroll.metrics)
       this.publish({ initialized: true, followingTail, activeTurn })
     }
@@ -276,7 +352,10 @@ export function useChatReading(
   }))
   const follow = useScrollFollow(state.followingTail, FOLLOW_THRESHOLD + 1)
   const [reading] = useState(() => new ChatReading(viewport, store, state, setState, follow))
-  useLayoutEffect(() => { reading.setStore(store) }, [reading, store])
+  useLayoutEffect(() => {
+    reading.setStore(store)
+    return store.registerFlush?.(() => { reading.savePendingPosition() })
+  }, [reading, store])
   useLayoutEffect(() => reading.bindFolds(), [reading])
   useLayoutEffect(() => () => { reading.dispose() }, [reading])
   return { reading, state }

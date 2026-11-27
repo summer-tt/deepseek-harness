@@ -85,11 +85,12 @@ export function apply(ctx: Context): void {
     label: () => t('view.trajectory'),
     children: { 'conversation.trajectory.images': { kind: 'single', scope: 'session' } },
     inject: (sessionId: SessionId): TrajectoryViewInjected => {
-      const session = ctx.sessions.binding(sessionId)?.session
-      if (session === undefined) {
+      const binding = ctx.sessions.binding(sessionId)
+      if (binding === undefined) {
         throw new Error(`ui-trajectory: session "${sessionId}" is unavailable`)
       }
-      const trajectory = ctx.uiConversation.binding(sessionId).target('trajectory')
+      const { session } = binding
+      const trajectory = ctx.uiConversation.binding(binding).target('trajectory')
       return {
         hooks: { duration },
         watchToolResult: createToolResultWatcher(ctx.remote, sessionId, (error) => {
@@ -99,6 +100,9 @@ export function apply(ctx: Context): void {
           getDefault: () => stringWrapping.getSnapshot(),
           setDefault: (value) => { stringWrapping.set(value) },
         },
+        readingPosition: epoch => session.getSnapshot().historyEpoch === epoch
+          ? session.readingPosition?.('trajectory') : undefined,
+        loadThrough: seq => session.loadThrough(seq),
         loadOlder: async () => {
           const before = trajectory.getSnapshot()
           await session.loadOlder()
