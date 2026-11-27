@@ -284,6 +284,15 @@ it.skipIf(MODE === 'record')('reopens an oversized history from a complete cache
         const history = body.payload?.args?.request
         if (history?.address?.sessionId === a) pageCuts.push({ beforeSeq: history.beforeSeq, throughSeq: history.throughSeq })
       })
+      let failNextPage = false
+      await page.route('**/api/session/page', async (route) => {
+        if (!failNextPage) return route.continue()
+        failNextPage = false
+        const { rpcId } = route.request().postDataJSON() as { rpcId: string }
+        await route.fulfill({ json: { type: 'server-response', rpcId, result: {
+          ok: false, error: { code: 'gateway/internal', message: 'Injected history page failure', data: {} },
+        } } })
+      })
       const warmGate = Promise.withResolvers<undefined>()
       let warm = false
       await page.routeWebSocket('**/api/remote.mux', (socket) => {
@@ -369,10 +378,12 @@ it.skipIf(MODE === 'record')('reopens an oversized history from a complete cache
       warmGate.resolve(undefined)
       await prompt(16).waitFor()
       await expect.poll(offset).toBeCloseTo(saved, 0)
-      const loadEarlier = chat.getByRole('button', { name: 'Load earlier', exact: true })
-      await loadEarlier.click()
+      failNextPage = true
+      await chat.getByRole('button', { name: 'Load earlier', exact: true }).click()
+      await chat.getByRole('button', { name: 'Retry loading', exact: true }).click()
       await prompt(1).waitFor()
-      expect(pageCuts).toEqual([{ beforeSeq: confirmed.records[0].event.seq, throughSeq: confirmed.cursor }])
+      const cut = { beforeSeq: confirmed.records[0].event.seq, throughSeq: confirmed.cursor }
+      expect(pageCuts).toEqual([cut, cut])
       console.info('[history-cache] oversized opening', JSON.stringify({
         records: cold.records.length, jsonBytes, estimatedLowerBound, retainedStart, confirmedStart: confirmed.records[0].event.seq,
         pageCut: pageCuts[0], savedOffset: saved,
