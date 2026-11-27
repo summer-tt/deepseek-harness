@@ -369,60 +369,33 @@ export abstract class RemoteJournalStream<
     notifications: Notification[],
   ): Promise<JournalStreamItem<Page, Entry, Cursor, Notification> | undefined> {
     const cancelled = (): boolean => signal.aborted || this.generationSignal !== signal
-    let read = await this.readPageWhileFollowing(
-      request,
-      requiredCursor,
-      generation,
-      signal,
-      iterator,
-      queued,
-      notifications,
-    )
-    if (read.type === 'superseded') return read.item
-    if (cancelled()) return undefined
-    if (read.type === 'page-error') throw read.error
-    let page = read.page
-    this.assertPageThrough(page, requiredCursor)
-    let entries = this.mergeReplacement(page, queued)
-    let target = this.maxCursor(requiredCursor, queued)
-    if (entries === undefined || this.options.compare(this.tailCursor(entries), target) < 0) {
-      read = await this.readPageWhileFollowing(
-        this.repairPageRequest(),
-        target,
-        generation,
-        signal,
-        iterator,
-        queued,
-        notifications,
-      )
+    let through = requiredCursor
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const pageRequest = attempt === 0 ? request : this.repairPageRequest()
+      const read = await this.readPageWhileFollowing(pageRequest, through, generation, signal, iterator, queued, notifications)
       if (read.type === 'superseded') return read.item
       if (cancelled()) return undefined
       if (read.type === 'page-error') throw read.error
-      page = read.page
-      this.assertPageThrough(page, target)
-      entries = this.mergeReplacement(page, queued)
-      target = this.maxCursor(requiredCursor, queued)
+      const { page } = read
+      this.assertPageThrough(page, through)
+      const entries = this.mergeReplacement(page, queued)
+      through = this.maxCursor(requiredCursor, queued)
+      if (entries === undefined || this.options.compare(this.tailCursor(entries), through) < 0) continue
+
+      this.windowRevision++
+      const first = entries[0]
+      /* v8 ignore next -- a successful positive-cursor replacement page cannot be empty. */
+      this.firstCursor = first === undefined ? undefined : this.options.first(first)
+      this.lastCursor = this.tailCursor(entries)
+      this.setResumeCursor(this.lastCursor)
+      this.options.publish({ type: 'replace', page, entries, hasMore: this.options.hasMore(page) })
+      for (const notification of notifications) {
+        if (cancelled()) break
+        this.publishNotification(notification)
+      }
+      return undefined
     }
-    if (entries === undefined || this.options.compare(this.tailCursor(entries), target) < 0) {
-      throw protocolViolation(`${this.options.name} page did not reach its opening cursor`)
-    }
-    const first = entries[0]
-    this.windowRevision++
-    /* v8 ignore next -- a successful positive-cursor replacement page cannot be empty. */
-    this.firstCursor = first === undefined ? undefined : this.options.first(first)
-    this.lastCursor = this.tailCursor(entries)
-    this.setResumeCursor(this.lastCursor)
-    this.options.publish({
-      type: 'replace',
-      page,
-      entries,
-      hasMore: this.options.hasMore(page),
-    })
-    for (const notification of notifications) {
-      if (cancelled()) break
-      this.publishNotification(notification)
-    }
-    return undefined
+    throw protocolViolation(`${this.options.name} page did not reach its opening cursor`)
   }
 
   private async readPageWhileFollowing(
