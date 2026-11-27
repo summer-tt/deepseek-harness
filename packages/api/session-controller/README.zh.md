@@ -76,6 +76,8 @@ Fork 将 `atSeq` 选定的含边界事件前缀（包括开放轮次内的截点
 
 已认证的 Web 页面在内存中限量保留最近确认的历史与阅读位置，按 owner、所配对的 Host 和完整 Session address 隔离。切回命中的 Session 时会重新打开 `follow`，并复用等值的记录，无需发布历史更新。Client 用 `history-append` 通知补回的历史后缀，用 `append` 通知实时记录。缓存的历史窗口不包含 Assistant 临时内容或待确认的发送状态。远端路由必须先通告支持权威快照和授权变化，Web 页面才会缓存该路由的历史。
 
+每个非活跃历史窗口最多保留 1,500 条持久记录和 2 MiB 估算权重，其中预留阅读位置的空间。窗口超限时，缓存保留从 Turn 起点开始的连续后缀，并标记还有更早的历史。如果最新 Turn 无法装入预算，缓存保留符合条件的阅读位置，等 `follow` 返回后再显示历史。后续分页从 Host 确认的窗口边界开始。保存在边界之前的阅读位置仍是加载较早历史的目标。
+
 Client 的首次 `follow`、重连首屏与 `loadOlder()` 至少请求 50 条以 append 方式追加的 `user/message` 和 `assistant/message` 事件，并向前跨过至少两个 `turn/start`，其中包含已加载窗口开头尚未补齐的轮次。Host 在首次同时满足两个下限的轮次开头停止；若先达到 500 条计数消息或历史已耗尽，则立即返回。Steering 不增加轮次分界。区间内的其他事件随页返回，但不计入消息预算。分页和 follow 请求可选的 `turnWindow` 在 `maxMessages` 上限内指定这两个下限。`loadThrough()` 复用相同规则，仅将每页消息数下限设为 200；500 条上限不限制整次跳转。不带 `turnWindow` 的请求保留按消息对齐的分页方式。
 
 调用方确认 `ctx.sessionController.supportsHistoryWindowStart` 或通过载体收到等效能力通告后，可以给 `follow` 传入 `historyWindowStart`。Host 通过同一份 observation 读取普通开场和扩展窗口，起点为请求指定的非负安全整数序号。只有完整候选窗口含至多 1,500 条记录，且 `records` 数组的 JSON UTF-8 编码至多为 2 MiB，Host 才扩展窗口。起点较晚或候选窗口超限时，Host 返回普通开场。通过已鉴权 relay 发起权威读取时，`follow` 和 `page` 可以携带 `verifiedHistoryWindow` 和 `historyRouteEpoch`。relay 检查该 epoch，并在转发前移除它。

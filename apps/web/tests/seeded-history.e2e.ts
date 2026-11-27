@@ -16,9 +16,9 @@ import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import { createLaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
-import { createMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createAssistantMessage, createMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, ContextFormed, Message, MessageSource } from '@deepseek-ai/dsh-llm'
-import { deriveEventMessage, SessionId } from '@deepseek-ai/dsh-session'
+import { deriveEventMessage, Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import type {} from '@deepseek-ai/dsh-api-terminal-controller'
@@ -227,6 +227,155 @@ it.skipIf(MODE === 'record')('displays visited history before a delayed follow a
       console.info('[history-cache] Chromium switch', JSON.stringify({
         browser: browser.version(), delay, coldVisibleMs, warmVisibleMs, warmPositionMs, position,
         anchorOffset: anchor.offset, restoredOffset: restored.offset, delayedRequests, transcriptMutations,
+      }))
+    } finally {
+      await browser.close()
+    }
+  } finally {
+    await scaffold.close()
+  }
+}, 60_000)
+
+it.skipIf(MODE === 'record')('reopens an oversized history from a complete cached tail before the Host replies', async () => {
+  const scaffold = await launchWebScaffold()
+  const executablePath = process.env.DSH_PLAYWRIGHT_EXECUTABLE_PATH
+  try {
+    const a = 'large-history-a'
+    const b = 'large-history-b'
+    const session = Session.create(SessionId(a))
+    const payload = 'bulky synthetic input '.repeat(4_200)
+    for (let turn = 1; turn <= 40; turn += 1) {
+      session.append('turn/start', { turn })
+      session.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: `Large history prompt ${String(turn)}` }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      session.append('step/start', { turn, step: 1 })
+      const content: ContentBlock[] = []
+      if (turn >= 16 && turn <= 36) content.push({ type: 'reasoning', text: payload })
+      content.push({ type: 'text', text: `Large history reply ${String(turn)}` })
+      session.append('assistant/message', {
+        turn, step: 1, stream: [],
+        message: createAssistantMessage({
+          content,
+          source: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+        }),
+      }, { surfaceOp: 'append' })
+      session.append('step/end', { turn, step: 1 })
+      session.append('turn/end', { turn, reason: { kind: 'completed' } })
+    }
+    const source = [JSON.stringify({ type: 'session', ...session.header, cwd: '{{cwd}}', delegationDepth: 0 }),
+      ...session.snapshotEvents().map(event => JSON.stringify(event)), '',
+    ].join('\n')
+    await seedSession(scaffold, source, a)
+    await seedSession(scaffold, (await readFile(SEED, 'utf8')).replaceAll(PROMPT, 'Switch away from large history'), b)
+    const browser = await chromium.launch(executablePath === undefined ? {} : { executablePath })
+    try {
+      const page = await newEnglishPage(browser)
+      await page.setViewportSize({ width: 1100, height: 550 })
+      type Opening = { readonly records: readonly { event: SessionEvent }[]; readonly hasMore: boolean; readonly cursor: number }
+      const openings: Opening[] = []
+      const starts: (number | undefined)[] = []
+      const pageCuts: { beforeSeq: number | undefined; throughSeq: number | undefined }[] = []
+      page.on('request', (request) => {
+        if (!new URL(request.url()).pathname.endsWith('/api/session/page')) return
+        const body = request.postDataJSON() as {
+          payload?: { args?: { request?: { address?: { sessionId?: string }; beforeSeq?: number; throughSeq?: number } } }
+        }
+        const history = body.payload?.args?.request
+        if (history?.address?.sessionId === a) pageCuts.push({ beforeSeq: history.beforeSeq, throughSeq: history.throughSeq })
+      })
+      const warmGate = Promise.withResolvers<undefined>()
+      let warm = false
+      await page.routeWebSocket('**/api/remote.mux', (socket) => {
+        const server = socket.connectToServer()
+        const streams = new Map<string, boolean>()
+        socket.onMessage((message) => {
+          const frame = JSON.parse(String(message)) as {
+            type: string
+            endpoint?: string
+            streamId?: string
+            payload?: { args?: { request?: { address?: { sessionId?: string }; historyWindowStart?: number } } }
+          }
+          const request = frame.payload?.args?.request
+          if (request?.address?.sessionId === a) {
+            if (frame.type === 'open' && frame.endpoint === 'session/follow' && frame.streamId !== undefined) {
+              streams.set(frame.streamId, warm)
+              starts.push(request.historyWindowStart)
+            }
+          }
+          server.send(message)
+        })
+        server.onMessage((message) => {
+          const frame = JSON.parse(String(message)) as { streamId?: string; value?: { type: string } & Opening }
+          const held = frame.streamId === undefined ? undefined : streams.get(frame.streamId)
+          if (held !== undefined && frame.value?.type === 'snapshot') {
+            openings.push(frame.value)
+          }
+          if (held === true) void warmGate.promise.then(() => { socket.send(message) })
+          else socket.send(message)
+        })
+      })
+      await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+      const group = page.locator('[data-row-key^="workspace:"]').first()
+      await group.waitFor({ timeout: 15_000 })
+      if (await group.getAttribute('aria-expanded') === 'false') await group.click()
+      const row = (id: string) => page.locator(`[data-row-key="session:${id}"]`)
+      const chat = page.locator('[data-conversation-scroll]')
+      const prompt = (turn: number) => chat.getByText(`Large history prompt ${String(turn)}`, { exact: true })
+      const switched = chat.getByText('Switch away from large history', { exact: true })
+      await row(b).click()
+      await switched.waitFor()
+      await row(a).click()
+      await prompt(40).waitFor()
+      await prompt(16).waitFor()
+      const cold = openings[0]
+      if (cold === undefined || cold.records[0] === undefined) throw new Error('missing cold opening')
+      const jsonBytes = Buffer.byteLength(JSON.stringify(cold.records))
+      const estimatedLowerBound = cold.records.reduce((bytes, { event }) => event.type === 'assistant/message'
+        ? bytes + event.data.message.content.reduce((total, block) => block.type === 'reasoning' ? total + 2 * block.text.length : total, 0)
+        : bytes, 0)
+      expect(estimatedLowerBound).toBeGreaterThan(2 * 1024 * 1024)
+      expect(cold.hasMore).toBe(true)
+      expect(await prompt(1).count()).toBe(0)
+
+      await prompt(39).evaluate((element) => {
+        element.scrollIntoView({ block: 'center' })
+        element.closest('[data-conversation-scroll]')?.dispatchEvent(new Event('scroll'))
+      })
+      const offset = () => prompt(39).evaluate((element) => {
+        const scroller = element.closest('[data-conversation-scroll]')
+        if (scroller === null) throw new Error('missing history scroller')
+        return element.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+      })
+      const saved = await offset()
+      await row(b).click()
+      await switched.waitFor()
+      warm = true
+      await row(a).click()
+      await expect.poll(() => starts.length).toBe(2)
+      const retainedStart = starts[1]
+      if (retainedStart === undefined) throw new Error('warm follow did not carry a cached history start')
+      expect(retainedStart).toBeGreaterThan(cold.records[0].event.seq)
+      expect(cold.records.find(record => record.event.seq === retainedStart)?.event.type).toBe('turn/start')
+      await prompt(40).waitFor({ timeout: 5_000 })
+      expect(await prompt(16).count()).toBe(0)
+      await expect.poll(offset).toBeCloseTo(saved, 0)
+      expect(pageCuts).toEqual([])
+      await expect.poll(() => openings.length).toBe(2)
+      const confirmed = openings[1]
+      if (confirmed === undefined || confirmed.records[0] === undefined) throw new Error('missing warm authoritative opening')
+      expect(confirmed.records[0].event.seq).toBe(cold.records[0].event.seq)
+      expect(confirmed.cursor).toBeGreaterThanOrEqual(cold.cursor)
+      warmGate.resolve(undefined)
+      await prompt(16).waitFor()
+      await expect.poll(offset).toBeCloseTo(saved, 0)
+      const loadEarlier = chat.getByRole('button', { name: 'Load earlier', exact: true })
+      await loadEarlier.click()
+      await prompt(1).waitFor()
+      expect(pageCuts).toEqual([{ beforeSeq: confirmed.records[0].event.seq, throughSeq: confirmed.cursor }])
+      console.info('[history-cache] oversized opening', JSON.stringify({
+        records: cold.records.length, jsonBytes, estimatedLowerBound, retainedStart, confirmedStart: confirmed.records[0].event.seq,
+        pageCut: pageCuts[0], savedOffset: saved,
       }))
     } finally {
       await browser.close()
