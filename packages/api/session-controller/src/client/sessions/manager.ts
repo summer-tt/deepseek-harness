@@ -32,6 +32,7 @@ import { Session } from './session.ts'
 import { historyDependsOn, historyServer, SessionHistoryCache, type HistoryAuthorization } from './history-cache.ts'
 import type { SessionRemotes } from './remotes.ts'
 import type { SessionTarget } from '../contract/sessions.ts'
+import type { SessionHistoryCacheBudget } from '../../history-cache-budget.ts'
 
 function sessionSeqCursor(value: number): SessionSeqCursor {
   return value === -1 ? -1 : SessionSeq(value)
@@ -774,6 +775,14 @@ export class SessionManager {
    */
   handleSessionError(sessionId: SessionId, message: string): void {
     this.sessions.get(sessionId)?.handleAgentError(message)
+  }
+
+  /**
+   * Apply the page's estimated-weight limits to the inactive cache.
+   * @param budget - per-Session and page limits in MiB.
+   */
+  setHistoryCacheBudget(budget: SessionHistoryCacheBudget): void {
+    this.history.setBudget(budget)
   }
 
   /**

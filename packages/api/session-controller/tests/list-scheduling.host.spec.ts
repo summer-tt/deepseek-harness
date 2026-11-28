@@ -181,6 +181,27 @@ describe('Session-list work slices', () => {
     expect(SessionController.Config({ nativeOpen: false, listWorkSliceMs: 32 })).toMatchObject({ nativeOpen: false, listWorkSliceMs: 32 })
   })
 
+  it('exposes only the Client history budgets as live settings and supplies their defaults', () => {
+    const defaults = SessionController.Config({})
+    expect(defaults.historyCacheSessionMiB.get()).toBe(20)
+    expect(defaults.historyCachePageMiB.get()).toBe(200)
+    const overridden = SessionController.Config({ historyCacheSessionMiB: 8_589_934_591, historyCachePageMiB: 1 })
+    expect(overridden.historyCacheSessionMiB.get()).toBe(8_589_934_591)
+    expect(overridden.historyCachePageMiB.get()).toBe(1)
+    const ctx = new Context()
+    contexts.add(ctx)
+    expect(() => new SessionController(ctx, overridden)).not.toThrow()
+    const fields = SessionController.Config.dict ?? {}
+    expect(Object.keys(fields).filter(key => fields[key]?.meta.volatile)).toEqual([
+      'historyCacheSessionMiB', 'historyCachePageMiB',
+    ])
+  })
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 8_589_934_592])('rejects invalid history budget %s', (value) => {
+    expect(() => SessionController.Config({ historyCacheSessionMiB: value })).toThrow()
+    expect(() => SessionController.Config({ historyCachePageMiB: value })).toThrow()
+  })
+
   it('routes an overridden budget through the public Session Controller', async () => {
     const h = await harness([{ id: 'first', phase: 'cold' }, { id: 'middle', phase: 'cold' }, { id: 'last', phase: 'cold' }], 4)
     const dispose = (): void => {}

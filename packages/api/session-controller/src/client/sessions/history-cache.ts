@@ -3,11 +3,10 @@ import { isJsonValue } from '@deepseek-ai/dsh-util-values'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SessionAddress, SessionHistoryOwner, SessionHistoryRoute, SessionWireHeader } from '../../types.ts'
 import type { SessionLiveEventEntry } from '../contract/events.ts'
+import { BYTES_PER_MIB, DEFAULT_HISTORY_CACHE_BUDGET, MAX_HISTORY_CACHE_MIB, type SessionHistoryCacheBudget } from '../../history-cache-budget.ts'
 
 /** Maximum durable records retained for one inactive binding. */
 export const MAX_HISTORY_CACHE_RECORDS = 1_500
-const MAX_ENTRY_BYTES = 2 * 1024 * 1024
-const MAX_CACHE_BYTES = 8 * 1024 * 1024
 const MAX_ENTRIES = 12
 const MAX_POSITION_BYTES = 4 * 1024
 // Window object, property slots and names, empty entries array, and hasMore boolean.
@@ -75,6 +74,8 @@ function cacheKey(address: SessionAddress, authorization: HistoryAuthorization):
 export class SessionHistoryCache {
   private readonly entries = new Map<string, CacheEntry>()
   private weight = 0
+  private entryBudget = DEFAULT_HISTORY_CACHE_BUDGET.historyCacheSessionMiB * BYTES_PER_MIB
+  private pageBudget = DEFAULT_HISTORY_CACHE_BUDGET.historyCachePageMiB * BYTES_PER_MIB
   private generation: number | undefined
   private lastGeneration: number | undefined
   private rejected = false
@@ -82,6 +83,39 @@ export class SessionHistoryCache {
   private lastOwnerEpoch: SessionHistoryOwner['ownerEpoch'] | undefined
   private readonly routes = new Map<string, SessionHistoryRoute>()
   private readonly routeGrants = new Map<string, HistoryAuthorization>()
+
+  /**
+   * Update the inactive cache, preserving entry recency during compaction.
+   * @param budget - complete limits in MiB, ignored together if either value is invalid.
+   */
+  setBudget(budget: SessionHistoryCacheBudget): void {
+    if (typeof budget !== 'object' || budget === null) return
+    const { historyCacheSessionMiB, historyCachePageMiB } = budget
+    if (!isBudgetMiB(historyCacheSessionMiB) || !isBudgetMiB(historyCachePageMiB)) return
+    const entryBudget = historyCacheSessionMiB * BYTES_PER_MIB
+    const pageBudget = historyCachePageMiB * BYTES_PER_MIB
+    if (this.entryBudget === entryBudget && this.pageBudget === pageBudget) return
+    const previousEntryLimit = this.entryLimit
+    this.entryBudget = entryBudget
+    this.pageBudget = pageBudget
+
+    if (this.entryLimit < previousEntryLimit) {
+      for (const [key, entry] of this.entries) {
+        const historyBudget = this.historyLimit(key)
+        const current = entry.history
+        if (current !== undefined && current.weight > historyBudget) {
+          const history = selectHistory(current.window, historyBudget, false)
+          const weight = entry.weight - current.weight + (history?.weight ?? 0)
+          if ((history === undefined && entry.positions.size === 0) || weight > this.entryLimit) this.delete(key)
+          else {
+            this.entries.set(key, { ...entry, history, weight })
+            this.weight -= entry.weight - weight
+          }
+        } else if (entry.weight > this.entryLimit) this.delete(key)
+      }
+    }
+    this.evictToFit(this.pageBudget, MAX_ENTRIES)
+  }
 
   /**
    * Freeze reads and invalidate remote entries when the Connection generation changes.
@@ -196,7 +230,7 @@ export class SessionHistoryCache {
     const key = cacheKey(address, grant)
     const positions = this.entries.get(key)?.positions ?? new Map()
     const history = window === undefined ? undefined
-      : selectHistory(window, MAX_ENTRY_BYTES - cacheEntryOverhead(key) - MAX_POSITION_BYTES, truncated)
+      : selectHistory(window, this.historyLimit(key), truncated)
     this.store(key, address, grant, history, positions)
   }
 
@@ -290,14 +324,31 @@ export class SessionHistoryCache {
     if (history === undefined && positions.size === 0) return
     let weight = cacheEntryOverhead(key) + (history?.weight ?? 0)
     for (const position of positions.values()) weight += position.bytes
-    if (weight > MAX_ENTRY_BYTES) return
+    if (weight > this.entryLimit) return
+    // Reserve room before adding the entry so combined weight stays a safe integer.
+    this.evictToFit(this.pageBudget - weight, MAX_ENTRIES - 1)
     this.entries.set(key, { address, route: grant.route, history, positions, weight })
     this.weight += weight
+  }
+
+  private get entryLimit(): number {
+    return Math.min(this.entryBudget, this.pageBudget)
+  }
+
+  private historyLimit(key: string): number {
+    return this.entryLimit - cacheEntryOverhead(key) - MAX_POSITION_BYTES
+  }
+
+  private evictToFit(weight: number, count: number): void {
     for (const oldest of this.entries.keys()) {
-      if (this.entries.size <= MAX_ENTRIES && this.weight <= MAX_CACHE_BYTES) break
+      if (this.entries.size <= count && this.weight <= weight) break
       this.delete(oldest)
     }
   }
+}
+
+function isBudgetMiB(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_HISTORY_CACHE_MIB
 }
 
 function cacheEntryOverhead(key: string): number {

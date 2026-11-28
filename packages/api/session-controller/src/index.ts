@@ -4,7 +4,7 @@ import { hostname } from 'node:os'
 import { resolve } from 'node:path'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-fs'
-import { Context, Service } from '@deepseek-ai/cordis'
+import { Context, Service, type Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { errorChain, ReasoningEffortId, type MessageSource } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-client-file-upload'
@@ -31,6 +31,7 @@ import { buildModelCatalog, hasProviderApiKey } from './catalog.ts'
 import { SessionSkillCatalog } from './skill-catalog.ts'
 import { SessionMediaReferences } from './media-references.ts'
 import { ArchivedSessionGate } from './archived-session-gate.ts'
+import { DEFAULT_HISTORY_CACHE_BUDGET, MAX_HISTORY_CACHE_MIB } from './history-cache-budget.ts'
 import type {
   ModelCatalog,
   SessionWorkspacePathApplication,
@@ -106,16 +107,19 @@ function resolveSessionResource({ args, parameters }: TypertResourceResolveInput
   return undefined
 }
 
-/** Session Controller deployment policy. */
+/** Session Controller deployment policy, including the Loader's live budget references. */
 export interface Config {
   /** Override platform desktop-opener detection. */
   readonly nativeOpen?: boolean
   /** Positive integral milliseconds of list work before yielding between complete rows. */
   readonly listWorkSliceMs?: number
+  /** Maximum estimated inactive history and position weight per Session, in MiB. */
+  readonly historyCacheSessionMiB?: number | Volatile<number>
+  /** Maximum combined estimated inactive history and position weight per page, in MiB. */
+  readonly historyCachePageMiB?: number | Volatile<number>
 }
 
-/** Deployment policy after schema defaults have been applied. */
-type ResolvedConfig = Config & { readonly listWorkSliceMs: number }
+const listWorkSliceMsSchema = z.natural().min(1).default(16)
 
 /** Host integrations replaceable by direct unit tests. */
 export interface SessionControllerInternals {
@@ -149,9 +153,15 @@ export class SessionController extends TypertRemoteService {
     'workspaceRegistry',
   ]
 
-  static Config: z<Config, ResolvedConfig> = z.object({
+  static Config = z.object({
     nativeOpen: z.boolean(),
-    listWorkSliceMs: z.natural().min(1).default(16),
+    listWorkSliceMs: listWorkSliceMsSchema,
+    historyCacheSessionMiB: z.number().step(1).min(1).max(MAX_HISTORY_CACHE_MIB)
+      .default(DEFAULT_HISTORY_CACHE_BUDGET.historyCacheSessionMiB).volatile()
+      .description('Estimated inactive history and reading positions per Session, in MiB.'),
+    historyCachePageMiB: z.number().step(1).min(1).max(MAX_HISTORY_CACHE_MIB)
+      .default(DEFAULT_HISTORY_CACHE_BUDGET.historyCachePageMiB).volatile()
+      .description('Combined estimated inactive history and reading positions per page, in MiB.'),
   })
 
   /** This Host can extend a follow opening's history window within the protocol budget. */
@@ -175,12 +185,12 @@ export class SessionController extends TypertRemoteService {
 
   /**
    * @param ctx - Host context containing the Session capability assembly.
-   * @param config - native-opener and list-scheduling deployment policy.
+   * @param config - Loader-validated policy or raw configuration from a direct caller.
    * @param internals - host integrations replaceable by direct unit tests.
    */
   constructor(ctx: Context, config: Config, internals: SessionControllerInternals = {}) {
     super(ctx, 'sessionController', { namespace: 'session' })
-    this.listWorkSliceMs = SessionController.Config(config).listWorkSliceMs
+    this.listWorkSliceMs = listWorkSliceMsSchema(config.listWorkSliceMs)
     this.fileApplications = internals.fileApplications ?? nativeFileApplications
     this.openFileApplication = internals.openFileApplication ?? openNativeFileApplication
     this.openPath = internals.openPath ?? openNativeAssociatedPath

@@ -9,6 +9,9 @@ import { createSessionControlStream } from './transport.ts'
 import { ClientSessions } from './sessions/service.ts'
 import type { SessionRemotes } from './sessions/remotes.ts'
 import type {} from '../remote-events.ts'
+import type { SessionHistoryCacheBudget } from '../history-cache-budget.ts'
+
+export type { SessionHistoryCacheBudget } from '../history-cache-budget.ts'
 
 export {
   createSessionControlStream,
@@ -93,6 +96,14 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     /** Client Session object layer and Agent scope owner. */
     sessions: import('./contract/sessions.ts').ISessions
+    /** Inactive history cache policy for this Client page. */
+    sessionHistoryCache: {
+      /**
+       * Apply both limits immediately to inactive entries. Ignore invalid budgets.
+       * @param budget - positive whole MiB values whose byte counts are safe integers.
+       */
+      setBudget(budget: SessionHistoryCacheBudget): void
+    }
   }
 }
 
@@ -156,4 +167,7 @@ export function apply(ctx: Context): void {
     },
   })
   ctx.effect(() => async () => { await control.dispose() }, 'session-controller.client.control')
+  ctx.provide('sessionHistoryCache', {
+    setBudget: (budget: SessionHistoryCacheBudget) => { sessions.setHistoryCacheBudget(budget) },
+  })
 }

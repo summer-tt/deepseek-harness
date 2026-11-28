@@ -15,17 +15,21 @@ function address(index: number): Extract<SessionAddress, { kind: 'session' }> {
   return { kind: 'session', sessionId: SessionId(`session-${String(index)}`) }
 }
 
-function windowOf(id: SessionId, text: string, count = 1): DurableHistoryWindow {
+function windowOf(id: SessionId, text: string, count = 1, first = 0): DurableHistoryWindow {
   return {
     header: { id, version: 2, createdAt: 0, isSeeded: false }, hasMore: false,
-    entries: historyEntries(Array.from({ length: count }, (_, seq) => ({
-      type: 'event', event: { type: 'turn/start', seq, time: seq, data: { turn: seq, text } },
-    }))),
+    entries: historyEntries(Array.from({ length: count }, (_, index) => {
+      const seq = first + index
+      return { type: 'event', event: { type: 'turn/start', seq, time: seq, data: { turn: seq, text } } }
+    })),
   }
 }
 
-function authorized(): { cache: SessionHistoryCache; grant: HistoryAuthorization } {
+const BASELINE_BUDGET = { historyCacheSessionMiB: 2, historyCachePageMiB: 8 }
+
+function authorized(budget: typeof BASELINE_BUDGET | null = BASELINE_BUDGET): { cache: SessionHistoryCache; grant: HistoryAuthorization } {
   const cache = new SessionHistoryCache()
+  if (budget !== null) cache.setBudget(budget)
   cache.connect(1)
   cache.authorize(OWNER)
   const grant = cache.authorization(address(0))
@@ -46,6 +50,22 @@ it('retains up to 12 entries and refreshes recency on reads, including positions
   expect(cache.readPosition(address(12), 'chat')).toEqual({ seq: 3 })
   cache.writePosition(address(12), 'chat', undefined)
   expect(cache.readPosition(address(12), 'chat')).toBeUndefined()
+})
+
+it('uses the 20 MiB per-Session and 200 MiB page defaults', () => {
+  const { cache, grant } = authorized(null)
+  const text = 'a'.repeat(9_000_000)
+  for (let index = 0; index < 12; index += 1) {
+    const target = address(index)
+    cache.retain(target, grant, windowOf(target.sessionId, text))
+  }
+  expect(cache.read(address(0), grant)).toBeUndefined()
+  expect(cache.read(address(1), grant)).toBeDefined()
+  expect(cache.read(address(11), grant)).toBeDefined()
+  const tooLarge = address(12)
+  cache.retain(tooLarge, grant, windowOf(tooLarge.sessionId, 'b'.repeat(10_500_000)))
+  expect(cache.read(tooLarge, grant)).toBeUndefined()
+  expect(cache.read(address(2), grant)).toBeDefined()
 })
 
 it('evicts by the combined byte budget and declines oversized records and windows', () => {
@@ -159,6 +179,98 @@ it('keeps an exact-budget window through position writes and counts only actual 
   cache.writePosition(address(4), 'chat', position)
   expect(cache.read(address(1), grant)).toBeUndefined()
   expect(cache.read(address(4), grant)).toBe(windows[4])
+})
+
+it('uses the page limit for per-Session admission before evicting other addresses', () => {
+  const { cache, grant } = authorized({ historyCacheSessionMiB: 4, historyCachePageMiB: 1 })
+  const first = address(0)
+  const other = address(1)
+  const small = windowOf(first.sessionId, 'a'.repeat(300_000))
+  cache.retain(first, grant, small)
+  cache.retain(other, grant, windowOf(other.sessionId, 'b'.repeat(700_000)))
+  expect(cache.read(other, grant)).toBeUndefined()
+  expect(cache.read(first, grant)).toBe(small)
+
+  const tail = windowOf(other.sessionId, 'c'.repeat(200_000), 1, 1)
+  const head = windowOf(other.sessionId, 'b'.repeat(700_000))
+  cache.retain(other, grant, { ...tail, entries: [...head.entries, ...tail.entries] })
+  const suffix = cache.read(other, grant)
+  expect(suffix?.hasMore).toBe(true)
+  expect(suffix?.entries[0]).toBe(tail.entries[0])
+  expect(cache.read(first, grant)).toBe(small)
+})
+
+it('compacts before page eviction and preserves recency, surviving records, and positions', () => {
+  const { cache, grant } = authorized({ historyCacheSessionMiB: 4, historyCachePageMiB: 8 })
+  const long = 'a'.repeat(560_000)
+  const short = 'b'.repeat(390_000)
+  const oversized = windowOf(address(2).sessionId, long)
+  const discarded = windowOf(address(4).sessionId, long)
+  const first = windowOf(address(0).sessionId, short, 1, 1)
+  const newer = windowOf(address(1).sessionId, short, 1, 1)
+  const last = windowOf(address(3).sessionId, short)
+  for (const window of [first, newer]) {
+    const { id } = window.header
+    const prefix = windowOf(id, long)
+    cache.retain({ kind: 'session', sessionId: id }, grant, { ...window, entries: [...prefix.entries, ...window.entries] })
+  }
+  cache.retain(address(2), grant, oversized)
+  cache.writePosition(address(2), 'chat', { seq: 1 })
+  cache.retain(address(3), grant, last)
+  cache.retain(address(4), grant, discarded)
+  cache.setBudget({ historyCacheSessionMiB: 1, historyCachePageMiB: 2 })
+
+  expect(cache.read(address(0), grant)).toBeUndefined()
+  expect(cache.read(address(4), grant)).toBeUndefined()
+  expect(cache.read(address(1), grant)?.entries[0]).toBe(newer.entries[0])
+  expect(cache.read(address(1), grant)?.hasMore).toBe(true)
+  expect(cache.read(address(2), grant)).toBeUndefined()
+  expect(cache.readPosition(address(2), 'chat')).toEqual({ seq: 1 })
+  expect(cache.read(address(3), grant)).toBe(last)
+})
+
+it('evicts mixed local and remote entries by recency when only the page limit shrinks', () => {
+  const { cache, grant } = authorized({ historyCacheSessionMiB: 1, historyCachePageMiB: 3 })
+  const relay = { kind: 'session', sessionId: SessionId('zr~aabb0011~remote') } as const
+  cache.updateRoute({ serverId: 'aabb0011', routeEpoch: 'live', available: true })
+  const relayGrant = cache.authorization(relay)
+  if (relayGrant === undefined) throw new Error('expected relay authorization')
+  const payload = 'a'.repeat(390_000)
+  const first = windowOf(address(0).sessionId, payload)
+  const remote = windowOf(relay.sessionId, payload)
+  const last = windowOf(address(1).sessionId, payload)
+  cache.retain(address(0), grant, first)
+  cache.retain(relay, relayGrant, remote)
+  cache.retain(address(1), grant, last)
+  expect(cache.read(address(0), grant)).toBe(first)
+
+  cache.setBudget({ historyCacheSessionMiB: 1, historyCachePageMiB: 2 })
+  expect(cache.read(relay, relayGrant)).toBeUndefined()
+  expect(cache.read(address(0), grant)).toBe(first)
+  expect(cache.read(address(1), grant)).toBe(last)
+  cache.setBudget({ historyCacheSessionMiB: 1, historyCachePageMiB: 3 })
+  expect(cache.read(relay, relayGrant)).toBeUndefined()
+})
+
+it('keeps the last complete valid budget and admits the maximum safe MiB value', () => {
+  const { cache, grant } = authorized()
+  const target = address(0)
+  const window = windowOf(target.sessionId, 'a'.repeat(700_000))
+  cache.retain(target, grant, window)
+  const invalid = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 8_589_934_592, '1', undefined]
+  for (const value of invalid) {
+    cache.setBudget({ historyCacheSessionMiB: 1, historyCachePageMiB: value as number })
+    cache.setBudget({ historyCacheSessionMiB: value as number, historyCachePageMiB: 1 })
+  }
+  cache.setBudget(null!)
+  cache.setBudget(BASELINE_BUDGET)
+  expect(cache.read(target, grant)).toBe(window)
+  const larger = windowOf(target.sessionId, 'a'.repeat(1_200_000))
+  cache.retain(target, grant, larger)
+  expect(cache.read(target, grant)).toBeUndefined()
+  cache.setBudget({ historyCacheSessionMiB: 8_589_934_591, historyCachePageMiB: 8_589_934_591 })
+  cache.retain(target, grant, larger)
+  expect(cache.read(target, grant)).toBe(larger)
 })
 
 it('scopes local reuse to the confirmed owner and freezes reads despite a matching retained grant', () => {

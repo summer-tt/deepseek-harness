@@ -1,12 +1,13 @@
 /** Verified history through the assembled Gateway, Connection, and Session references. */
 import { createClientTest, webApp } from '@deepseek-ai/dsh-client-test-runtime/src/assembly/index.ts'
 import { RemoteStreamCarrierError } from '@deepseek-ai/dsh-api-gateway/client'
-import { SessionId } from '@deepseek-ai/dsh-session/types'
+import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session/types'
 import { RemoteError, type RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { ok, type RemoteMock } from '@deepseek-ai/dsh-remote-mock'
 import { expect, vi } from 'vitest'
 import type { SessionEventsPage, SessionFollowRequest } from '../src/types.ts'
 import { FOLLOW, PAGE, followSnapshot } from './remote/session.client.ts'
+import { ev, historyValue } from './event-script.client.ts'
 
 const it = createClientTest({ roster: webApp.closure(['@deepseek-ai/dsh-api-session-controller']) })
 const A = SessionId('session-a')
@@ -37,6 +38,94 @@ function catalog(mock: RemoteMock, ...ids: ReturnType<typeof SessionId>[]): void
 }
 
 function followRequest(value: unknown): SessionFollowRequest { return value as SessionFollowRequest }
+
+for (const { name, count, turns, labelLength, baselineOffset } of [
+  { name: 'latest Turn exceeds the old limit', count: 645, turns: [0, 50], labelLength: () => 2_900, baselineOffset: undefined },
+  { name: 'whole opening fits the old limit', count: 283, turns: [0, 275], labelLength: () => 2_000, baselineOffset: 0 },
+  { name: 'only a Turn-aligned suffix fits the old limit', count: 403, turns: [0, 205, 304], labelLength: (i: number) => i < 205 ? 5_200 : 4_300, baselineOffset: 205 },
+]) {
+  it(`reopens verified remote history at the cache boundary when ${name}`, async ({ mock, start }) => {
+    const head = 100
+    const opening = historyValue(turns.flatMap((start, turn) => {
+      const length = (turns[turn + 1] ?? count) - start
+      return Array.from({ length }, (_, index) => {
+        const seq = SessionSeq(head + start + index)
+        if (index === 0) return ev.turnStart(seq, turn)
+        if (index === length - 1) return ev.turnEnd(seq, turn)
+        return ev.user(seq, 'x'.repeat(labelLength(start + index)))
+      })
+    }), true)
+    catalog(mock, PARENT)
+    const requests: SessionFollowRequest[] = []
+    mock.stream(FOLLOW, ([value], stream) => {
+      const request = followRequest(value)
+      requests.push(request)
+      stream.push(followSnapshot(structuredClone(opening), request))
+    })
+    const { ctx } = await start()
+    await ctx.sessions.refresh()
+    await emit(mock, 'api-session/history-owner', OWNER)
+    await emit(mock, 'api-session/history-route', ROUTE)
+
+    using initial = ctx.sessions.retain(PARENT, { source: 'gateway' })
+    const { eventSource, session } = initial.binding
+    expect(session.getSnapshot().historyAvailability).toBe('unavailable')
+    await initial.ready
+    expect(requests.at(-1)?.historyWindowStart).toBeUndefined()
+    const original = eventSource.getSnapshot()
+    expect(original.entries).toHaveLength(count)
+    session.readingPosition?.('chat')?.write({ seq: head + count - 1 })
+    initial.release()
+
+    using cached = ctx.sessions.retain(PARENT, { source: 'gateway' })
+    const cachedSource = cached.binding.eventSource
+    expect(cached.binding.session.getSnapshot().historyAvailability).toBe('cached')
+    const seed = cachedSource.getSnapshot()
+    expect(seed.entries).toHaveLength(count)
+    expect(seed.entries[0]).toBe(original.entries[0])
+    const published = vi.fn()
+    const unsubscribe = cachedSource.subscribe(published)
+    try {
+      await cached.ready
+      expect(requests.at(-1)?.historyWindowStart).toBe(head)
+      expect(cachedSource.getSnapshot()).toBe(seed)
+      expect(published).not.toHaveBeenCalled()
+
+      ctx.sessionHistoryCache.setBudget({ historyCacheSessionMiB: 2, historyCachePageMiB: 8 })
+      expect(cachedSource.getSnapshot()).toBe(seed)
+      expect(published).not.toHaveBeenCalled()
+    } finally {
+      unsubscribe()
+    }
+    cached.release()
+
+    using baseline = ctx.sessions.retain(PARENT, { source: 'gateway' })
+    const before = baseline.binding.eventSource.getSnapshot()
+    expect(baseline.binding.session.getSnapshot().historyAvailability)
+      .toBe(baselineOffset === undefined ? 'unavailable' : 'cached')
+    expect(before.entries).toHaveLength(baselineOffset === undefined ? 0 : count - baselineOffset)
+    await baseline.ready
+    expect(baseline.binding.session.readingPosition?.('chat')?.read()).toEqual({ seq: head + count - 1 })
+    const after = baseline.binding.eventSource.getSnapshot()
+    expect(after.entries).toHaveLength(count)
+    expect(baseline.binding.session.getSnapshot().historyAvailability).toBe('confirmed')
+    expect(requests.at(-1)?.historyWindowStart).toBe(baselineOffset === undefined ? undefined : head + baselineOffset)
+    if (baselineOffset !== undefined) expect(after.entries[baselineOffset]).toBe(before.entries[0])
+    if (baselineOffset === 0) expect(after).toBe(before)
+    if (baselineOffset === 205) {
+      mock.remote.session.page.mockResolvedValueOnce(ok({ ...page(0, head - 1), cursor: opening.cursor }))
+      await baseline.binding.session.loadOlder()
+      expect(mock.remote.session.page).toHaveBeenLastCalledWith(expect.objectContaining({
+        beforeSeq: head, throughSeq: opening.cursor, verifiedHistoryWindow: true, historyRouteEpoch: ROUTE.routeEpoch,
+      }))
+      expect(baseline.binding.eventSource.getSnapshot().entries[head + baselineOffset]).toBe(before.entries[0])
+    }
+    expect(requests).toHaveLength(3)
+    for (const request of requests) expect(request).toMatchObject({
+      verifiedHistoryWindow: true, historyRouteEpoch: ROUTE.routeEpoch,
+    })
+  })
+}
 
 it('reuses the complete window after A → B → A with zero notifications and excludes any unconsumed page', async ({ mock, start }) => {
   catalog(mock, A, B)
@@ -132,6 +221,7 @@ for (const mode of ['release', 'freeze']) {
     })
     mock.remote.session.page.mockResolvedValueOnce(ok({ ...oldest, records, cursor: 1_799 }))
     const { ctx, connection } = await start()
+    ctx.sessionHistoryCache.setBudget({ historyCacheSessionMiB: 2, historyCachePageMiB: 8 })
     await ctx.sessions.refresh()
     await emit(mock, 'api-session/history-owner', OWNER)
     using first = ctx.sessions.retain(A, { source: 'gateway' })

@@ -76,8 +76,15 @@ describe('Session Controller Client apply', () => {
     const connected = vi.spyOn(ClientSessions.prototype, 'handleConnected')
     const { client } = await bench(start)
     await vi.waitFor(() => { expect(connected).toHaveBeenCalledOnce() })
+    const initialCacheService = client.ctx.get('sessionHistoryCache')
+    expect(initialCacheService?.setBudget).toBeTypeOf('function')
     await client.reload(SELF)
+    expect(client.ctx.get('sessionHistoryCache')?.setBudget).toBeTypeOf('function')
+    expect(client.ctx.get('sessionHistoryCache')).not.toBe(initialCacheService)
     expect(connected).toHaveBeenCalledTimes(2)
+    await client.unload(SELF)
+    expect(client.ctx.get('sessionHistoryCache')).toBeUndefined()
+    initialCacheService?.setBudget({ historyCacheSessionMiB: 1, historyCachePageMiB: 1 })
   })
 
   it('keeps immediate control projections when the ready notification follows their baseline', async ({ mock, start }) => {

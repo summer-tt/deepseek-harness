@@ -22,6 +22,7 @@ import type { SessionRemotes } from './remotes.ts'
 import type { SessionListPhase, SessionSearchResultItem, SessionProjectionSnapshot } from './manager.ts'
 import type { Session } from './session.ts'
 import type { SessionListEntry } from './lineage.ts'
+import type { SessionHistoryCacheBudget } from '../../history-cache-budget.ts'
 
 /** Session list row projected from the host list RPC plus live stream increments. */
 export interface SessionSummary {
@@ -435,6 +436,14 @@ export class ClientSessions implements ISessions {
    */
   handleSessionError(...args: Parameters<SessionManager['handleSessionError']>): void {
     this.manager.handleSessionError(...args)
+  }
+
+  /**
+   * Apply the page's retention budget while this service is mounted.
+   * @param budget - both estimated-weight limits in MiB.
+   */
+  setHistoryCacheBudget(budget: SessionHistoryCacheBudget): void {
+    if (!this.closed) this.manager.setHistoryCacheBudget(budget)
   }
 
   /**

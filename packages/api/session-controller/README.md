@@ -76,7 +76,7 @@ A resume blocked by an existing write handle returns `session/writer-held` with 
 
 An authenticated Web page keeps a bounded in-memory copy of recently confirmed history and reading positions, scoped to the owner, paired Host, and complete Session address. Returning to a cached Session opens a new `follow` and reuses matching records without publishing a history change. The Client separates historical suffixes (`history-append`) from live entries (`append`). Cached windows exclude transient Assistant and pending submission state. A compatible remote route must advertise support for authoritative opening snapshots and authorization changes before the Web page caches its history.
 
-An inactive history window can retain up to 1,500 durable records and 2 MiB of estimated weight, with room reserved for reading positions. For a larger window, the cache retains a contiguous suffix starting at a Turn boundary and marks older history as available. If the latest Turn cannot fit, the cache keeps eligible reading positions and waits for `follow` to display history. The Host's confirmed window sets the pagination boundary. A saved position older than that boundary remains a target for loading older history.
+The in-memory cache retains up to 12 inactive Session addresses and 1,500 durable records per address. Its default estimated weight limits are 20 MiB per Session and 200 MiB per page, with room reserved for reading positions. For a larger window, the cache retains a contiguous suffix starting at a Turn boundary and marks older history as available. If the latest Turn cannot fit, the cache keeps eligible reading positions and waits for `follow` to display history. The Host's confirmed window sets the pagination boundary. A saved position older than that boundary remains a target for loading older history.
 
 The Client's initial `follow`, reconnect openings, and `loadOlder()` request at least 50 append-origin `user/message` and `assistant/message` events and cross at least two `turn/start` events, including the partial Turn at the loaded window's beginning. The Host stops at the first Turn start satisfying both minima, or at 500 counted messages or history exhaustion, whichever comes first. Steering does not add a Turn boundary. Intervening events accompany the page without counting toward the message budget. The optional `turnWindow` on page and follow requests supplies these minima under `maxMessages`. `loadThrough()` uses the same rules with a 200-message minimum per page; the 500-message cap does not limit the whole jump. Requests without `turnWindow` retain message-aligned paging.
 
@@ -112,7 +112,11 @@ A successful `selectModel` response acknowledges the recorded Session selection 
 | Field | Default | Meaning |
 |---|---:|---|
 | `nativeOpen` | platform-detected | Whether Session workspace paths can be handed to a native desktop opener |
-| `listWorkSliceMs` | `16` | Positive integral list-work time slice in milliseconds; checks occur between complete rows |
+| `listWorkSliceMs` | `16` | Positive whole milliseconds of list work between complete-row yield checks |
+| `historyCacheSessionMiB` | `20` | Estimated cache weight in MiB per Session address |
+| `historyCachePageMiB` | `200` | Estimated total cache weight in MiB per page |
+
+In Web, open **Plugins → Session history cache** to edit both limits as positive whole MiB. Each MiB is 1,048,576 bytes of estimated Client retention. The Host that serves the page supplies the limits for its local and paired remote Sessions together. Saving applies to open pages as they receive the accepted settings. A decrease trims or evicts inactive entries immediately. Active history stays in view, and later releases use the new limits.
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-api-session-controller) is the exhaustive source for accepted fields and their JSDoc.
 
