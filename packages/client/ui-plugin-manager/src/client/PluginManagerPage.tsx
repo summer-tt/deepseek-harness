@@ -479,7 +479,7 @@ function ListSkeleton({ label }: { readonly label: string }): ReactNode {
         </span>
       </div>
       <ul className={css.cards} aria-hidden="true">
-        {[0, 1, 2, 3].map(index => (
+        {[0, 1, 2, 3, 4].map(index => (
           <li key={index} className={css.card}>
             <div className={css.cardHead}>
               <span className={`${css.cardIcon} ${css.skeletonFill} ${css.skeletonIcon}`} />

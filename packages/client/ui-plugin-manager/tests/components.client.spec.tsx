@@ -567,7 +567,7 @@ describe('PluginManagerPage', () => {
     const { actions, set } = renderTab({ status: 'loading' })
     expect(actions.ensure).toHaveBeenCalledTimes(1)
     const loading = screen.getByRole('status', { name: en.loading })
-    expect(loading.querySelectorAll('li')).toHaveLength(4)
+    expect(loading.querySelectorAll('li')).toHaveLength(5)
     expect(loading.querySelector('ul')?.getAttribute('aria-hidden')).toBe('true')
     expect(loading.querySelector('button, input, [data-state="ongoing"]')).toBeNull()
     expect(document.querySelector('[data-plugin-panel]')?.getAttribute('aria-busy')).toBe('true')

@@ -293,11 +293,12 @@ it.skipIf(MODE === 'record')('reopens an oversized history from a complete cache
           ok: false, error: { code: 'gateway/internal', message: 'Injected history page failure', data: {} },
         } } })
       })
+      const fullGate = Promise.withResolvers<undefined>()
       const warmGate = Promise.withResolvers<undefined>()
-      let warm = false
+      let nextGate: Promise<undefined> | undefined
       await page.routeWebSocket('**/api/remote.mux', (socket) => {
         const server = socket.connectToServer()
-        const streams = new Map<string, boolean>()
+        const streams = new Map<string, Promise<undefined> | undefined>()
         socket.onMessage((message) => {
           const frame = JSON.parse(String(message)) as {
             type: string
@@ -308,7 +309,7 @@ it.skipIf(MODE === 'record')('reopens an oversized history from a complete cache
           const request = frame.payload?.args?.request
           if (request?.address?.sessionId === a) {
             if (frame.type === 'open' && frame.endpoint === 'session/follow' && frame.streamId !== undefined) {
-              streams.set(frame.streamId, warm)
+              streams.set(frame.streamId, nextGate)
               starts.push(request.historyWindowStart)
             }
           }
@@ -316,11 +317,11 @@ it.skipIf(MODE === 'record')('reopens an oversized history from a complete cache
         })
         server.onMessage((message) => {
           const frame = JSON.parse(String(message)) as { streamId?: string; value?: { type: string } & Opening }
-          const held = frame.streamId === undefined ? undefined : streams.get(frame.streamId)
-          if (held !== undefined && frame.value?.type === 'snapshot') {
+          if (frame.streamId !== undefined && streams.has(frame.streamId) && frame.value?.type === 'snapshot') {
             openings.push(frame.value)
           }
-          if (held === true) void warmGate.promise.then(() => { socket.send(message) })
+          const held = frame.streamId === undefined ? undefined : streams.get(frame.streamId)
+          if (held !== undefined) void held.then(() => { socket.send(message) })
           else socket.send(message)
         })
       })
@@ -359,10 +360,42 @@ it.skipIf(MODE === 'record')('reopens an oversized history from a complete cache
       const saved = await offset()
       await row(b).click()
       await switched.waitFor()
-      warm = true
+      nextGate = fullGate.promise
       await row(a).click()
       await expect.poll(() => starts.length).toBe(2)
-      const retainedStart = starts[1]
+      expect(starts[1]).toBe(cold.records[0].event.seq)
+      await prompt(16).waitFor({ timeout: 5_000 })
+      fullGate.resolve(undefined)
+      await expect.poll(() => openings.length).toBe(2)
+      await row(b).click()
+      await switched.waitFor()
+      // Shrink the complete inactive entry from a different page before reopening.
+      const settingsPage = await newEnglishPage(browser)
+      await settingsPage.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+      await settingsPage.getByRole('button', { name: 'Plugins', exact: true }).first().click()
+      const plugins = settingsPage.locator('[data-plugin-panel]')
+      await plugins.getByRole('button', { name: 'View Session history cache', exact: true }).click()
+      const sessionLimit = plugins.getByLabel('Per-session limit (MiB)', { exact: true })
+      const pageLimit = plugins.getByLabel('Page total limit (MiB)', { exact: true })
+      await expect.poll(() => sessionLimit.inputValue()).toBe('20')
+      await expect.poll(() => pageLimit.inputValue()).toBe('200')
+      const refreshedBudget = page.waitForResponse(async (response) => {
+        if (!new URL(response.url()).pathname.endsWith('/api/settings/describe')) return false
+        const envelope = await response.json() as {
+          result?: { value?: { namespaces?: { ns: string; value?: { historyCacheSessionMiB?: number } }[] } }
+        }
+        return envelope.result?.value?.namespaces?.some(view => view.ns === 'session-controller' && view.value?.historyCacheSessionMiB === 2) === true
+      })
+      await sessionLimit.fill('2')
+      await pageLimit.fill('8')
+      await plugins.getByRole('button', { name: 'Save', exact: true }).click()
+      await refreshedBudget
+      await page.evaluate(() => new Promise<void>((resolve) => { requestAnimationFrame(() => { resolve() }) }))
+      await settingsPage.close()
+      nextGate = warmGate.promise
+      await row(a).click()
+      await expect.poll(() => starts.length).toBe(3)
+      const retainedStart = starts[2]
       if (retainedStart === undefined) throw new Error('warm follow did not carry a cached history start')
       expect(retainedStart).toBeGreaterThan(cold.records[0].event.seq)
       expect(cold.records.find(record => record.event.seq === retainedStart)?.event.type).toBe('turn/start')
@@ -370,8 +403,8 @@ it.skipIf(MODE === 'record')('reopens an oversized history from a complete cache
       expect(await prompt(16).count()).toBe(0)
       await expect.poll(offset).toBeCloseTo(saved, 0)
       expect(pageCuts).toEqual([])
-      await expect.poll(() => openings.length).toBe(2)
-      const confirmed = openings[1]
+      await expect.poll(() => openings.length).toBe(3)
+      const confirmed = openings[2]
       if (confirmed === undefined || confirmed.records[0] === undefined) throw new Error('missing warm authoritative opening')
       expect(confirmed.records[0].event.seq).toBe(cold.records[0].event.seq)
       expect(confirmed.cursor).toBeGreaterThanOrEqual(cold.cursor)

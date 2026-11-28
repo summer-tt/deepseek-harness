@@ -17,7 +17,8 @@ let page: Page
 
 beforeAll(async () => {
   scaffold = await launchWebScaffold()
-  browser = await chromium.launch()
+  const executablePath = process.env.DSH_PLAYWRIGHT_EXECUTABLE_PATH
+  browser = await chromium.launch(executablePath === undefined ? {} : { executablePath })
 })
 
 afterAll(async () => {
@@ -27,7 +28,7 @@ afterAll(async () => {
 })
 
 describe('startup RPC budget', () => {
-  it('keeps settings and Web Search credential reads at their publication counts', async () => {
+  it('bounds startup settings reads and credential reads triggered by their accepted publications', async () => {
     page = await newEnglishPage(browser)
     watchConsole(page)
     const calls: string[] = []
@@ -37,8 +38,8 @@ describe('startup RPC budget', () => {
     const credentialStarted = Promise.withResolvers<undefined>()
     let settingsFinished = 0
     let webSearchFinished = 0
-    // Both settings answers must reach the card after it subscribes, regardless
-    // of plugin load order. The eager credential request proves that subscription.
+    // Hold both wire answers until the card subscribes. The first connection
+    // may discard the eager answer computed before its Settings epoch.
     const holdSettings = async (route: Route): Promise<void> => {
       await credentialStarted.promise
       await route.continue()
@@ -70,12 +71,12 @@ describe('startup RPC budget', () => {
     try {
       await page.goto(scaffold.authenticatedUrl)
       await page.getByRole('textbox', { name: 'Choose workspace' }).waitFor({ timeout: 30_000 })
-      await expect.poll(() => settingsFinished, { timeout: 30_000 }).toBeGreaterThanOrEqual(DESCRIBE_BUDGET)
-      await expect.poll(() => webSearchFinished, { timeout: 30_000 }).toBeGreaterThanOrEqual(WEB_SEARCH_CREDENTIAL_BUDGET)
+      await expect.poll(() => settingsFinished, { timeout: 30_000 }).toBeGreaterThanOrEqual(1)
+      await expect.poll(() => webSearchFinished, { timeout: 30_000 }).toBeGreaterThanOrEqual(2)
       await expect.poll(() => pending.size, { timeout: 30_000 }).toBe(0)
       const describeCount = calls.filter(method => method === 'settings/describe').length
-      expect(describeCount, `startup /api calls:\n${calls.join('\n')}`).toBe(DESCRIBE_BUDGET)
-      expect(webSearchRequests.size, `startup credential references:\n${JSON.stringify(credentials)}`).toBe(WEB_SEARCH_CREDENTIAL_BUDGET)
+      expect(describeCount, `startup /api calls:\n${calls.join('\n')}`).toBeLessThanOrEqual(DESCRIBE_BUDGET)
+      expect(webSearchRequests.size, `startup credential references:\n${JSON.stringify(credentials)}`).toBeLessThanOrEqual(WEB_SEARCH_CREDENTIAL_BUDGET)
     } finally {
       credentialStarted.resolve(undefined)
       await page.unrouteAll({ behavior: 'wait' })

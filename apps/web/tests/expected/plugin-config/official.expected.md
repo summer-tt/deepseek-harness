@@ -17,6 +17,9 @@
     - button "查看 Agent 循环": Agent 循环
     - text: 控制 Agent 派发工具调用的方式。
   - listitem:
+    - button "查看 会话历史缓存": 会话历史缓存
+    - text: 设置每个浏览器页面缓存多少会话历史。本机与远端会话共享页面总额度。保存后，已打开的页面也会更新。
+  - listitem:
     - button "查看 终端": 终端
     - text: 限制每条命令最多能跑多久、最多输出多少内容。
 - heading "实验性插件" [level=3]

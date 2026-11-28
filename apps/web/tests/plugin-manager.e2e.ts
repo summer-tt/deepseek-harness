@@ -435,7 +435,7 @@ describe('web e2e: plugin manager', () => {
         const skeleton = panel.locator('[data-plugin-loading]')
         await skeleton.waitFor()
         await probe.evaluate(() => document.fonts.ready)
-        expect(await skeleton.locator(':scope > ul > li').count()).toBe(4)
+        expect(await skeleton.locator(':scope > ul > li').count()).toBe(5)
         expect(await skeleton.getAttribute('role')).toBe('status')
         expect(await skeleton.getAttribute('aria-label')).toBe('正在读取插件…')
         expect(await panel.getAttribute('aria-busy')).toBe('true')
@@ -456,7 +456,7 @@ describe('web e2e: plugin manager', () => {
           return {
             pageHeader: rect(element.closest('[data-plugin-panel]')?.querySelector('[data-plugin-bar] > header')),
             groupHeader: rect(element.firstElementChild),
-            rows: Array.from(element.querySelectorAll(selector)).slice(0, 4).map((row) => {
+            rows: Array.from(element.querySelectorAll(selector)).map((row) => {
               const head = row.firstElementChild
               const main = head?.children[1]
               return {
@@ -474,7 +474,7 @@ describe('web e2e: plugin manager', () => {
           width: node.getBoundingClientRect().width,
           height: node.getBoundingClientRect().height,
         })))
-        expect(blankActions).toEqual(Array.from({ length: 4 }, () => ({ children: 0, background: 'rgba(0, 0, 0, 0)', width: 58, height: 20 })))
+        expect(blankActions).toEqual(Array.from({ length: 5 }, () => ({ children: 0, background: 'rgba(0, 0, 0, 0)', width: 58, height: 20 })))
         if (shots !== undefined) {
           for (const colorScheme of ['light', 'dark'] as const) {
             await probe.emulateMedia({ colorScheme })
@@ -488,7 +488,7 @@ describe('web e2e: plugin manager', () => {
           opacityOnly: animation.effect instanceof KeyframeEffect
             && animation.effect.getKeyframes().every(frame => frame.opacity !== undefined && frame.transform === undefined),
         })))
-        expect(motion.length).toBe(13)
+        expect(motion.length).toBe(16)
         expect(motion.every(animation => animation.duration === 2000 && animation.opacityOnly)).toBe(true)
         await probe.emulateMedia({ reducedMotion: 'reduce' })
         await expect.poll(() => skeleton.evaluate(element => element.getAnimations({ subtree: true }).length)).toBe(0)
@@ -502,7 +502,7 @@ describe('web e2e: plugin manager', () => {
         await basic.locator('[data-plugin-item]').first().waitFor()
         // Configuration cards lead the list; their absent switches give the text column more width.
         const loaded = await measure(basic)
-        expect(await basic.locator(':scope > ul > li[data-plugin-item]').count()).toBe(4)
+        expect(await basic.locator(':scope > ul > li[data-plugin-item]').count()).toBe(5)
         expect(loaded.rows).toHaveLength(loading.rows.length)
         const compare = (name: string, a: typeof loading.pageHeader, b: typeof loaded.pageHeader, axes: readonly (keyof typeof a)[] = ['x', 'y', 'width', 'height']) => {
           for (const axis of axes) {
@@ -532,9 +532,9 @@ describe('web e2e: plugin manager', () => {
     }
     await compareOrRefreshGolden(join(SNAPSHOT_DIR, 'loading.expected.md'), [
       aria, '', ...facts,
-      'Loading: header actions disabled; action spaces are empty 36×20 areas, with no switch placeholders',
+      'Loading: header actions disabled; action spaces are empty 58×20 areas, with no switch placeholders',
       'Loaded: skeleton removed; header actions enabled',
-      'Motion: 13 opacity-only pulses, 2000ms; reduced motion stops all pulses',
+      'Motion: 16 opacity-only pulses, 2000ms; reduced motion stops all pulses',
     ].join('\n'), MODE)
   })
 
@@ -834,7 +834,7 @@ describe('web e2e: plugin manager', () => {
     expect(focusRing.outlineWidth).toBeGreaterThan(0)
     // Profile bundles stay in Installed; configuration pages and offered bundles have their own groups.
     expect(await panel.locator('[data-plugin-group="bundles"] [data-plugin-package]').count()).toBe(2)
-    expect(await panel.locator('[data-plugin-group="basic"] [data-plugin-item]').count()).toBe(4)
+    expect(await panel.locator('[data-plugin-group="basic"] [data-plugin-item]').count()).toBe(5)
     expect(await panel.locator('[data-plugin-package="@deepseek-ai/dsh-experimental-inspector"]').count()).toBe(0)
     expect(await panel.getByRole('switch', { name: '启用 语音输入', exact: true }).getAttribute('aria-checked')).toBe('false')
     expect(await panel.getByRole('switch', { name: '启用 自定义插件索引', exact: true }).getAttribute('aria-checked')).toBe('false')

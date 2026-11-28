@@ -42,7 +42,8 @@ describe('web e2e: plugin configuration pages', () => {
       deepSeekSearch: { apiKeyEnv: UNUSED_KEY_ENV },
       profile: { packages: [{ dir: join(FIXTURE_PLUGINS, 'fixture-live-client') }] },
     })
-    browser = await chromium.launch()
+    const executablePath = process.env.DSH_PLAYWRIGHT_EXECUTABLE_PATH
+    browser = await chromium.launch(executablePath === undefined ? {} : { executablePath })
     // Chinese browser: the pages assert the localized copy the client derives
     // from it, as the rest of the settings surface does.
     page = await browser.newPage({ viewport: { width: 1680, height: 1000 }, locale: ZH_BROWSER_LOCALE })
@@ -87,18 +88,69 @@ describe('web e2e: plugin configuration pages', () => {
     return readFile(join(scaffold.harnessHome, 'profiles', 'scaffold', 'cordis.patch.yml'), 'utf8').catch(() => '')
   }
 
+  it('saves valid Session history budgets and propagates them to another open page', async () => {
+    const other = await browser.newPage({ viewport: { width: 1680, height: 1000 }, locale: ZH_BROWSER_LOCALE })
+    try {
+      await other.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+      await other.getByRole('navigation', { name: '全局面板' }).getByRole('button', { name: '插件', exact: true }).click()
+      const otherPanel = other.locator('[data-plugin-panel]')
+      await openPage(otherPanel, '会话历史缓存')
+      const panel = await openPlugins()
+      await openPage(panel, '会话历史缓存')
+      const sessionLimit = panel.getByLabel('单会话上限（MiB）', { exact: true })
+      const pageLimit = panel.getByLabel('页面总上限（MiB）', { exact: true })
+      const theirLimit = otherPanel.getByLabel('单会话上限（MiB）', { exact: true })
+      const theirPageLimit = otherPanel.getByLabel('页面总上限（MiB）', { exact: true })
+      const save = panel.getByRole('button', { name: '保存', exact: true })
+      await expect.poll(() => sessionLimit.inputValue()).toBe('20')
+      await expect.poll(() => pageLimit.inputValue()).toBe('200')
+      await expect.poll(() => theirLimit.inputValue()).toBe('20')
+      await sessionLimit.fill('1.5')
+      await expect.poll(() => save.isDisabled()).toBe(true)
+      expect(await settingsDocument()).not.toContain('historyCacheSessionMiB')
+      await sessionLimit.fill('2')
+      await pageLimit.fill('4')
+      const settingsRoute = '**/api/settings/mutate'
+      await page.route(settingsRoute, async (route) => {
+        const envelope = route.request().postDataJSON() as {
+          payload: { args: { ops: { path: string[]; value: number }[] } }
+        }
+        const perSession = envelope.payload.args.ops.find(operation => operation.path[0] === 'historyCacheSessionMiB')
+        if (perSession === undefined) throw new Error('missing per-session budget operation')
+        perSession.value = 0
+        await route.continue({ postData: JSON.stringify(envelope) })
+      }, { times: 1 })
+      const rejected = page.waitForResponse(response => new URL(response.url()).pathname === '/api/settings/mutate')
+      await save.click()
+      expect(await (await rejected).json()).toMatchObject({ result: { ok: false } })
+      expect(await theirLimit.inputValue()).toBe('20')
+      expect(await settingsDocument()).not.toContain('historyCacheSessionMiB')
+      await expect.poll(() => save.isEnabled()).toBe(true)
+      await save.click()
+      await expect.poll(() => theirLimit.inputValue()).toBe('2')
+      await expect.poll(() => theirPageLimit.inputValue()).toBe('4')
+      await expect.poll(settingsDocument).toContain('historyCacheSessionMiB: 2')
+      await expect.poll(settingsDocument).toContain('historyCachePageMiB: 4')
+      await sessionLimit.fill('20')
+      await pageLimit.fill('200')
+      await save.click()
+      await expect.poll(() => theirLimit.inputValue()).toBe('20')
+      await expect.poll(() => theirPageLimit.inputValue()).toBe('200')
+    } finally {
+      await other.close()
+    }
+  })
+
   it('keeps configuration pages first and opens the full experimental plugin list separately', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-plugin-config-cards'))
     const panel = await openPlugins()
 
-    // Every page the shipped web composition exposes: the shell executor, the
-    // agent loop, subagent selection, and the DeepSeek search provider.
-    await panel.getByRole('button', { name: '查看 网页搜索与获取', exact: true }).waitFor({ timeout: 20_000 })
+    await panel.getByRole('button', { name: '查看 会话历史缓存', exact: true }).waitFor({ timeout: 20_000 })
     const basic = panel.locator('[data-plugin-group="basic"]')
-    expect(await basic.locator('[data-plugin-item]').count()).toBe(4)
+    expect(await basic.locator('[data-plugin-item]').count()).toBe(5)
     expect(await basic.locator(':scope > ul > li').evaluateAll(cards => cards.map(card => card.getAttribute('data-plugin-item'))))
-      .toEqual(['subagent', 'web-search', 'agent-loop', 'shell'])
-    for (const title of ['子智能体', '网页搜索与获取', 'Agent 循环', '终端']) {
+      .toEqual(['subagent', 'web-search', 'agent-loop', 'session-controller', 'shell'])
+    for (const title of ['子智能体', '网页搜索与获取', 'Agent 循环', '会话历史缓存', '终端']) {
       expect(await basic.getByRole('button', { name: `查看 ${title}`, exact: true }).count()).toBe(1)
     }
     // A card carries the one-liner; the fields wait for the page.
