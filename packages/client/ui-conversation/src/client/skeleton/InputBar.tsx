@@ -36,7 +36,7 @@ import {
   revealDraftSelection,
 } from '../input/editor/view-binding.ts'
 import { resolveSubmitMode } from '../input/submission-policy.ts'
-import { attachmentErrorText, imageSizeText } from '../image-labels.ts'
+import { attachmentErrorText, imageSizeText, promptErrorText } from '../image-labels.ts'
 import { isImageMediaType } from '../service.ts'
 import { ContextMeter } from './ContextMeter.tsx'
 import { observeControlRow } from './control-row-layout.ts'
@@ -133,14 +133,7 @@ export const InputBar = memo(function InputBar({
   // failures retain the diagnostic message and code.
   useEffect(() => {
     if (promptError === null) return
-    const { error } = promptError
-    if (error.code === 'session/writer-held') {
-      showToast(t('error.sessionInUse'))
-      return
-    }
-    showToast(error.code === 'session/attachment-invalid' || error.code === 'subagent/attachment-invalid'
-      ? attachmentErrorText(t, error.details.reason, imageLimits)
-      : `${error.message} (${error.code})`)
+    showToast(promptErrorText(t, promptError.error, imageLimits))
   }, [promptError, showToast, t, imageLimits])
   useEffect(() => {
     if (notice?.level === 'error') showToast(notice.text)

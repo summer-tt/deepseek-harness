@@ -2,15 +2,17 @@
  * Session-bound input registry and default-send routing for Conversation.
  * Each retained Session binding owns one shell, its input listeners, and its
  * catalog subscription. Saved drafts enter the model before the first lookup
- * returns; Session-scope disposal releases the shell and its resources.
+ * returns. Browser image drafts can outlive the shell under the same authorization.
  */
 import type {} from '@deepseek-ai/dsh-client-product-analytics/client'
 import type { PlanProjection } from '@deepseek-ai/dsh-plan-mode/types'
 import type { GoalProjection } from '@deepseek-ai/dsh-goal/types'
 import type { Context } from '@deepseek-ai/cordis'
+import type { ImageAttachmentLimits } from '@deepseek-ai/dsh-attachment'
 import type {
-  ISessions, SessionBinding, SessionFace,
+  ISessions, PromptError, SessionBinding, SessionFace, SessionReference,
 } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionHistoryInvalidation, SessionHistoryRoute } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { SessionId, SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-locale/client'
 import type { InboxState } from '@deepseek-ai/dsh-agent/types'
@@ -21,11 +23,13 @@ import type {
   SessionInputResolver, SessionInput, SubmitOutcome,
 } from '../contract/input.ts'
 import type { ComposerKeyboard } from '../contract/draft-editor.ts'
+import type { ComposerAttachment } from '../contract/slots.ts'
 import type { ComposerBlocks } from '../contract/composer-blocks.ts'
 import type { InputSubmitMode } from '../contract/composer-submission.ts'
 import type { PopupDismissFace } from './facade.ts'
 import { SessionInputShell } from './facade.ts'
 import { reportMessageSubmission } from './submission-analytics.ts'
+import { promptErrorText } from '../image-labels.ts'
 import { readConversationDraft } from '../stores.ts'
 
 /** Structural command face for per-session popup resolution. */
@@ -51,12 +55,126 @@ interface ConversationAttachmentFace {
     accept?: () => void,
   ): Promise<SubmitOutcome>
   serializeDraftAttachments(attachmentIds: readonly DraftAttachmentId[]): Promise<DraftAttachmentSerializationResult>
+  resolveDraftAttachments(ids: readonly DraftAttachmentId[]): readonly ComposerAttachment[]
   releaseDraftAttachment(id: DraftAttachmentId): void
+}
+
+declare module '@deepseek-ai/dsh-api-session-controller/client' {
+  interface SessionReferenceSourceMap {
+    /** An image submission awaiting a Host outcome. */
+    composerImageSubmission: unknown
+  }
+}
+
+function remoteHost(id: SessionId): string | undefined {
+  return id.startsWith('zr~') ? /^zr~([0-9a-f]{8})~/u.exec(id)?.[1] ?? '' : undefined
 }
 
 /** Session-addressed input facade registry (SessionInputResolver face + composer-layer extras). */
 export class InputHub implements SessionInputResolver {
   private readonly shells = new WeakMap<SessionBinding, SessionInputShell>()
+  private readonly mounted = new Map<SessionId, { session: SessionFace; shell: SessionInputShell }>()
+  private readonly parkedImages = new Map<SessionId, {
+    ids: readonly DraftAttachmentId[]
+    failure?: string
+  }>()
+  private readonly routes = new Map<string, string>()
+  private ownerEpoch: string | undefined
+
+  /** Bind retained drafts to the authenticated browser owner. */
+  authorizeDraftOwner(ownerEpoch: string): void {
+    if (this.ownerEpoch === ownerEpoch) return
+    // Zen can publish an already-online route before the local owner frame.
+    if (this.ownerEpoch !== undefined) this.routes.clear()
+    for (const id of this.draftSessions()) this.releaseDraftSession(id)
+    this.ownerEpoch = ownerEpoch
+  }
+
+  /** Clear drafts whose Host route ended or was replaced. */
+  authorizeDraftRoute(route: SessionHistoryRoute): void {
+    const previous = this.routes.get(route.serverId)
+    if (route.available) {
+      this.routes.set(route.serverId, route.routeEpoch)
+      if (previous === route.routeEpoch) return
+    } else {
+      if (previous !== route.routeEpoch) return
+      this.routes.delete(route.serverId)
+    }
+    for (const id of this.draftSessions()) {
+      if (remoteHost(id) === route.serverId) this.releaseDraftSession(id)
+    }
+  }
+
+  /** Erase an image draft when its Session is unshared on the current route. */
+  invalidateDraftRouteSession(invalidation: SessionHistoryInvalidation): void {
+    if (this.routes.get(invalidation.serverId) === invalidation.routeEpoch
+      && remoteHost(invalidation.sessionId) === invalidation.serverId) {
+      this.releaseDraftSession(invalidation.sessionId)
+    }
+  }
+
+  /** Erase image drafts when the browser authorization ends. */
+  resetDraftAuthorization(): void {
+    this.ownerEpoch = undefined
+    this.routes.clear()
+    for (const id of this.draftSessions()) this.releaseDraftSession(id)
+  }
+
+  /** Release both mounted and parked images for a withdrawn Session. */
+  releaseDraftSession(id: SessionId): void {
+    const shell = this.mounted.get(id)?.shell
+    const conversation = this.rootCtx.get('conversation') as ConversationAttachmentFace | undefined
+    const images = conversation?.resolveDraftAttachments(shell?.snapshot.attachmentIds ?? [])
+      .filter(attachment => attachment.kind === 'image').map(attachment => attachment.id) ?? []
+    shell?.discardAttachments(images)
+    const parked = this.parkedImages.get(id)?.ids ?? []
+    this.parkedImages.delete(id)
+    for (const image of [...images, ...parked]) conversation?.releaseDraftAttachment(image)
+  }
+
+  private draftSessions(): Set<SessionId> {
+    return new Set([...this.mounted.keys(), ...this.parkedImages.keys()])
+  }
+
+  private detachShell(session: SessionFace, shell: SessionInputShell): void {
+    const id = session.sessionId
+    const drafts = shell.dispose()
+    if (this.mounted.get(id)?.shell === shell) this.mounted.delete(id)
+    if (drafts.length === 0) return
+    const conversation = this.rootCtx.get('conversation') as ConversationAttachmentFace | undefined
+    if (conversation === undefined) return
+    const attachments = conversation.resolveDraftAttachments(drafts)
+    const canPark = this.authorized(id) && !session.getSnapshot().removed
+    const images: DraftAttachmentId[] = []
+    for (const attachment of attachments) {
+      if (canPark && attachment.kind === 'image') images.push(attachment.id)
+      else conversation.releaseDraftAttachment(attachment.id)
+    }
+    if (images.length > 0) {
+      const error: PromptError | null = session.getSnapshot().promptError
+      const failure = shell.notices.getSnapshot()
+      const limits = session.projections.faceOf('imageLimits').getSnapshot() as ImageAttachmentLimits | undefined
+      const text = error?.op === 'send' ? promptErrorText(this.t, error.error, limits)
+        : failure?.level === 'error' ? failure.text : undefined
+      this.parkedImages.set(id, { ids: images, ...text === undefined ? {} : { failure: text } })
+    }
+  }
+
+  private authorized(id: SessionId): boolean {
+    const host = remoteHost(id)
+    return this.ownerEpoch !== undefined && (host === undefined || this.routes.has(host))
+  }
+
+  private retainImageSubmission(binding: SessionBinding, ids: readonly DraftAttachmentId[]): SessionReference | undefined {
+    if (ids.length === 0 || !this.authorized(binding.sessionId)) return undefined
+    const conversation = this.rootCtx.get('conversation') as ConversationAttachmentFace | undefined
+    if (conversation?.resolveDraftAttachments(ids).some(attachment => attachment.kind === 'image') !== true) return undefined
+    const child = binding.session.getSnapshot().subagent?.address
+    const reference = this.sessions().retain(child ?? binding.sessionId, { source: 'composerImageSubmission' })
+    // A reference holds the binding synchronously; image submission itself handles failures.
+    void reference.ready.catch(() => {})
+    return reference
+  }
 
   /**
    * @param ctx - client root context (services resolved lazily per call — boot order stays free).
@@ -99,9 +217,13 @@ export class InputHub implements SessionInputResolver {
   shellFor(binding: SessionBinding): SessionInputShell {
     const existing = this.shells.get(binding)
     if (existing !== undefined) return existing
-    const { session, ctx: actx } = binding
+    const { session, ctx: actx, sessionId } = binding
+    // A new binding can be requested before Cordis finishes disposing the old fiber.
+    const previous = this.mounted.get(sessionId)
+    if (previous !== undefined) this.detachShell(previous.session, previous.shell)
     const shell = new SessionInputShell({
       actx,
+      retainImageSubmission: ids => this.retainImageSubmission(binding, ids),
       submissionState: () => {
         const state = session.getSnapshot()
         const model = session.projections.faceOf('modelSelection').getSnapshot() as ModelSelectionProjection | undefined
@@ -153,8 +275,9 @@ export class InputHub implements SessionInputResolver {
       },
     })
     this.shells.set(binding, shell)
-    // The one teardown axis: listeners, shell, and map entries all ride the
-    // scope fiber (nothing here outlives the scope).
+    this.mounted.set(sessionId, { session, shell })
+    // Listeners and the editor belong to the binding. Eligible image IDs move
+    // back to the browser owner when that binding is released.
     actx.effect(() => {
       const offs = [
         actx.on('slash/input-begin-command', req =>
@@ -168,10 +291,8 @@ export class InputHub implements SessionInputResolver {
       ]
       return () => {
         for (const off of offs) off()
-        const drafts = shell.dispose()
+        this.detachShell(session, shell)
         this.shells.delete(binding)
-        const conversation = this.rootCtx.get('conversation') as ConversationAttachmentFace | undefined
-        for (const attachmentId of drafts) conversation?.releaseDraftAttachment(attachmentId)
       }
     }, 'conversation.input: session shell')
     actx.inject(['inputTriggers'], (scope) => {
@@ -180,7 +301,14 @@ export class InputHub implements SessionInputResolver {
         return () => { shell.refreshLexiconSubscription() }
       }, 'conversation.input: reference catalogs')
     })
-    shell.setDraft(readConversationDraft(binding.sessionId))
+    shell.setDraft(readConversationDraft(sessionId))
+    const images = this.parkedImages.get(sessionId)
+    if (images !== undefined) {
+      this.parkedImages.delete(sessionId)
+      const present = this.conversation().resolveDraftAttachments(images.ids)
+      shell.addAttachments(present.map(attachment => attachment.id))
+      if (images.failure !== undefined && present.length > 0) shell.notify('error', images.failure)
+    }
     return shell
   }
 

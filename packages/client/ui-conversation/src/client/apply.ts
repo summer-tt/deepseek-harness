@@ -4,8 +4,9 @@ import type {} from '@deepseek-ai/dsh-client-product-analytics/client'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ISessions, SessionBinding } from '@deepseek-ai/dsh-api-session-controller/client'
+import type {} from '@deepseek-ai/dsh-api-session-controller/remote-events'
 import { IconPaperclipOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
-import { createSnapshotStore, type BoundActions } from '@deepseek-ai/dsh-client-store'
+import { createSnapshotStore, type BoundActions, type ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
 import { resolveSlotLabel } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 // Type-only service and declaration merges used by this assembly.
@@ -301,6 +302,36 @@ export function apply(ctx: Context, config: Config = Config({})): void {
   })
 
   const inputHub = new InputHub(ctx, t)
+  ctx.inject(['remote', 'connection'], (scope) => {
+    const { generation: generations } = scope.get('connection') as { generation: ObservableSnapshot<{ readonly id: number } | undefined> }
+    const currentGeneration = () => generations.getSnapshot()?.id
+    let generation = currentGeneration()
+    let rejected = false
+    const trackGeneration = (): void => {
+      const next = currentGeneration()
+      if (next === generation) return
+      generation = next
+      rejected = false
+      inputHub.resetDraftAuthorization()
+    }
+    scope.effect(() => generations.subscribe(trackGeneration), 'conversation: draft authorization generation')
+    scope.remote.$on('api-session/history-owner', ({ ownerEpoch }) => {
+      if (!rejected) inputHub.authorizeDraftOwner(ownerEpoch)
+    })
+    scope.remote.$on('api-session/history-route', (route) => {
+      if (!rejected) inputHub.authorizeDraftRoute(route)
+    })
+    scope.remote.$on('api-session/history-invalidated', (invalidation) => { inputHub.invalidateDraftRouteSession(invalidation) })
+    scope.remote.$on('api-session/removed', (id) => { inputHub.releaseDraftSession(id) })
+    const endAuthorization = (ended: number | undefined): void => {
+      if (ended !== generation || rejected) return
+      rejected = true
+      inputHub.resetDraftAuthorization()
+    }
+    scope.on('connection/authentication-rejected', ({ generation: ended }) => { endAuthorization(ended) })
+    scope.on('connection/history-authorization-ended', ({ generation: ended }) => { endAuthorization(ended) })
+    scope.effect(() => () => { inputHub.resetDraftAuthorization() }, 'conversation: draft authorization')
+  })
   const composerBlocks = new ComposerBlockRegistry()
 
   ctx.inject(['commandUi'], (scope) => {

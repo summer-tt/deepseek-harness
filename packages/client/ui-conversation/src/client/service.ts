@@ -299,6 +299,7 @@ export class ConversationController extends Service implements IConversation {
     try {
       await nextPaint()
       const uploaded = await serializeAttachments()
+      signal?.throwIfAborted()
       content = [...uploaded, ...(text === '' ? [] : [{ type: 'text' as const, text }])]
     } catch (error) {
       submission.abandon()

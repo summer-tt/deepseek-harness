@@ -43,6 +43,8 @@ export interface PopupDismissFace {
 export interface SessionInputDeps {
   /** Session-scope ctx handed to claim.submit transactions. */
   actx: Context
+  /** Keep the Session binding alive while an authorized image send settles. */
+  retainImageSubmission?: (ids: readonly DraftAttachmentId[]) => { release(): void } | undefined
   /** Snapshot the Session facts before asynchronous command arbitration. */
   submissionState?: () => MessageSubmissionState
   /** Notify one ordinary message attempt before reference serialization. */
@@ -172,9 +174,11 @@ export class SessionInputShell implements SessionInput {
   private lastPublishedDraft: DraftSnapshot | undefined
   private draftSnapshotCache: { revision: number; value: DraftSnapshot } | undefined
   private attachmentIds: readonly DraftAttachmentId[] = []
+  private submissionReference: { release(): void } | undefined
   private disposed = false
   /** Conversation store writer for the current semantic document. */
   private persistDraft: ((draft: DraftSnapshot) => void) | undefined
+  private detachedDraftWriter = false
   /** A restored draft's command token waiting for the trigger pipeline, with the revision its restore produced. */
   private pendingCommand: { readonly token: string; readonly rev: number } | undefined
   /** The in-flight claim resolution for a restored command chip. */
@@ -342,7 +346,7 @@ export class SessionInputShell implements SessionInput {
 
   /** Append ordered attachment ids unless an admission transaction is locked. */
   addAttachments(ids: readonly DraftAttachmentId[]): boolean {
-    if (frozen(this.snapshot.phase)) return false
+    if (this.disposed || frozen(this.snapshot.phase)) return false
     if (ids.length === 0) return true
     this.attachmentIds = [...this.attachmentIds, ...ids]
     this.publish()
@@ -356,7 +360,7 @@ export class SessionInputShell implements SessionInput {
    * @returns false when admission is locked or the editor refuses the insertion.
    */
   addFiles(references: readonly ReferenceInsert[], ids: readonly DraftAttachmentId[]): boolean {
-    if (frozen(this.snapshot.phase)) return false
+    if (this.disposed || frozen(this.snapshot.phase)) return false
     if (!this.draftEditor.insertFileReferences(references)) return false
     this.attachmentIds = [...this.attachmentIds, ...ids]
     this.publish()
@@ -375,6 +379,13 @@ export class SessionInputShell implements SessionInput {
     this.attachmentIds = next
     this.publish()
     return true
+  }
+
+  /** Cancel an admission before discarding images whose authorization ended. */
+  discardAttachments(ids: readonly DraftAttachmentId[]): void {
+    if (ids.length === 0) return
+    this.attachmentIds = this.attachmentIds.filter(id => !ids.includes(id))
+    this.dispatchRun({ type: 'release' })
   }
 
   /**
@@ -441,6 +452,14 @@ export class SessionInputShell implements SessionInput {
       submission,
     })
     if (effects.length > 0 && frozen(this.core.state.phase)) {
+      try {
+        this.submissionReference = this.deps.retainImageSubmission?.(this.attachmentIds)
+        if (this.submissionReference !== undefined) this.notices.set(null)
+      } catch (error) {
+        this.dispatchRun({ type: 'release' })
+        this.notify('error', errorText(error))
+        return
+      }
       this.deps.popup?.()?.dismiss()
       this.deps.inputTriggers?.()?.track(this.projection.detectText, 0, { tier: 'frozen' }, this.rev)
     }
@@ -617,11 +636,12 @@ export class SessionInputShell implements SessionInput {
    * Teardown the shell, abort the in-flight attempt, and return every
    * browser-owned attachment the draft still holds, including those of a
    * message the Host has not accepted yet.
-   * @returns attachment ids the scope disposer must release.
+   * @returns attachment ids the hub must park or release.
    */
   dispose(): readonly DraftAttachmentId[] {
     if (this.disposed) return []
-    const retained = [...this.attachmentIds]
+    const retained = this.attachmentIds
+    this.attachmentIds = []
     this.disposed = true
     this.cancelCommandRestore()
     this.dispatchRun(({ type: 'release' }))
@@ -642,8 +662,11 @@ export class SessionInputShell implements SessionInput {
    */
   bindDraftPersistence(write: (draft: DraftSnapshot) => void): () => void {
     this.persistDraft = write
+    this.detachedDraftWriter = false
     return () => {
-      if (this.persistDraft === write) this.persistDraft = undefined
+      if (this.persistDraft !== write) return
+      if (this.submissionReference === undefined) this.persistDraft = undefined
+      else this.detachedDraftWriter = true
     }
   }
 
@@ -687,6 +710,12 @@ export class SessionInputShell implements SessionInput {
   private run(effects: readonly InputEffect[], composerId?: ComposerOccurrenceId): void {
     for (const fx of effects) this.execute(fx, composerId)
     this.publish()
+    if (!frozen(this.core.state.phase) && this.submissionReference !== undefined) {
+      const reference = this.submissionReference
+      this.submissionReference = undefined
+      if (this.detachedDraftWriter) this.persistDraft = undefined
+      reference.release()
+    }
   }
 
   private execute(fx: InputEffect, composerId?: ComposerOccurrenceId): void {

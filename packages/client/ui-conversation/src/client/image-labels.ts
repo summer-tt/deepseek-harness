@@ -1,5 +1,6 @@
 /** Attachment error and limit copy owned by the conversation input flow. */
 
+import type { PromptError } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { ImageAttachmentLimits } from '@deepseek-ai/dsh-attachment'
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ConversationKey } from './locales.ts'
@@ -56,4 +57,13 @@ export function attachmentErrorText(
     default: break
   }
   return t('image.sendFailed', { reason })
+}
+
+/** Use the same prompt failure copy for mounted and restored image drafts. */
+export function promptErrorText(t: Translate<ConversationKey>, error: PromptError['error'], limits?: ImageAttachmentLimits): string {
+  if (error.code === 'session/writer-held') return t('error.sessionInUse')
+  if (error.code === 'session/attachment-invalid' || error.code === 'subagent/attachment-invalid') {
+    return attachmentErrorText(t, error.details.reason, limits)
+  }
+  return `${error.message} (${error.code})`
 }
