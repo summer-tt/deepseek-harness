@@ -7,6 +7,7 @@
  * handoff, route invalidation, scope disposal) releases the preview URL.
  */
 import { apply as applyMenus, inject as injectMenus } from '@deepseek-ai/dsh-client-ui-context-menu/client'
+import { AttachmentId, type ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { act } from '@testing-library/react'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
@@ -51,9 +52,9 @@ const OTHER_SERVER = 'cceeff22'
 const VIRTUAL_OTHER = SessionId(`zr~${OTHER_SERVER}~session-c`)
 const OTHER_ROUTE: SessionHistoryRoute = { serverId: OTHER_SERVER, routeEpoch: 'other-route-1', available: true }
 /** Durable image reference the Host echoes back for an observed retirement. */
-const IMAGE_REF = {
-  attachmentId: 'image-stored-1' as never,
-  mediaType: 'image/png' as const,
+const IMAGE_REF: ImageAttachmentRef = {
+  attachmentId: AttachmentId('image-stored-1'),
+  mediaType: 'image/png',
   bytes: 1,
   width: 1,
   height: 1,
@@ -97,8 +98,8 @@ async function bench(options: { readonly remote?: boolean } = {}) {
     const uploadImage = vi.fn(() => Promise.resolve({ ok: true, value: { receiptId: `image-receipt-${id}` as never, image: IMAGE_REF } }))
     uploadImages.set(id, uploadImage)
     // The transcript's image loader verifies a retired echo's stored reference through the Session scope.
-    const readAttachment = vi.fn((attachment: typeof IMAGE_REF) =>
-      Promise.resolve({ ok: true, value: { attachment, data: Uint8Array.of(1, 2, 3) } }))
+    const readAttachment = vi.fn<ISession['readAttachment']>(async attachment =>
+      ({ ok: true, value: { attachment, data: Uint8Array.of(1, 2, 3) } }))
     return { prompt, cancel: vi.fn(), loadOlder: vi.fn(), beginSubmission, uploadImage, readAttachment }
   }
   await runtime.sessions.add({ id: LOCAL, session: sessionFace(LOCAL) })
@@ -288,7 +289,7 @@ describe('Session image drafts: native shell release and rebind', () => {
     emit('api-session/history-route', [ROUTE])
     const image = await b.addImage(VIRTUAL, imageFile('before-reject.png'))
     // The Host rejects this generation's credentials: everything authorized under it is released.
-    b.runtime.ctx.emit('connection/authentication-rejected', { generation: 7 })
+    b.runtime.ctx.emit('connection/authentication-rejected', { generation: 7, status: 401 })
     expect(shell.snapshot.attachmentIds).toEqual([])
     expect(b.live(image.id)).toBe(0)
     expect(b.revoked).toHaveBeenCalledExactlyOnceWith(image.previewUrl)
@@ -312,7 +313,7 @@ describe('Session image drafts: native shell release and rebind', () => {
     emit('api-session/history-route', [{ ...ROUTE, routeEpoch: 'route-2' }])
     const fresh = await b.addImage(VIRTUAL, imageFile('fresh.png'))
     expect(shell.snapshot.attachmentIds).toEqual([fresh.id])
-    b.runtime.ctx.emit('connection/authentication-rejected', { generation: 8 })
+    b.runtime.ctx.emit('connection/authentication-rejected', { generation: 8, status: 403 })
     expect(shell.snapshot.attachmentIds).toEqual([])
     expect(b.live(fresh.id)).toBe(0)
     expect(b.revoked).toHaveBeenCalledTimes(3)
@@ -418,7 +419,7 @@ describe('Session image drafts: send outcomes', () => {
       b.authorize.authorizeDraftRoute(ROUTE)
       const view = await shellFor(b, VIRTUAL)
       const image = await b.addImage(VIRTUAL, imageFile('in-flight.png'))
-      const receipt = Promise.withResolvers<{ ok: true; value: { accepted: true } } | { ok: false; error: RemoteError }>()
+      const receipt = Promise.withResolvers<Awaited<ReturnType<ISession['prompt']>>>()
       const signal = await submitPending(b, view.shell, receipt.promise)
       const binding = view.reference.binding
 
