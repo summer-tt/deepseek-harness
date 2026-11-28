@@ -382,7 +382,7 @@ describe('ModelsSection', () => {
       value: { apiKeyEnv: 'DEEPSEEK_API_KEY', baseURL: 'https://current.example', models: DEFAULT_DEEPSEEK_MODELS },
       user: { baseURL: 'https://current.example' },
       revision: 1,
-    })
+    }, mirror.getWriteEpoch())
     const read = Promise.withResolvers<RemoteResult<Record<string, CredentialInfo>>>()
     const started = Promise.withResolvers<undefined>()
     face.credentials.describe.mockImplementationOnce(() => { started.resolve(undefined); return read.promise })
@@ -430,7 +430,7 @@ describe('ModelsSection', () => {
       value: { apiKeyEnv: 'DEEPSEEK_API_KEY', baseURL: 'https://recovered.example', models: DEFAULT_DEEPSEEK_MODELS },
       user: { baseURL: 'https://recovered.example' },
       revision: 2,
-    })
+    }, mirror.getWriteEpoch())
     const read = Promise.withResolvers<RemoteResult<Record<string, CredentialInfo>>>()
     const started = Promise.withResolvers<undefined>()
     const describe = face.credentials.describe.getMockImplementation()!

@@ -46,7 +46,8 @@ export interface ConfigForm<T> {
    * Queue one atomic namespace mutation. All operations share one revision
    * fence, Host validation, and recovery read. Supplying
    * `expectedRevision` preserves an earlier read as the fence instead of using
-   * the latest queued or mirrored revision.
+   * the latest queued or mirrored revision. After a connection reset, writes
+   * wait for a complete description and skip if the refresh fails.
    * @param ops - ordered field operations copied when queued.
    * @param expectedRevision - optional fixed revision read by the domain editor.
    * @returns true for Host acceptance, false for refusal or skipped writes, after any latest-write recovery.

@@ -108,15 +108,20 @@ export class PermissionPresetSettingsController {
    * @returns nothing; {@link store} carries success or failure.
    */
   async select(preset: string): Promise<void> {
-    const state = this.store.getSnapshot()
-    const view = this.describeFace.getSnapshot().view?.namespaces
-      .find(entry => entry.ns === PERMISSION_SETTINGS_NS)
-    if (view === undefined || !state.writable || this.saving) return
+    if (this.disposed || this.saving) return
+    if (!this.describeFace.hasConnectionBaseline()) {
+      await this.describeFace.ensure()
+      if (this.disposed || this.saving || !this.describeFace.hasConnectionBaseline()) return
+    }
+    const document = this.describeFace.getSnapshot().view
+    const view = document?.namespaces.find(entry => entry.ns === PERMISSION_SETTINGS_NS)
+    if (view === undefined || !document?.writable || !this.store.getSnapshot().writable) return
     this.saving = true
     this.store.update((draft) => {
       draft.status = 'saving'
       draft.error = null
     })
+    const epoch = this.describeFace.getWriteEpoch()
     let response
     try {
       response = await this.ctx.remote.settings.mutate(
@@ -130,13 +135,12 @@ export class PermissionPresetSettingsController {
       this.saving = false
     }
     if (this.disposed) return
-    if (!response.ok) {
+    // Mirror publications during the save may have advanced the row's source.
+    if (!response.ok || !this.describeFace.acceptView(response.value, epoch)) this.derive()
+    if (this.store.getSnapshot().status === 'saving') await this.load()
+    if (!response.ok && epoch === this.describeFace.getWriteEpoch() && this.store.getSnapshot().status === 'ready') {
       this.fail(response.error)
-      return
     }
-    // The mirror publish reaches this row's own subscription, so the fold
-    // is also what republishes the accepted value here.
-    this.describeFace.acceptView(response.value)
   }
 
   /** Stop following the mirror; later publishes leave the snapshot alone. */

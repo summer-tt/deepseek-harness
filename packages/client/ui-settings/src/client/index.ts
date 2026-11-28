@@ -40,13 +40,11 @@ export function apply(ctx: Context): void {
   const mirror = new SettingsDescribeMirror(ctx)
   ctx.effect(() => {
     const disposers = [
-      ctx.remote.$on('settings/document-updated', () => { void mirror.load() }),
-      ctx.on('connection/reset', () => { void mirror.load() }),
+      ctx.remote.$on('settings/document-updated', (ns, revision) => { void mirror.documentUpdated(ns, revision) }),
+      ctx.on('connection/reset', () => { void mirror.resetConnection() }),
     ]
-    // The first connection also emits connection/reset, so startup normally
-    // costs two reads (budgeted in startup-rpc-budget.e2e.ts). The in-flight
-    // fold does not merge them into one; it guarantees at most one pending
-    // read at a time and that no invalidation arriving mid-read is lost.
+    // The first connection refresh closes the gap between the eager read and
+    // event subscription. The eager read can cover both if it has not dispatched.
     void mirror.ensure()
     return () => { for (const dispose of disposers) dispose() }
   }, 'ui-settings: describe mirror invalidations')

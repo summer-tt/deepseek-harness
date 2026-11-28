@@ -58,7 +58,7 @@ export class ConfigFormController<T> implements ConfigForm<T> {
    * mirror only folds the LATEST settlement in, so a queued successor takes
    * its fence from here first.
    */
-  private pendingRevision: number | undefined
+  private pendingRevision: { revision: number; epoch: number } | undefined
 
   /**
    * @param ctx - the providing plugin's context, whose `remote.settings`
@@ -130,18 +130,25 @@ export class ConfigFormController<T> implements ConfigForm<T> {
     const ownedOps = structuredClone(ops) as SettingsPathOpView[]
     const generation = ++this.writeGeneration
     return this.enqueue(async () => {
-      const revision = expectedRevision ?? this.pendingRevision ?? this.getSnapshot().revision
+      if (!this.mirror.hasConnectionBaseline()) await this.mirror.ensure()
+      if (this.disposed || !this.mirror.hasConnectionBaseline()) return false
+      const epoch = this.mirror.getWriteEpoch()
+      const pending = this.pendingRevision
+      if (pending !== undefined && !this.mirror.canUseWriteRevision(this.spec.namespace, pending.revision, pending.epoch)) {
+        this.pendingRevision = undefined
+      }
+      const revision = expectedRevision ?? this.pendingRevision?.revision ?? this.getSnapshot().revision
       const response = await this.ctx.remote.settings.mutate(this.spec.namespace, ownedOps, revision)
       if (!response.ok) {
-        await this.recover(generation)
+        if (epoch === this.mirror.getWriteEpoch()) await this.recover(generation)
         return false
       }
       if (this.disposed) return true
       if (generation === this.writeGeneration) {
         this.pendingRevision = undefined
-        this.mirror.acceptView(response.value)
-      } else {
-        this.pendingRevision = response.value.revision
+        this.mirror.acceptView(response.value, epoch)
+      } else if (this.mirror.canUseWriteRevision(this.spec.namespace, response.value.revision, epoch)) {
+        this.pendingRevision = { revision: response.value.revision, epoch }
       }
       return true
     })
@@ -275,6 +282,14 @@ export class ConfigForms extends Service {
    */
   describe(): SettingsDescribeFace {
     return this.mirror
+  }
+
+  /**
+   * Re-read the shared settings document after the caller's read access changes.
+   * @returns settlement after the mirror publishes the result or records the read error.
+   */
+  refresh(): Promise<void> {
+    return this.mirror.load()
   }
 
   /** Get the shared form values and write queue for one Host plugin entry.

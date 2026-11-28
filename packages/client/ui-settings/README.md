@@ -48,7 +48,7 @@ To customize a page's navigation icon, use `ctx.slots.inject('settings.section.i
 
 ### Observable success and failures
 
-A committed write folds its answer into the shared mirror. Refused writes refresh the latest Host values. Browser validation uses the serialized Config schema; the Host validates complete configuration, including checks that cannot be serialized.
+A committed write can update the shared mirror directly. The mirror ignores delayed answers that would replace newer settings or restore a removed namespace. Refused configuration form writes refresh the latest Host values. Browser validation uses the serialized Config schema. The Host validates complete configuration, including checks that cannot be serialized.
 
 -----
 
@@ -64,7 +64,7 @@ The package realizes one ownership rule: the browser keeps one shared mirror of 
 
 ### The describe mirror
 
-The Host Config of the `ui-settings` entry declares the default-on `enabled` preference. The Client plugin injects `remote` with its `settings` namespace and owns the one `settings.describe` reader in the browser: a shared mirror refreshed on every forwarded `settings/document-updated` event and on `connection/reset` (the first connection included, closing the window where a commit lands between the eager read and the SSE subscription). Cross-namespace surfaces read it through `ctx.configForms.describe()`, a read/fold face (`getSnapshot`/`subscribe`/`ensure`, plus `acceptView` folding a write answer in).
+Each browser refreshes its shared mirror on `settings/document-updated` and `connection/reset`, including the initial connection. A notification invalidates reads already on the wire and supplies a minimum revision for subsequent write answers. A reset retains the displayed document until the next complete `settings.describe` and starts a new write epoch. A lower notification pauses partial updates until a complete read can resolve its ordering. Consumers that dispatch their own settings writes use the [shared describe face](src/client/settings-mirror.ts) to capture the epoch and submit each answer.
 
 ### Shared entry writes
 

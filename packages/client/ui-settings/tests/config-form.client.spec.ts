@@ -247,6 +247,166 @@ describe('ConfigFormController', () => {
     expect(sibling.getSnapshot()).toMatchObject({ value: { preference: 'dark' }, revision: 5 })
   })
 
+  it('keeps both page mirrors on the newer commit after an older page receives its ACK', async () => {
+    const firstAck = deferred<Answer<SettingsNamespaceView>>()
+    const mutateFirstPage = vi.fn().mockReturnValue(firstAck.promise)
+    const mutateSecondPage = vi.fn().mockResolvedValue(ok(view({ preference: 'light' }, 6)))
+    const describeFirstPage = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'system' }, 4))
+      .mockResolvedValueOnce(described({ preference: 'light' }, 6))
+    const firstPage = derivedScope({ describe: describeFirstPage, mutate: mutateFirstPage })
+    const secondPage = derivedScope({
+      describe: vi.fn().mockResolvedValueOnce(described({ preference: 'dark' }, 5)),
+      mutate: mutateSecondPage,
+    })
+    await firstPage.mirror.load()
+    const first = firstPage.scope.set('preference', 'dark')
+    await vi.waitFor(() => expect(mutateFirstPage).toHaveBeenCalledOnce())
+    await secondPage.mirror.load()
+    expect(await secondPage.scope.set('preference', 'light')).toBe(true)
+    await firstPage.mirror.documentUpdated('ui-test', 6)
+    firstAck.resolve(ok(view({ preference: 'dark' }, 5)))
+    expect(await first).toBe(true)
+    for (const { scope } of [firstPage, secondPage]) {
+      expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 6 })
+    }
+    expect(describeFirstPage).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['notification', 'reset'] as const)('uses the current fence for a queued write after %s', async (reason) => {
+    const firstAck = deferred<Answer<SettingsNamespaceView>>()
+    const refresh = deferred<ReturnType<typeof described>>()
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'system' }, 4))
+      .mockReturnValueOnce(refresh.promise)
+    const nextRevision = reason === 'reset' ? 1 : 6
+    const mutate = vi.fn()
+      .mockReturnValueOnce(firstAck.promise)
+      .mockResolvedValueOnce(ok(view({ preference: 'light' }, nextRevision + 1)))
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    const first = scope.set('preference', 'dark')
+    await vi.waitFor(() => expect(mutate).toHaveBeenCalledOnce())
+    const following = scope.set('preference', 'light')
+    const reading = reason === 'reset' ? mirror.resetConnection() : mirror.documentUpdated('ui-test', nextRevision)
+    refresh.resolve(described({ preference: 'system' }, nextRevision))
+    await reading
+    firstAck.resolve(ok(view({ preference: 'dark' }, 5)))
+    expect(await Promise.all([first, following])).toEqual([true, true])
+    expect(mutate).toHaveBeenNthCalledWith(2, 'ui-test', [{ op: 'set', path: ['preference'], value: 'light' }], nextRevision)
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: nextRevision + 1 })
+  })
+
+  it('lets the new connection settle a recovery read before the old RPC returns', async () => {
+    const oldRead = deferred<ReturnType<typeof described>>()
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'system' }, 4))
+      .mockReturnValueOnce(oldRead.promise)
+      .mockResolvedValueOnce(described({ preference: 'system' }, 0))
+    const mutate = vi.fn().mockResolvedValueOnce(rejected()).mockResolvedValueOnce(ok(view({ preference: 'light' }, 1)))
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    const refused = scope.set('preference', 'dark')
+    await vi.waitFor(() => expect(describeCall).toHaveBeenCalledTimes(2))
+    const reset = mirror.resetConnection()
+    const latest = scope.set('preference', 'light')
+    try {
+      await reset
+      expect(await refused).toBe(false)
+      expect(await latest).toBe(true)
+      expect(mutate.mock.calls.map(args => args[2])).toEqual([4, 0])
+      expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 1 })
+    } finally {
+      oldRead.resolve(described({ preference: 'dark' }, 5))
+    }
+  })
+
+  it('waits for the new baseline before dispatching writes after reset', async () => {
+    const baseline = deferred<ReturnType<typeof described>>()
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'system' }, 4))
+      .mockReturnValueOnce(baseline.promise)
+    const mutate = vi.fn().mockResolvedValue(ok(view({ preference: 'dark' }, 1)))
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    const reset = mirror.resetConnection()
+    const write = scope.set('preference', 'dark')
+    try {
+      await Promise.resolve()
+      expect(mutate).not.toHaveBeenCalled()
+    } finally {
+      baseline.resolve(described({ preference: 'light' }, 0))
+      await reset
+      await write
+    }
+    expect(mutate).toHaveBeenCalledWith('ui-test', [{ op: 'set', path: ['preference'], value: 'dark' }], 0)
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'dark' }, revision: 1 })
+  })
+
+  it('retries an unavailable reset baseline on demand before dispatching', async () => {
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'system' }, 4))
+      .mockResolvedValueOnce(rejected())
+      .mockResolvedValueOnce(rejected())
+      .mockResolvedValueOnce(described({ preference: 'light' }, 0))
+    const mutate = vi.fn().mockResolvedValue(ok(view({ preference: 'dark' }, 1)))
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    await mirror.resetConnection()
+    expect(await scope.set('preference', 'dark')).toBe(false)
+    expect(mutate).not.toHaveBeenCalled()
+    expect(await scope.set('preference', 'dark')).toBe(true)
+    expect(mutate).toHaveBeenCalledWith('ui-test', [{ op: 'set', path: ['preference'], value: 'dark' }], 0)
+  })
+
+  it('preserves the revision fence after a previously served namespace disappears', async () => {
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'system' }, 4))
+      .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [] }))
+      .mockResolvedValueOnce(described({ preference: 'light' }, 6))
+    const mutate = vi.fn().mockResolvedValueOnce(rejected())
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    await mirror.documentUpdated('ui-test', 5)
+    expect(scope.getSnapshot().status).toBe('unavailable')
+    expect(await scope.set('preference', 'dark')).toBe(false)
+    expect(mutate).toHaveBeenCalledWith('ui-test', [{ op: 'set', path: ['preference'], value: 'dark' }], 4)
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 6 })
+  })
+
+  it('revalidates a pending revision at dispatch after a notification raised the floor', async () => {
+    const firstAck = deferred<Answer<SettingsNamespaceView>>()
+    const refresh = deferred<ReturnType<typeof described>>()
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'system' }, 4))
+      .mockReturnValueOnce(refresh.promise)
+      .mockResolvedValue(described({ preference: 'light' }, 7))
+    const intermediateAck = deferred<Answer<SettingsNamespaceView>>()
+    const mutate = vi.fn()
+      .mockReturnValueOnce(firstAck.promise)
+      .mockReturnValueOnce(intermediateAck.promise)
+      .mockResolvedValueOnce(rejected())
+    const { mirror, scope } = derivedScope({ describe: describeCall, mutate })
+    await mirror.load()
+    const first = scope.set('preference', 'dark')
+    await vi.waitFor(() => expect(mutate).toHaveBeenCalledOnce())
+    const intermediate = scope.set('preference', 'system')
+    const latest = scope.set('preference', 'light')
+    firstAck.resolve(ok(view({ preference: 'dark' }, 5)))
+    expect(await first).toBe(true)
+    await vi.waitFor(() => expect(mutate).toHaveBeenCalledTimes(2))
+    const refreshing = mirror.documentUpdated('ui-test', 6)
+    intermediateAck.resolve(rejected())
+    expect(await intermediate).toBe(false)
+    await vi.waitFor(() => expect(mutate).toHaveBeenCalledTimes(3))
+    // Without the refreshed row, the queued edit still uses the published Host CAS fence.
+    expect(mutate.mock.calls.map(args => args[2])).toEqual([4, 5, 4])
+    refresh.resolve(described({ preference: 'light' }, 7))
+    await refreshing
+    expect(await latest).toBe(false)
+    expect(scope.getSnapshot()).toMatchObject({ value: { preference: 'light' }, revision: 7 })
+  })
+
   it('re-reads after a revisionless first write lands during the initial read', async () => {
     const initial = deferred<ReturnType<typeof described>>()
     const describeCall = vi.fn()
@@ -499,7 +659,9 @@ describe('ConfigFormController', () => {
 
 describe('ConfigForms.get', () => {
   it('shares accepted values and one write queue across consumers of the same entry', async () => {
-    const describeCall = vi.fn().mockResolvedValue(described({ preference: 'dark' }, 1))
+    const describeCall = vi.fn()
+      .mockResolvedValueOnce(described({ preference: 'dark' }, 1))
+      .mockResolvedValue(described({ preference: 'light' }, 2))
     const mirror = new SettingsDescribeMirror(ctxWith({ describe: describeCall }))
     const ctx = new Context()
     let theme!: ConfigForm<UiTestSettings>
@@ -522,8 +684,9 @@ describe('ConfigForms.get', () => {
     expect(describeCall).toHaveBeenCalledTimes(1)
     expect(theme).toBe(locale)
     await fiber.dispose()
-    await mirror.load()
-    expect(theme.getSnapshot()).toMatchObject({ revision: 1 })
+    await ctx.configForms.refresh()
+    expect(theme.getSnapshot()).toMatchObject({ revision: 2, value: { preference: 'light' } })
+    expect(describeCall).toHaveBeenCalledTimes(2)
   })
 
 })

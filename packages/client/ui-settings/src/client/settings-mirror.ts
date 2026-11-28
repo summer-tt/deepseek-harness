@@ -52,29 +52,46 @@ export interface SettingsDescribeFace {
    */
   subscribe(listener: () => void): () => void
   /**
-   * Resolve once an answer is held, reading only from `idle`. A settled mirror
-   * holds either a view or the read's error.
+   * Await an active read, or read if no answer is held or reset still needs a
+   * complete baseline. The snapshot records any read failure.
    * @returns settlement of the current or newly started read, if any.
    */
   ensure(): Promise<void>
+  /** @returns the mirror epoch to capture immediately before dispatching a settings write. */
+  getWriteEpoch(): number
+  /** @returns whether the connection has no reset baseline outstanding. */
+  hasConnectionBaseline(): boolean
   /**
-   * Fold one write answer's namespace view into the held view without a wire
-   * read, invalidating any older read still in flight.
+   * Fold a current write answer into the held document without starting a read.
    * @param view - the namespace view a settings write answered with.
+   * @param epoch - the mirror epoch captured when the write was dispatched.
+   * @returns whether the answer was folded and published to subscribers.
    */
-  acceptView(view: SettingsNamespaceView): void
+  acceptView(view: SettingsNamespaceView, epoch: number): boolean
+}
+
+interface DescribeRead {
+  promise: Promise<void>
+  follow: (result: Promise<void>) => void
+  rerun: boolean
+  dispatched: boolean
 }
 
 /**
  * Serializes every Host `settings.describe` read behind one snapshot store.
- * Concurrent {@link load} calls fold into the in-flight read plus one rerun,
- * so an invalidation arriving mid-read is never lost and never duplicated.
+ * Within a connection, concurrent {@link load} calls coalesce into one read
+ * and one rerun. Reset retires the old read and starts a new baseline.
  */
 export class SettingsDescribeMirror implements SettingsDescribeFace {
   private readonly store: SnapshotStore<SettingsMirrorSnapshot>
-  private inFlight: Promise<void> | undefined
-  private rerun = false
-  private generation = 0
+  private inFlight: DescribeRead | undefined
+  private readGeneration = 0
+  private writeEpoch = 0
+  private awaitingConnectionBaseline = false
+  private partialWritesPaused = false
+  private readonly revisions = new Map<string, number>()
+  private readonly notified = new Set<string>()
+  private readonly removed = new Set<string>()
 
   /**
    * @param ctx - the providing plugin's context, whose `remote.settings`
@@ -103,47 +120,137 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
   }
 
   /**
-   * Refresh from the Host. A call during an in-flight read marks one rerun
-   * after it settles instead of racing a second wire read.
-   * @returns settlement after this call's freshness is reflected.
+   * Refresh from the Host. Concurrent requests on one connection share the
+   * current read and a rerun. Waiters follow the new read on reset.
+   * @returns settlement after the refresh publishes its answer or failure.
    */
   load(): Promise<void> {
     if (this.inFlight !== undefined) {
-      this.rerun = true
-      return this.inFlight
+      this.inFlight.rerun = true
+      return this.inFlight.promise
     }
     // Own the slot before the loading publication can synchronously reenter load().
-    const run = Promise.resolve().then(() => this.run())
-    this.inFlight = run
-    return run
+    const { promise, resolve, reject } = Promise.withResolvers<void>()
+    const read: DescribeRead = { promise, follow: resolve, rerun: false, dispatched: false }
+    this.inFlight = read
+    void Promise.resolve().then(() => this.run(read)).then(resolve, reject)
+    return promise
   }
 
   /**
-   * Resolve once an answer is held, reading only from `idle`.
+   * Reuse the active read or retry an unanswered baseline.
    * @returns settlement of the current or newly started read, if any.
    */
   ensure(): Promise<void> {
-    if (this.inFlight !== undefined) return this.inFlight
-    if (this.getSnapshot().status === 'idle') return this.load()
+    if (this.inFlight !== undefined) return this.inFlight.promise
+    if (this.awaitingConnectionBaseline || this.getSnapshot().status === 'idle') return this.load()
     return Promise.resolve()
   }
 
+  /** @returns the mirror epoch to capture immediately before dispatching a settings write. */
+  getWriteEpoch(): number {
+    return this.writeEpoch
+  }
+
+  /** @returns whether an implicit edit can use the current connection's revision. */
+  hasConnectionBaseline(): boolean {
+    return !this.awaitingConnectionBaseline
+  }
+
   /**
-   * Fold one write answer's namespace view into the held view without a wire
-   * read, and invalidate any read still in flight. With no held document, the
-   * answer is not published as a partial document; an in-flight read reruns so
-   * it cannot publish a document fetched before the write committed.
-   * @param view - the namespace view a settings write answered with.
+   * Check whether a successful answer can supply a value or a queued write's revision.
+   * @param ns - the written namespace.
+   * @param revision - the revision from the write answer.
+   * @param epoch - the mirror epoch captured when the write was dispatched.
+   * @returns whether the answer is current and the namespace has no confirmed removal.
    */
-  acceptView(view: SettingsNamespaceView): void {
+  canUseWriteRevision(ns: string, revision: number, epoch: number): boolean {
+    if (epoch !== this.writeEpoch || this.awaitingConnectionBaseline || this.partialWritesPaused) return false
+    return !this.removed.has(ns) && revision >= (this.revisions.get(ns) ?? revision)
+  }
+
+  /**
+   * Fold a current answer into the held document without starting a read.
+   * A current answer still invalidates a read in flight before the first document.
+   * @param view - the namespace view a settings write answered with.
+   * @param epoch - the mirror epoch captured when the write was dispatched.
+   * @returns whether the answer was folded and published to subscribers.
+   */
+  acceptView(view: SettingsNamespaceView, epoch: number): boolean {
+    if (!this.canUseWriteRevision(view.ns, view.revision, epoch)) return false
+    // A notified full view may carry newer presentation policy at the same revision.
+    if (this.notified.has(view.ns) && this.namespace(view.ns)?.revision === view.revision) return false
+    this.revisions.set(view.ns, view.revision)
+    this.invalidateRead()
     const before = this.store.getSnapshot()
-    this.generation += 1
-    if (this.inFlight !== undefined) this.rerun = true
-    if (before.view === undefined) return
+    if (before.view === undefined) return false
     const namespaces = before.view.namespaces.some(row => row.ns === view.ns)
       ? before.view.namespaces.map(row => row.ns === view.ns ? view : row)
       : [...before.view.namespaces, view]
     this.store.set({ ...before, view: { ...before.view, namespaces } })
+    return true
+  }
+
+  /**
+   * Reconcile a Host notification with a full read dispatched after it.
+   * @param ns - the namespace named by the notification.
+   * @param revision - the announced namespace revision.
+   * @returns settlement of the refresh.
+   */
+  documentUpdated(ns: string, revision: number): Promise<void> {
+    this.notified.add(ns)
+    const known = this.revisions.get(ns)
+    if (known !== undefined && revision < known) {
+      // A delayed notification and a provider restart look the same until describe answers.
+      this.partialWritesPaused = true
+    } else {
+      this.revisions.set(ns, revision)
+    }
+    this.invalidateRead()
+    return this.load()
+  }
+
+  /**
+   * Advance the write epoch and rebuild ordering from the new connection's full document.
+   * @returns settlement of the refresh.
+   */
+  resetConnection(): Promise<void> {
+    this.writeEpoch += 1
+    this.revisions.clear()
+    this.notified.clear()
+    this.awaitingConnectionBaseline = true
+    this.partialWritesPaused = false
+    // A call still waiting to dispatch can read the new connection. A dispatched
+    // call may never settle, so the new connection gets its own read slot.
+    const previous = this.inFlight
+    if (!previous?.dispatched) return this.load()
+    this.inFlight = undefined
+    const refresh = this.load()
+    previous.follow(refresh)
+    return refresh
+  }
+
+  private invalidateRead(): void {
+    this.readGeneration += 1
+    if (this.inFlight !== undefined) this.inFlight.rerun = true
+  }
+
+  private publishDescribe(view: SettingsDescribeView): void {
+    // Only a full read dispatched after the invalidation can establish a lower baseline.
+    const resetsProvider = view.namespaces.some(row => row.revision < (this.revisions.get(row.ns) ?? row.revision))
+    for (const previous of this.getSnapshot().view?.namespaces ?? []) this.removed.add(previous.ns)
+    for (const ns of this.revisions.keys()) this.removed.add(ns)
+    if (resetsProvider) {
+      this.writeEpoch += 1
+      this.revisions.clear()
+    }
+    for (const row of view.namespaces) {
+      this.revisions.set(row.ns, row.revision)
+      this.removed.delete(row.ns)
+    }
+    this.awaitingConnectionBaseline = false
+    this.partialWritesPaused = false
+    this.store.set({ status: 'ready', view, error: null })
   }
 
   /**
@@ -155,7 +262,7 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
     return this.store.getSnapshot().view?.namespaces.find(row => row.ns === ns)
   }
 
-  private async run(): Promise<void> {
+  private async run(read: DescribeRead): Promise<void> {
     // The in-flight slot must clear in the same synchronous segment that
     // observes `rerun` false (and on abrupt exit): a `.finally()` on the
     // returned promise runs one microtask later, and a `load()` landing in
@@ -168,8 +275,9 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
         // earlier (including one reentering from the loading publish above)
         // is covered by this very read, while one landing after needs the
         // rerun.
-        this.rerun = false
-        const generation = ++this.generation
+        read.rerun = false
+        read.dispatched = true
+        const generation = this.readGeneration
         let outcome: { view: SettingsDescribeView } | { failure: string }
         try {
           const response = await this.ctx.remote.settings.describe()
@@ -179,10 +287,10 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
         } catch (error) {
           outcome = { failure: error instanceof Error ? error.message : String(error) }
         }
-        // A write answer invalidates a document read before that write committed.
-        if (generation !== this.generation) continue
+        if (this.inFlight !== read) return
+        if (generation !== this.readGeneration) continue
         if ('view' in outcome) {
-          this.store.set({ status: 'ready', view: outcome.view, error: null })
+          this.publishDescribe(outcome.view)
         } else {
           const held = this.store.getSnapshot()
           // No answer yet: fall back to idle so `ensure` retries; with one, the
@@ -193,13 +301,9 @@ export class SettingsDescribeMirror implements SettingsDescribeFace {
             error: outcome.failure,
           })
         }
-      } while (this.shouldRerun())
+      } while (this.inFlight === read && read.rerun)
     } finally {
-      this.inFlight = undefined
+      if (this.inFlight === read) this.inFlight = undefined
     }
-  }
-
-  private shouldRerun(): boolean {
-    return this.rerun
   }
 }

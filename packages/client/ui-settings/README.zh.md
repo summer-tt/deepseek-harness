@@ -48,7 +48,7 @@ kind: "package-reference"
 
 ### 可观察的成功与失败
 
-已提交的写入将应答合入共享镜像。被拒绝的写入刷新最新 Host 值。浏览器使用序列化的 Config schema 校验；Host 校验完整配置，包括无法序列化的检查。
+已提交的写入可以直接更新共享镜像。镜像会忽略可能覆盖较新设置或恢复已撤除命名空间的迟到应答。Host 拒绝表单写入时，表单重新读取 Host 当前值。浏览器使用序列化的 Config schema 校验。Host 校验完整配置，包括无法序列化的检查。
 
 -----
 
@@ -64,7 +64,7 @@ kind: "package-reference"
 
 ### Describe 镜像
 
-`ui-settings` 条目的 Host Config 声明默认开启的 `enabled` 偏好。Client 插件注入 `remote` 及其 `settings` 命名空间，并持有浏览器中唯一的 `settings.describe` 读取方：一面共享镜像，在每次转发的 `settings/document-updated` 事件与 `connection/reset` 时刷新（首次连接也包含在内，关闭「提交落在急切读取与 SSE 订阅之间」的窗口）。跨命名空间表面通过 `ctx.configForms.describe()` 读它，这是一个读取/折叠面（`getSnapshot`/`subscribe`/`ensure`，另有把写应答折入的 `acceptView`）。
+每个浏览器在 `settings/document-updated` 与 `connection/reset` 时刷新共享镜像，首次连接也会触发刷新。通知使已发出的读取结果失效，并为后续写入应答提供最低 revision。连接重置开启新的写入 epoch，页面可继续显示已有文档，直到完整的 `settings.describe` 应答到达。较低 revision 的通知会暂缓局部更新，直到完整读取确认当前顺序。直接发出设置写入的调用方通过[共享 describe 接口](src/client/settings-mirror.ts)捕获 epoch 并提交应答。
 
 ### 共享条目写入
 

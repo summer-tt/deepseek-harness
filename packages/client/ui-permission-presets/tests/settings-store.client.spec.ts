@@ -87,6 +87,85 @@ describe('permission settings store', () => {
     expect(describe).toHaveBeenCalledTimes(1)
   })
 
+  it.each(['newer value', 'removed namespace'] as const)('derives the %s after rejecting an ACK received during saving', async (outcome) => {
+    const mutation = Promise.withResolvers<ReturnType<typeof ok<SettingsNamespaceView>>>()
+    const describe = vi.fn()
+      .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [view('read-only', 4)] }))
+      .mockResolvedValueOnce(ok({
+        writable: true, hasDocument: true, namespaces: outcome === 'newer value' ? [view('read-only', 6)] : [],
+      }))
+    const mutate = vi.fn().mockReturnValue(mutation.promise)
+    const { mirror, controller } = permissionController({ describe, mutate })
+    await controller.load()
+    const saving = controller.select('workspace-write')
+    expect(mutate).toHaveBeenCalledOnce()
+    await mirror.documentUpdated('permission', 6)
+    expect(controller.store.getSnapshot()).toMatchObject({ status: 'saving', revision: 4 })
+    mutation.resolve(ok(view('workspace-write', 5)))
+    await saving
+    expect(controller.store.getSnapshot()).toMatchObject(outcome === 'newer value'
+      ? { status: 'ready', currentValue: 'read-only', revision: 6 }
+      : { status: 'unavailable', currentValue: '', writable: false })
+    expect(describe).toHaveBeenCalledTimes(2)
+  })
+
+  it('ignores a successful permission write dispatched before connection reset', async () => {
+    const mutation = Promise.withResolvers<ReturnType<typeof ok<SettingsNamespaceView>>>()
+    const describe = vi.fn()
+      .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [view('read-only', 4)] }))
+      .mockResolvedValueOnce(ok({ writable: true, hasDocument: true, namespaces: [view('read-only', 0)] }))
+    const mutate = vi.fn().mockReturnValue(mutation.promise)
+    const { mirror, controller } = permissionController({ describe, mutate })
+    await controller.load()
+    const saving = controller.select('workspace-write')
+    await mirror.resetConnection()
+    expect(controller.store.getSnapshot().status).toBe('saving')
+    mutation.resolve(ok(view('workspace-write', 5)))
+    await saving
+    expect(controller.store.getSnapshot()).toMatchObject({ status: 'ready', currentValue: 'read-only', revision: 0 })
+    expect(describe).toHaveBeenCalledTimes(2)
+  })
+
+  it('waits to fence a selection against the new connection revision', async () => {
+    const described = (revision: number) => ok({ writable: true, hasDocument: true, namespaces: [view('read-only', revision)] })
+    const baseline = Promise.withResolvers<ReturnType<typeof described>>()
+    const describe = vi.fn().mockResolvedValueOnce(described(4)).mockReturnValueOnce(baseline.promise)
+    const mutate = vi.fn().mockResolvedValue(ok(view('workspace-write', 1)))
+    const { mirror, controller } = permissionController({ describe, mutate })
+    await controller.load()
+    const reset = mirror.resetConnection()
+    const saving = controller.select('workspace-write')
+    try {
+      await Promise.resolve()
+      expect(mutate).not.toHaveBeenCalled()
+    } finally {
+      baseline.resolve(described(0))
+      await Promise.all([reset, saving])
+    }
+    expect(mutate).toHaveBeenCalledWith('permission', [{ op: 'set', path: ['defaultPreset'], value: 'workspace-write' }], 0)
+    expect(controller.store.getSnapshot()).toMatchObject({ status: 'ready', currentValue: 'workspace-write', revision: 1 })
+  })
+
+  it('reports a failed catalog refresh after a reset retires the pending write', async () => {
+    const mutation = Promise.withResolvers<{ ok: false; error: RemoteError }>()
+    const ctx = { remote: { settings: {
+      describe: async () => ok({ writable: true, hasDocument: true, namespaces: [view('read-only')] }),
+      mutate: () => mutation.promise,
+    } } } as never
+    const mirror = new SettingsDescribeMirror(ctx)
+    const store = createSnapshotStore<{ value: typeof catalog | null }>({ value: catalog })
+    const load = vi.fn().mockResolvedValueOnce(catalog).mockRejectedValueOnce(new Error('catalog unavailable'))
+    const controller = new PermissionPresetSettingsController(mirror, ctx, { store, load })
+    await controller.load()
+    const saving = controller.select('workspace-write')
+    store.set({ value: null })
+    await mirror.resetConnection()
+    mutation.resolve({ ok: false, error: new RemoteError('settings/rejected', 'stale write', { ns: 'permission' }) })
+    await saving
+    expect(controller.store.getSnapshot()).toMatchObject({ status: 'error', error: 'catalog unavailable' })
+    controller.dispose()
+  })
+
   it('hides the row when the namespace is absent and contains write failures', async () => {
     const describe = vi.fn(() => Promise.resolve(ok({ writable: true, hasDocument: false, namespaces: [] })))
     const { controller } = permissionController({ describe, mutate: vi.fn() })
